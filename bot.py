@@ -276,6 +276,31 @@ def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # ── Broadcast Management Tables ──
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                sent_by INTEGER NOT NULL,
+                total_users INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'sending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broadcast_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER,
+                delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (broadcast_id) REFERENCES broadcasts(id)
+            );
+        """)
+        # Auto-create index for fast lookups
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_deliver ON broadcast_deliveries(broadcast_id, user_id);")
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
@@ -916,6 +941,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("🗑️ Remove Numbers (.txt)", callback_data="admin_remove_prompt")],
         [InlineKeyboardButton("🌍 Manage Countries & Stock", callback_data="admin_manage_countries")],
         [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
+        [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
         [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
         [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
         [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
@@ -929,14 +955,40 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_text = update.message.text.replace("/broadcast", "", 1).strip()
     if not msg_text:
+        ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
         await update.message.reply_text(
-            "⚠️ <b>Usage:</b> <code>/broadcast Your message here</code>\n"
-            "Or use the <b>📢 Broadcast Message</b> button in `/admin`.",
-            parse_mode=ParseMode.HTML
+            "📢 <b>Broadcast Message to All Users</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please type your broadcast message below.\n"
+            "You will see a <b>preview before it's sent</b> — so double-check your text!\n\n"
+            "<i>Supports HTML: <code>&lt;b&gt;bold&lt;/b&gt;</code>, <code>&lt;i&gt;italic&lt;/i&gt;</code>, "
+            "<code>&lt;code&gt;code&lt;/code&gt;</code></i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
+            ])
         )
         return
 
-    await execute_broadcast(context.bot, update.message.chat_id, msg_text)
+    # Direct /broadcast <text> — show preview
+    ADMIN_STATES[user.id] = {"preview_broadcast": msg_text}
+    user_count = len(get_all_user_ids())
+    await update.message.reply_text(
+        f"👁️ <b>Broadcast Preview</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>This is how your message will look:</i>\n\n"
+        f"{msg_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Will be sent to:</b> <code>{user_count}</code> users\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Confirm and send?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Send Broadcast", callback_data="bc_confirm_send"),
+             InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")],
+            [InlineKeyboardButton("✏️ Edit Message", callback_data="bc_edit_message")]
+        ])
+    )
 
 async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1198,36 +1250,191 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ <b>Failed to update group link.</b>", parse_mode=ParseMode.HTML)
 
-async def execute_broadcast(bot: Bot, admin_chat_id: int, text: str):
+# ──────────────────────────────────────────────────────────────────
+#  BROADCAST DB HELPERS
+# ──────────────────────────────────────────────────────────────────
+def create_broadcast_record(text: str, sent_by: int, total_users: int) -> int:
+    with get_main_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO broadcasts (text, sent_by, total_users, status) VALUES (?, ?, ?, 'sending')",
+            (text, sent_by, total_users)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+def finalize_broadcast_record(bc_id: int, success: int, failed: int):
+    with get_main_db() as conn:
+        conn.execute(
+            "UPDATE broadcasts SET success_count=?, failed_count=?, status='done' WHERE id=?",
+            (success, failed, bc_id)
+        )
+        conn.commit()
+
+def save_delivery(bc_id: int, user_id: int, message_id: int):
+    try:
+        with get_main_db() as conn:
+            conn.execute(
+                "INSERT INTO broadcast_deliveries (broadcast_id, user_id, message_id) VALUES (?, ?, ?)",
+                (bc_id, user_id, message_id)
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def get_broadcast_history(limit: int = 10):
+    with get_main_db() as conn:
+        rows = conn.execute(
+            """SELECT id, text, success_count, failed_count, total_users, status, created_at
+               FROM broadcasts ORDER BY id DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_broadcast_deliveries(bc_id: int):
+    with get_main_db() as conn:
+        rows = conn.execute(
+            "SELECT user_id, message_id FROM broadcast_deliveries WHERE broadcast_id=?",
+            (bc_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def delete_broadcast_record(bc_id: int):
+    with get_main_db() as conn:
+        conn.execute("DELETE FROM broadcast_deliveries WHERE broadcast_id=?", (bc_id,))
+        conn.execute("DELETE FROM broadcasts WHERE id=?", (bc_id,))
+        conn.commit()
+
+# ──────────────────────────────────────────────────────────────────
+#  CORE BROADCAST ENGINE
+# ──────────────────────────────────────────────────────────────────
+def _make_progress_bar(done: int, total: int, width: int = 12) -> str:
+    filled = int(width * done / max(total, 1))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(100 * done / max(total, 1))
+    return f"[{bar}] {pct}%"
+
+async def execute_broadcast(bot: Bot, admin_chat_id: int, text: str, admin_id: int = 0):
     user_ids = get_all_user_ids()
     if not user_ids:
-        await bot.send_message(admin_chat_id, "⚠️ No registered users found.", parse_mode=ParseMode.HTML)
+        await bot.send_message(
+            admin_chat_id,
+            "⚠️ <b>No registered users found.</b>\nNo one to broadcast to yet.",
+            parse_mode=ParseMode.HTML
+        )
         return
+
+    total = len(user_ids)
+    bc_id = create_broadcast_record(text, admin_id or admin_chat_id, total)
 
     status_msg = await bot.send_message(
         admin_chat_id,
-        f"⏳ <b>Broadcasting to {len(user_ids)} users...</b>",
+        f"📡 <b>Broadcast Initiated</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
+        f"👥 <b>Target Users:</b> <code>{total}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Sending...  {_make_progress_bar(0, total)}",
         parse_mode=ParseMode.HTML
     )
 
     success = 0
     failed = 0
-    for uid in user_ids:
+    last_edit_pct = -1
+
+    for idx, uid in enumerate(user_ids, 1):
         try:
-            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+            sent_msg = await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+            save_delivery(bc_id, uid, sent_msg.message_id)
             success += 1
-            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
+
+        # Throttle: Telegram allows ~30 msg/sec; 0.04s ≈ 25 msg/sec (safe)
+        await asyncio.sleep(0.04)
+
+        # Live progress update every 5% or every 10 users
+        current_pct = int(100 * idx / total)
+        if (current_pct - last_edit_pct >= 5 or idx % 10 == 0) and current_pct != last_edit_pct:
+            last_edit_pct = current_pct
+            try:
+                await status_msg.edit_text(
+                    f"📡 <b>Broadcasting...</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
+                    f"👥 <b>Progress:</b> <code>{idx}/{total}</code>\n"
+                    f"✅ <b>Sent:</b> <code>{success}</code>  ❌ <b>Failed:</b> <code>{failed}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚡ {_make_progress_bar(idx, total)}",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+    finalize_broadcast_record(bc_id, success, failed)
 
     await status_msg.edit_text(
         f"📢 <b>Broadcast Complete!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>Sent Successfully:</b> <code>{success}</code>\n"
-        f"❌ <b>Failed / Blocked:</b> <code>{failed}</code>\n"
-        f"👥 <b>Total Users:</b> <code>{len(user_ids)}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
+        f"✅ <b>Delivered:</b> <code>{success}</code> users\n"
+        f"❌ <b>Failed/Blocked:</b> <code>{failed}</code> users\n"
+        f"👥 <b>Total Targeted:</b> <code>{total}</code>\n"
+        f"📊 <b>Delivery Rate:</b> <code>{int(success/max(total,1)*100)}%</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✨ <i>Users can now see your message. You can delete it anytime from Broadcast History.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Delete This Broadcast", callback_data=f"bc_delete_{bc_id}")],
+            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
+async def execute_delete_broadcast(bot: Bot, admin_chat_id: int, bc_id: int):
+    """Retract/delete a broadcast — removes the message from every user's chat."""
+    deliveries = get_broadcast_deliveries(bc_id)
+    if not deliveries:
+        await bot.send_message(
+            admin_chat_id,
+            f"⚠️ <b>Broadcast #{bc_id} has no tracked deliveries to delete.</b>\n"
+            f"<i>The broadcast record will be removed.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        delete_broadcast_record(bc_id)
+        return
+
+    status_msg = await bot.send_message(
+        admin_chat_id,
+        f"🗑️ <b>Deleting Broadcast #{bc_id}...</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Retracting from <code>{len(deliveries)}</code> users...",
         parse_mode=ParseMode.HTML
+    )
+
+    deleted = 0
+    failed = 0
+    for row in deliveries:
+        try:
+            await bot.delete_message(chat_id=row["user_id"], message_id=row["message_id"])
+            deleted += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.04)
+
+    delete_broadcast_record(bc_id)
+
+    await status_msg.edit_text(
+        f"🗑️ <b>Broadcast #{bc_id} Retracted!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>Deleted from:</b> <code>{deleted}</code> users\n"
+        f"⚠️ <b>Could not delete:</b> <code>{failed}</code> users\n"
+        f"<i>(Some users may have already deleted the message manually.)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
     )
 
 # ==========================================
@@ -1319,8 +1526,26 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if admin_state.get("awaiting_broadcast"):
-        del ADMIN_STATES[user.id]
-        await execute_broadcast(context.bot, update.message.chat_id, text)
+        # Store message for preview, don't send yet
+        ADMIN_STATES[user.id] = {"preview_broadcast": text}
+        user_count = len(get_all_user_ids())
+        await update.message.reply_text(
+            f"👁️ <b>Broadcast Preview</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>This is exactly how your message will appear to users:</i>\n\n"
+            f"{text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 <b>Will be sent to:</b> <code>{user_count}</code> registered users\n"
+            f"📅 <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Ready to broadcast? Click <b>Send Broadcast</b> to confirm.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Send Broadcast", callback_data="bc_confirm_send"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")],
+                [InlineKeyboardButton("✏️ Edit Message", callback_data="bc_edit_message")]
+            ])
+        )
         return
 
     if admin_state.get("awaiting_group_link"):
@@ -1624,6 +1849,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("🗑️ Remove Numbers (.txt)", callback_data="admin_remove_prompt")],
             [InlineKeyboardButton("🌍 Manage Countries & Stock", callback_data="admin_manage_countries")],
             [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
+            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
             [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
             [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
@@ -1695,13 +1921,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "admin_broadcast_prompt" and user_admin:
         ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
         await query.edit_message_text(
-            "📢 <b>Broadcast Message to All Users:</b>\n"
+            "📢 <b>Broadcast Message to All Users</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Please type your broadcast announcement in this chat.\n\n"
-            "<i>Formatting: Supports HTML tags like <code>&lt;b&gt;bold&lt;/b&gt;</code>, <code>&lt;code&gt;code&lt;/code&gt;</code>.</i>",
+            "📝 Type your broadcast message below.\n"
+            "You will see a <b>preview</b> before it's sent.\n\n"
+            "✨ <i>Supports HTML formatting:</i>\n"
+            "• <code>&lt;b&gt;bold&lt;/b&gt;</code> → <b>bold</b>\n"
+            "• <code>&lt;i&gt;italic&lt;/i&gt;</code> → <i>italic</i>\n"
+            "• <code>&lt;code&gt;code&lt;/code&gt;</code> → <code>code</code>\n\n"
+            "💡 <i>Tip: Include emojis to make it look great!</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel Broadcast", callback_data="cancel_broadcast")]
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
             ])
         )
 
@@ -1710,11 +1941,127 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if user.id in ADMIN_STATES:
             del ADMIN_STATES[user.id]
         await query.edit_message_text(
-            "❌ <b>Broadcast cancelled.</b>",
+            "❌ <b>Broadcast Cancelled.</b>\n"
+            "<i>Your message was not sent.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
+        )
+
+    # 11b. Confirm & Send Broadcast
+    elif data == "bc_confirm_send" and user_admin:
+        state = ADMIN_STATES.get(user.id, {})
+        bc_text = state.get("preview_broadcast")
+        if not bc_text:
+            await query.answer("⚠️ No pending broadcast found. Please start again.", show_alert=True)
+            return
+        del ADMIN_STATES[user.id]
+        await query.edit_message_text(
+            "📡 <b>Broadcast is launching...</b>\n"
+            "<i>You'll receive live progress updates below.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        asyncio.create_task(
+            execute_broadcast(context.bot, query.message.chat_id, bc_text, admin_id=user.id)
+        )
+
+    # 11c. Edit broadcast message (go back to awaiting state)
+    elif data == "bc_edit_message" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
+        await query.edit_message_text(
+            "✏️ <b>Edit Your Broadcast Message</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Type your updated message below:\n\n"
+            "<i>Supports HTML: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
+            ])
+        )
+
+    # 11d. Broadcast History
+    elif data == "bc_history" and user_admin:
+        history = get_broadcast_history(limit=8)
+        if not history:
+            await query.edit_message_text(
+                "📋 <b>Broadcast History</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No broadcasts have been sent yet.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")],
+                    [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+
+        lines = ["📋 <b>Broadcast History</b>\n━━━━━━━━━━━━━━━━━━━━"]
+        buttons = []
+        for bc in history:
+            bc_id = bc["id"]
+            preview = (bc["text"][:40] + "...") if len(bc["text"]) > 40 else bc["text"]
+            status_icon = "✅" if bc["status"] == "done" else "⏳"
+            lines.append(
+                f"\n{status_icon} <b>#{bc_id}</b> — <code>{preview}</code>\n"
+                f"   👥 {bc['success_count']}/{bc['total_users']} delivered · "
+                f"📅 {bc['created_at'][:16]}"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"🗑️ Delete #{bc_id}", callback_data=f"bc_delete_{bc_id}"
+            )])
+        buttons.append([InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")])
+        buttons.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    # 11e. Delete a specific Broadcast
+    elif data.startswith("bc_delete_") and user_admin:
+        bc_id_str = data.replace("bc_delete_", "", 1)
+        if not bc_id_str.isdigit():
+            await query.answer("Invalid broadcast ID.", show_alert=True)
+            return
+        bc_id = int(bc_id_str)
+        # Confirm first
+        with get_main_db() as conn:
+            row = conn.execute("SELECT text, success_count, total_users FROM broadcasts WHERE id=?", (bc_id,)).fetchone()
+        if not row:
+            await query.answer(f"⚠️ Broadcast #{bc_id} not found.", show_alert=True)
+            return
+        preview = (dict(row)["text"][:50] + "...") if len(dict(row)["text"]) > 50 else dict(row)["text"]
+        await query.edit_message_text(
+            f"🗑️ <b>Delete Broadcast #{bc_id}?</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 <b>Message:</b> <i>{preview}</i>\n"
+            f"👥 <b>Delivered to:</b> <code>{dict(row)['success_count']}/{dict(row)['total_users']}</code> users\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>This will delete the message from ALL users' chats!</b>\n"
+            f"<i>(Users who deleted it manually won't be affected.)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🗑️ Yes, Delete #{bc_id}", callback_data=f"bc_confirm_delete_{bc_id}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="bc_history")]
+            ])
+        )
+
+    # 11f. Confirm Delete Broadcast
+    elif data.startswith("bc_confirm_delete_") and user_admin:
+        bc_id_str = data.replace("bc_confirm_delete_", "", 1)
+        if not bc_id_str.isdigit():
+            await query.answer("Invalid broadcast ID.", show_alert=True)
+            return
+        bc_id = int(bc_id_str)
+        await query.edit_message_text(
+            f"🗑️ <b>Retracting Broadcast #{bc_id}...</b>\n"
+            f"<i>Deleting from all users' chats. Please wait...</i>",
+            parse_mode=ParseMode.HTML
+        )
+        asyncio.create_task(
+            execute_delete_broadcast(context.bot, query.message.chat_id, bc_id)
         )
 
     # 12. Admin Select Existing Country for Upload / Removal

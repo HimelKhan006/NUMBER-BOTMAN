@@ -278,6 +278,7 @@ def init_db():
         """)
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
+    load_consumed_cache()
 
 def register_user(user_id: int, username: str = "", first_name: str = ""):
     try:
@@ -341,8 +342,37 @@ def get_all_countries_with_stock(only_active: bool = True) -> List[Dict[str, Any
         })
     return results
 
+# ==========================================
+# In-Memory Deduplication Cache (Like OTPMAN)
+# ==========================================
+CONSUMED_NUMBERS_CACHE: Set[str] = set()
+
+def load_consumed_cache():
+    """Preloads all previously delivered numbers into an in-memory set for instantaneous deduplication."""
+    global CONSUMED_NUMBERS_CACHE
+    total_loaded = 0
+    try:
+        with get_main_db() as conn:
+            countries = conn.execute("SELECT id FROM countries;").fetchall()
+        for c in countries:
+            cid = c["id"]
+            try:
+                with get_country_db(cid) as cconn:
+                    used = cconn.execute("SELECT number FROM used_numbers;").fetchall()
+                    for r in used:
+                        CONSUMED_NUMBERS_CACHE.add(r["number"])
+                        total_loaded += 1
+            except Exception:
+                pass
+        logger.info(f"🔒 Deduplication Cache initialized with {total_loaded} previously delivered numbers.")
+    except Exception as e:
+        logger.warning(f"Could not load consumed cache: {e}")
+
 def add_numbers_to_country(country_id: int, numbers: List[str]) -> Tuple[int, int]:
-    """Adds numbers with guaranteed '+' prefix to the isolated country database."""
+    """
+    Adds numbers with guaranteed '+' prefix to the isolated country database.
+    Multi-layer deduplication ensures numbers delivered to ANY user can NEVER be re-added!
+    """
     added = 0
     duplicates = 0
     with get_country_db(country_id) as conn:
@@ -350,6 +380,20 @@ def add_numbers_to_country(country_id: int, numbers: List[str]) -> Tuple[int, in
             num = sanitize_phone_number(raw)
             if not num:
                 continue
+
+            # Layer 1: In-memory instant check against all delivered numbers
+            if num in CONSUMED_NUMBERS_CACHE:
+                duplicates += 1
+                continue
+
+            # Layer 2: SQLite database check in used_numbers archive
+            already_used = conn.execute("SELECT 1 FROM used_numbers WHERE number = ? LIMIT 1;", (num,)).fetchone()
+            if already_used:
+                CONSUMED_NUMBERS_CACHE.add(num)
+                duplicates += 1
+                continue
+
+            # Layer 3: SQLite UNIQUE constraint on available_numbers
             try:
                 conn.execute("INSERT INTO available_numbers (number) VALUES (?);", (num,))
                 added += 1
@@ -375,13 +419,15 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
 def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> Tuple[List[str], int, str]:
     """
     Atomically retrieves 10 numbers for a user and REMOVES them from available stock.
-    Guarantees no other user will EVER get these numbers again!
+    Guarantees with 100% mathematical certainty that no two users will EVER get the same number!
     """
     with get_main_db() as mconn:
         c_row = mconn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
         country_name = c_row["name"] if c_row else "Unknown"
 
     with get_country_db(country_id) as cconn:
+        # Atomic transaction lock
+        cconn.execute("BEGIN IMMEDIATE;")
         cur = cconn.execute("""
             SELECT id, number FROM available_numbers
             ORDER BY id ASC
@@ -390,6 +436,7 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> 
         rows = cur.fetchall()
 
         if not rows:
+            cconn.commit()
             return [], 0, country_name
 
         numbers = [r["number"] for r in rows]
@@ -399,6 +446,7 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> 
         cconn.execute(f"DELETE FROM available_numbers WHERE id IN ({','.join(['?']*len(ids))});", ids)
         for num in numbers:
             cconn.execute("INSERT INTO used_numbers (number, user_id) VALUES (?, ?);", (num, user_id))
+            CONSUMED_NUMBERS_CACHE.add(num)
         cconn.commit()
 
         # Get remaining available count
@@ -601,6 +649,7 @@ class GistStorage:
             return False
         try:
             countries_data = {}
+            used_data = {}
             with get_main_db() as conn:
                 cur = conn.execute("SELECT id, name FROM countries;")
                 for c_row in cur.fetchall():
@@ -608,8 +657,11 @@ class GistStorage:
                     cname = c_row["name"]
                     with get_country_db(cid) as cconn:
                         num_list = [r["number"] for r in cconn.execute("SELECT number FROM available_numbers;").fetchall()]
+                        u_list = [r["number"] for r in cconn.execute("SELECT number FROM used_numbers;").fetchall()]
                         if num_list:
                             countries_data[cname] = num_list
+                        if u_list:
+                            used_data[cname] = u_list
 
             payload = {
                 "description": self.description,
@@ -620,6 +672,7 @@ class GistStorage:
                             "updated_at": datetime.now(timezone.utc).isoformat(),
                             "total_countries": len(countries_data),
                             "countries": countries_data,
+                            "used_countries": used_data,
                         }, indent=2)
                     }
                 }
@@ -627,7 +680,7 @@ class GistStorage:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
                 if res.is_success:
-                    logger.info("☁️ Database backed up to GitHub Gist.")
+                    logger.info("☁️ Database & Used Numbers archive backed up to GitHub Gist.")
                     return True
         except Exception as e:
             logger.warning(f"Gist export error: {e}")
@@ -646,12 +699,32 @@ class GistStorage:
                         content = files[self.filename].get("content", "{}")
                         parsed = json.loads(content)
                         countries_data = parsed.get("countries", {})
+                        used_data = parsed.get("used_countries", {})
                         total_restored = 0
+                        total_used_restored = 0
+
+                        # 1. Restore used numbers archive first so deduplication cache is 100% armed
+                        for cname, u_list in used_data.items():
+                            cid = get_or_create_country(cname)
+                            with get_country_db(cid) as cconn:
+                                for unum in u_list:
+                                    s_num = sanitize_phone_number(unum)
+                                    if s_num:
+                                        CONSUMED_NUMBERS_CACHE.add(s_num)
+                                        try:
+                                            cconn.execute("INSERT OR IGNORE INTO used_numbers (number, user_id) VALUES (?, 0);", (s_num,))
+                                            total_used_restored += 1
+                                        except Exception:
+                                            pass
+                                cconn.commit()
+
+                        # 2. Restore available stock (strictly deduplicated against used archive)
                         for cname, num_list in countries_data.items():
                             cid = get_or_create_country(cname)
                             added, _ = add_numbers_to_country(cid, num_list)
                             total_restored += added
-                        logger.info(f"☁️ Restored {total_restored} numbers from GitHub Gist.")
+
+                        logger.info(f"☁️ Restored {total_restored} available numbers & {total_used_restored} archived used numbers from GitHub Gist.")
                         return True
         except Exception as e:
             logger.warning(f"Gist restore error: {e}")

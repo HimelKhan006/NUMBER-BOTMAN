@@ -16,6 +16,14 @@ import os
 import sys
 import subprocess
 
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 # ==========================================
 # 1. Auto Dependency Installer
 # ==========================================
@@ -1985,13 +1993,6 @@ def main():
 
     init_db()
 
-    # Cloud Gist restore on startup
-    if gist_storage.enabled:
-        async def init_gist():
-            await gist_storage.ensure_gist()
-            await gist_storage.restore_from_gist()
-        asyncio.run(init_gist())
-
     httpx_req = HTTPXRequest(
         connection_pool_size=16,
         connect_timeout=15.0,
@@ -2053,6 +2054,13 @@ def main():
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 
     async def post_init(application: Application):
+        # Cloud Gist restore safely inside active loop
+        if gist_storage.enabled:
+            try:
+                await gist_storage.ensure_gist()
+                await gist_storage.restore_from_gist()
+            except Exception as e:
+                logger.warning(f"Gist startup sync notice: {e}")
         await setup_bot_commands(application)
         await send_startup_announcement(application)
 
@@ -2062,4 +2070,8 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"FATAL BOT SHUTDOWN: {e}", exc_info=True)
+        sys.exit(1)

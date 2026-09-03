@@ -124,6 +124,8 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           echo "========================================"
           echo "  NUMBER BOTMAN — Starting Up"

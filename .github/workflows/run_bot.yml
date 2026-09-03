@@ -162,7 +162,7 @@ jobs:
           key: bot4-database-persistent
 
       - name: Self-Trigger Next Run (Zero Downtime Restart)
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

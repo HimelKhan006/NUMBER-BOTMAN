@@ -874,7 +874,7 @@ def get_numbers_view_keyboard(country_id: int) -> InlineKeyboardMarkup:
     """Builds number result keyboard. Includes OTP group URL buttons at the bottom."""
     buttons = [
         [
-            InlineKeyboardButton("🔄 Change Numbers", callback_data=f"change_num_{country_id}"),
+            InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=f"change_num_{country_id}"),
             InlineKeyboardButton("🌍 Change Country", callback_data="btn_get_number")
         ],
     ]
@@ -1846,15 +1846,175 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"⚡ <i>Upload .txt to Add or Remove numbers in bulk:</i>"
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("🗑️ Remove Numbers (.txt)", callback_data="admin_remove_prompt")],
-            [InlineKeyboardButton("🌍 Manage Countries & Stock", callback_data="admin_manage_countries")],
-            [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
-            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
-            [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
-            [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
+            [InlineKeyboardButton("📁 Uploaded Number Files", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+            [InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
+            [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
+            [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 6b. Admin View Uploaded Number Files & Stock Pools
+    elif (data == "admin_uploaded_files" or data.startswith("page_upfiles_")) and user_admin:
+        page = int(data.split("_")[2]) if data.startswith("page_upfiles_") else 0
+        countries = get_all_countries_with_stock(only_active=False)
+        stats = get_system_stats()
+
+        if not countries:
+            await query.edit_message_text(
+                "📁 <b>Uploaded Number Files</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No number files or country pools uploaded yet.</i>\n\n"
+                "Click below to upload your first country numbers file (.txt)!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                    [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+
+        per_page = 6
+        start = page * per_page
+        end = start + per_page
+        page_c = countries[start:end]
+
+        lines = [
+            "📁 <b>Uploaded Number Files & Stocks</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"• <b>Total in Stock:</b> <code>{stats['total_available']} numbers</code>",
+            f"• <b>Delivered / Used:</b> <code>{stats['total_consumed']} numbers</code>",
+            f"• <b>Active Pools:</b> <code>{len(countries)} countries</code>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "📋 <b>Active Country Files:</b>"
+        ]
+
+        for idx, c in enumerate(page_c, start + 1):
+            lines.append(f"{idx}. <b>{c['name']}</b>: <code>{c['available']} available</code> (Used: <code>{c['used']}</code>)")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("👇 <i>Click any country below to view details or manage:</i>")
+
+        buttons = []
+        row = []
+        for c in page_c:
+            row.append(InlineKeyboardButton(f"{c['name']} ({c['available']})", callback_data=f"adm_country_{c['id']}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"page_upfiles_{page-1}"))
+        if end < len(countries):
+            nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"page_upfiles_{page+1}"))
+        if nav_row:
+            buttons.append(nav_row)
+
+        buttons.append([
+            InlineKeyboardButton("➕ Upload New .txt", callback_data="admin_upload_prompt"),
+            InlineKeyboardButton("🗑️ Remove Numbers", callback_data="admin_remove_files_menu")
+        ])
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    # 6c. Admin Remove Numbers / Files Menu (1-Click Removal)
+    elif (data == "admin_remove_files_menu" or data.startswith("page_rmfiles_")) and user_admin:
+        page = int(data.split("_")[2]) if data.startswith("page_rmfiles_") else 0
+        countries = get_all_countries_with_stock(only_active=False)
+
+        if not countries:
+            await query.edit_message_text(
+                "🗑️ <b>Remove Numbers & Files</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No country files or numbers available to remove.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                    [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+
+        per_page = 6
+        start = page * per_page
+        end = start + per_page
+        page_c = countries[start:end]
+
+        lines = [
+            "🗑️ <b>Remove Numbers & Country Files</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "⚡ <b>1-Click Removal:</b>",
+            "<i>Click any country file button below to delete all its numbers from stock instantly without uploading any file:</i>",
+            "━━━━━━━━━━━━━━━━━━━━"
+        ]
+
+        buttons = []
+        for c in page_c:
+            buttons.append([InlineKeyboardButton(f"🗑️ Delete {c['name']} ({c['available']} nums)", callback_data=f"adm_quick_del_{c['id']}")])
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"page_rmfiles_{page-1}"))
+        if end < len(countries):
+            nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"page_rmfiles_{page+1}"))
+        if nav_row:
+            buttons.append(nav_row)
+
+        buttons.append([InlineKeyboardButton("📄 Remove Specific Numbers (.txt)", callback_data="admin_remove_prompt")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    # 6d. Quick Delete Confirmation
+    elif data.startswith("adm_quick_del_") and not data.startswith("adm_quick_del_do_") and user_admin:
+        cid = int(data.split("_")[3])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        c_avail = c_info.get("available", 0)
+
+        text = (
+            f"⚠️ <b>Confirm Deletion — {c_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Are you sure you want to remove <b>{c_name}</b> and delete all <b>{c_avail} available numbers</b> from stock?\n\n"
+            f"• <i>The file & numbers will be removed immediately from stock.</i>\n"
+            f"• <i>Cloud Gist will sync automatically.</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Yes, Delete {c_name} Numbers", callback_data=f"adm_quick_del_do_{cid}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_remove_files_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 6e. Execute Quick Delete
+    elif data.startswith("adm_quick_del_do_") and user_admin:
+        cid = int(data.split("_")[4])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        c_avail = c_info.get("available", 0)
+
+        delete_country_and_stock(cid)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        text = (
+            f"✅ <b>Successfully Removed!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🗑️ <b>Deleted:</b> <code>{c_avail} numbers removed from stock</code>\n"
+            f"☁️ <b>Cloud Status:</b> <code>Synchronized & Updated</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Remove Another File", callback_data="admin_remove_files_menu")],
+            [InlineKeyboardButton("📁 Uploaded Files", callback_data="admin_uploaded_files")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 7. Admin Add Numbers Prompt
     elif data == "admin_upload_prompt" and user_admin:
@@ -2185,8 +2345,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ Delete Country & All Stock", callback_data=f"adm_del_confirm_{cid}")],
-                [InlineKeyboardButton("🔙 Back to Countries", callback_data="admin_manage_countries")]
+                [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
+                [InlineKeyboardButton("➕ Add More Numbers (.txt)", callback_data="admin_upload_prompt")],
+                [InlineKeyboardButton("📁 All Uploaded Files", callback_data="admin_uploaded_files")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
 

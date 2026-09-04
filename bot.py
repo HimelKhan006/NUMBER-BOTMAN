@@ -2532,7 +2532,7 @@ def main():
     app.post_init = post_init
 
     logger.info("🚀 NUMBER BOTMAN is running live in multi-user exclusive mode!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
     try:

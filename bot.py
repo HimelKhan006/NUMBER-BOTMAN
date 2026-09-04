@@ -6,10 +6,12 @@
 - Single-Use Number Delivery (Numbers auto-removed on issue, 100% exclusive)
 - Guaranteed '+' Prefix on all phone numbers
 - Separated Main Management DB + Dedicated Country Databases
+- Standard Numbers + Secret Numbers Pool with Admin Access Whitelisting
 - Admin Bulk Number Upload & Bulk Removal via .txt Files
+- Comprehensive User Management, Profile Inspection & Real-time Consumption Tracking
 - Multi-User Session Isolation & Instant 10-Number Rotation
-- 28-Hour Gist Persistent Cloud Storage & SQLite WAL Architecture
-- Professional Admin Panel, Broadcast System & User Analytics
+- GitHub Gist Persistent Cloud Storage & SQLite WAL Architecture
+- Clean, Minimalist & Professional Interface
 """
 
 import os
@@ -129,10 +131,8 @@ MAIN_DB_FILE    = os.getenv("DB_FILE", os.path.join(BASE_DIR, "bot4_database.db"
 STOCKS_DIR      = os.path.join(BASE_DIR, "country_stocks")
 os.makedirs(STOCKS_DIR, exist_ok=True)
 
-DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
-
 # ==========================================
-# 4. Logging
+# 4. Logging & Helpers
 # ==========================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -141,16 +141,14 @@ logging.basicConfig(
 logger = logging.getLogger("NUMBER_BOTMAN")
 
 def is_admin(user_id: int) -> bool:
-    """Strict admin check — always requires explicit ADMIN_USER_IDS. Never grants access by default."""
+    """Strict admin check — always requires explicit ADMIN_USER_IDS."""
     if not ADMIN_USER_IDS:
-        return False  # No admins configured -> nobody is admin
+        return False
     return user_id in ADMIN_USER_IDS
 
 def is_user_authorized(user_id: int) -> bool:
-    """Alias kept for compatibility — use is_admin() for all admin checks."""
     return is_admin(user_id)
 
-# Country Flags mapping
 COUNTRY_FLAGS = {
     "usa": "🇺🇸", "united states": "🇺🇸", "us": "🇺🇸",
     "uk": "🇬🇧", "united kingdom": "🇬🇧", "england": "🇬🇧", "great britain": "🇬🇧",
@@ -221,6 +219,7 @@ def get_country_db(country_id: int):
         CREATE TABLE IF NOT EXISTS available_numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             number TEXT UNIQUE NOT NULL,
+            is_secret INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -229,9 +228,19 @@ def get_country_db(country_id: int):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             number TEXT NOT NULL,
             user_id INTEGER,
+            is_secret INTEGER DEFAULT 0,
             delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Auto-migrations for existing databases
+    try:
+        conn.execute("ALTER TABLE available_numbers ADD COLUMN is_secret INTEGER DEFAULT 0;")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE used_numbers ADD COLUMN is_secret INTEGER DEFAULT 0;")
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -250,13 +259,18 @@ def init_db():
                 username TEXT,
                 first_name TEXT,
                 numbers_consumed INTEGER DEFAULT 0,
+                has_secret_access INTEGER DEFAULT 0,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Auto-migration if table was created previously with older schema
+        # Auto-migrations
         try:
             conn.execute("ALTER TABLE users ADD COLUMN numbers_consumed INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN has_secret_access INTEGER DEFAULT 0;")
         except Exception:
             pass
         conn.execute("""
@@ -265,9 +279,14 @@ def init_db():
                 user_id INTEGER,
                 country_id INTEGER,
                 number_count INTEGER,
+                is_secret INTEGER DEFAULT 0,
                 delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        try:
+            conn.execute("ALTER TABLE delivery_log ADD COLUMN is_secret INTEGER DEFAULT 0;")
+        except Exception:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS linked_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,31 +295,6 @@ def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # ── Broadcast Management Tables ──
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS broadcasts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                sent_by INTEGER NOT NULL,
-                total_users INTEGER DEFAULT 0,
-                success_count INTEGER DEFAULT 0,
-                failed_count INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'sending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS broadcast_deliveries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                broadcast_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                message_id INTEGER,
-                delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (broadcast_id) REFERENCES broadcasts(id)
-            );
-        """)
-        # Auto-create index for fast lookups
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_deliver ON broadcast_deliveries(broadcast_id, user_id);")
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
@@ -309,11 +303,11 @@ def register_user(user_id: int, username: str = "", first_name: str = ""):
     try:
         with get_main_db() as conn:
             conn.execute("""
-                INSERT INTO users (user_id, username, first_name, numbers_consumed, joined_at, last_seen)
-                VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen)
+                VALUES (?, ?, ?, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
+                    username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+                    first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
                     last_seen = CURRENT_TIMESTAMP;
             """, (user_id, username or "", first_name or ""))
             conn.commit()
@@ -325,6 +319,74 @@ def get_all_user_ids() -> List[int]:
         cur = conn.execute("SELECT user_id FROM users;")
         return [row["user_id"] for row in cur.fetchall()]
 
+def get_user_details(user_id: int) -> Optional[Dict[str, Any]]:
+    with get_main_db() as conn:
+        row = conn.execute("""
+            SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen
+            FROM users WHERE user_id = ?;
+        """, (user_id,)).fetchone()
+        return dict(row) if row else None
+
+def user_has_secret_access(user_id: int) -> bool:
+    """Admins always have full secret access. Regular users need granted access."""
+    if is_admin(user_id):
+        return True
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT has_secret_access FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+            if row and row["has_secret_access"] == 1:
+                return True
+    except Exception as e:
+        logger.warning(f"Error checking secret access for {user_id}: {e}")
+    return False
+
+def set_user_secret_access(user_id: int, granted: bool) -> bool:
+    val = 1 if granted else 0
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO users (user_id, has_secret_access, last_seen)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    has_secret_access = excluded.has_secret_access,
+                    last_seen = CURRENT_TIMESTAMP;
+            """, (user_id, val))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error setting secret access for {user_id}: {e}")
+        return False
+
+def get_all_users_detailed(limit: int = 10, offset: int = 0, search: str = "") -> Tuple[List[Dict[str, Any]], int]:
+    with get_main_db() as conn:
+        if search:
+            search_pattern = f"%{search.strip()}%"
+            cur_count = conn.execute("""
+                SELECT COUNT(*) FROM users
+                WHERE CAST(user_id AS TEXT) LIKE ? OR username LIKE ? OR first_name LIKE ?;
+            """, (search_pattern, search_pattern, search_pattern))
+            total = cur_count.fetchone()[0]
+
+            cur = conn.execute("""
+                SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen
+                FROM users
+                WHERE CAST(user_id AS TEXT) LIKE ? OR username LIKE ? OR first_name LIKE ?
+                ORDER BY numbers_consumed DESC, last_seen DESC
+                LIMIT ? OFFSET ?;
+            """, (search_pattern, search_pattern, search_pattern, limit, offset))
+            rows = [dict(r) for r in cur.fetchall()]
+            return rows, total
+        else:
+            total = conn.execute("SELECT COUNT(*) FROM users;").fetchone()[0]
+            cur = conn.execute("""
+                SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen
+                FROM users
+                ORDER BY numbers_consumed DESC, last_seen DESC
+                LIMIT ? OFFSET ?;
+            """, (limit, offset))
+            rows = [dict(r) for r in cur.fetchall()]
+            return rows, total
+
 def get_or_create_country(country_name: str) -> int:
     formatted = format_country_name(country_name)
     with get_main_db() as conn:
@@ -335,11 +397,10 @@ def get_or_create_country(country_name: str) -> int:
         cur = conn.execute("INSERT INTO countries (name) VALUES (?);", (formatted,))
         conn.commit()
         cid = cur.lastrowid
-        # Initialize country DB
         get_country_db(cid).close()
         return cid
 
-def get_all_countries_with_stock(only_active: bool = True) -> List[Dict[str, Any]]:
+def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = False) -> List[Dict[str, Any]]:
     results = []
     with get_main_db() as conn:
         cur = conn.execute("SELECT id, name FROM countries ORDER BY name ASC;")
@@ -350,30 +411,38 @@ def get_all_countries_with_stock(only_active: bool = True) -> List[Dict[str, Any
         cname = c["name"]
         try:
             with get_country_db(cid) as cconn:
-                avail = cconn.execute("SELECT COUNT(*) FROM available_numbers;").fetchone()[0]
-                used = cconn.execute("SELECT COUNT(*) FROM used_numbers;").fetchone()[0]
+                avail_std = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 0;").fetchone()[0]
+                avail_sec = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 1;").fetchone()[0]
+                used_std  = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 0;").fetchone()[0]
+                used_sec  = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 1;").fetchone()[0]
         except Exception:
-            avail, used = 0, 0
+            avail_std, avail_sec, used_std, used_sec = 0, 0, 0, 0
 
-        if only_active and avail == 0:
+        target_avail = avail_sec if secret_mode else avail_std
+        if only_active and target_avail == 0:
             continue
 
         results.append({
             "id": cid,
             "name": cname,
-            "available": avail,
-            "used": used,
-            "total": avail + used,
+            "available": target_avail,
+            "available_std": avail_std,
+            "available_sec": avail_sec,
+            "used_std": used_std,
+            "used_sec": used_sec,
+            "total_available": avail_std + avail_sec,
+            "total_used": used_std + used_sec,
+            "total": avail_std + avail_sec + used_std + used_sec,
         })
     return results
 
 # ==========================================
-# In-Memory Deduplication Cache (Like OTPMAN)
+# In-Memory Deduplication Cache
 # ==========================================
 CONSUMED_NUMBERS_CACHE: Set[str] = set()
 
 def load_consumed_cache():
-    """Preloads all previously delivered numbers into an in-memory set for instantaneous deduplication."""
+    """Preloads all delivered numbers into memory for instantaneous deduplication."""
     global CONSUMED_NUMBERS_CACHE
     total_loaded = 0
     try:
@@ -393,25 +462,26 @@ def load_consumed_cache():
     except Exception as e:
         logger.warning(f"Could not load consumed cache: {e}")
 
-def add_numbers_to_country(country_id: int, numbers: List[str]) -> Tuple[int, int]:
+def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool = False) -> Tuple[int, int]:
     """
     Adds numbers with guaranteed '+' prefix to the isolated country database.
-    Multi-layer deduplication ensures numbers delivered to ANY user can NEVER be re-added!
+    Can be marked as standard (is_secret=0) or secret (is_secret=1).
     """
     added = 0
     duplicates = 0
+    secret_val = 1 if is_secret else 0
     with get_country_db(country_id) as conn:
         for raw in numbers:
             num = sanitize_phone_number(raw)
             if not num:
                 continue
 
-            # Layer 1: In-memory instant check against all delivered numbers
+            # Layer 1: In-memory instant check
             if num in CONSUMED_NUMBERS_CACHE:
                 duplicates += 1
                 continue
 
-            # Layer 2: SQLite database check in used_numbers archive
+            # Layer 2: SQLite check in used_numbers archive
             already_used = conn.execute("SELECT 1 FROM used_numbers WHERE number = ? LIMIT 1;", (num,)).fetchone()
             if already_used:
                 CONSUMED_NUMBERS_CACHE.add(num)
@@ -420,7 +490,7 @@ def add_numbers_to_country(country_id: int, numbers: List[str]) -> Tuple[int, in
 
             # Layer 3: SQLite UNIQUE constraint on available_numbers
             try:
-                conn.execute("INSERT INTO available_numbers (number) VALUES (?);", (num,))
+                conn.execute("INSERT INTO available_numbers (number, is_secret) VALUES (?, ?);", (num, secret_val))
                 added += 1
             except sqlite3.IntegrityError:
                 duplicates += 1
@@ -441,23 +511,24 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
         conn.commit()
     return removed
 
-def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> Tuple[List[str], int, str]:
+def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_secret: bool = False) -> Tuple[List[str], int, str]:
     """
-    Atomically retrieves 10 numbers for a user and REMOVES them from available stock.
-    Guarantees with 100% mathematical certainty that no two users will EVER get the same number!
+    Atomically retrieves numbers for a user and REMOVES them from available stock.
+    Guarantees 100% exclusivity.
     """
+    secret_val = 1 if is_secret else 0
     with get_main_db() as mconn:
         c_row = mconn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
         country_name = c_row["name"] if c_row else "Unknown"
 
     with get_country_db(country_id) as cconn:
-        # Atomic transaction lock
         cconn.execute("BEGIN IMMEDIATE;")
         cur = cconn.execute("""
             SELECT id, number FROM available_numbers
+            WHERE is_secret = ?
             ORDER BY id ASC
             LIMIT ?;
-        """, (limit,))
+        """, (secret_val, limit))
         rows = cur.fetchall()
 
         if not rows:
@@ -467,17 +538,14 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> 
         numbers = [r["number"] for r in rows]
         ids = [r["id"] for r in rows]
 
-        # Atomically remove from available stock & move to used archive
         cconn.execute(f"DELETE FROM available_numbers WHERE id IN ({','.join(['?']*len(ids))});", ids)
         for num in numbers:
-            cconn.execute("INSERT INTO used_numbers (number, user_id) VALUES (?, ?);", (num, user_id))
+            cconn.execute("INSERT INTO used_numbers (number, user_id, is_secret) VALUES (?, ?, ?);", (num, user_id, secret_val))
             CONSUMED_NUMBERS_CACHE.add(num)
         cconn.commit()
 
-        # Get remaining available count
-        remaining = cconn.execute("SELECT COUNT(*) FROM available_numbers;").fetchone()[0]
+        remaining = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = ?;", (secret_val,)).fetchone()[0]
 
-    # Update user consumption counter in main DB
     try:
         with get_main_db() as mconn:
             mconn.execute("""
@@ -485,8 +553,8 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10) -> 
                 WHERE user_id = ?;
             """, (len(numbers), user_id))
             mconn.execute("""
-                INSERT INTO delivery_log (user_id, country_id, number_count) VALUES (?, ?, ?);
-            """, (user_id, country_id, len(numbers)))
+                INSERT INTO delivery_log (user_id, country_id, number_count, is_secret) VALUES (?, ?, ?, ?);
+            """, (user_id, country_id, len(numbers), secret_val))
             mconn.commit()
     except Exception as e:
         logger.warning(f"Error logging delivery: {e}")
@@ -498,10 +566,19 @@ def delete_country_and_stock(country_id: int) -> bool:
         with get_main_db() as conn:
             conn.execute("DELETE FROM countries WHERE id = ?;", (country_id,))
             conn.commit()
-        # Delete country SQLite DB file
         c_db_path = os.path.join(STOCKS_DIR, f"country_{country_id}.db")
         if os.path.exists(c_db_path):
-            os.remove(c_db_path)
+            import gc
+            gc.collect()
+            try:
+                os.remove(c_db_path)
+            except Exception:
+                try:
+                    with sqlite3.connect(c_db_path) as cconn:
+                        cconn.execute("DELETE FROM available_numbers;")
+                        cconn.commit()
+                except Exception:
+                    pass
         return True
     except Exception as e:
         logger.error(f"Error deleting country {country_id}: {e}")
@@ -511,21 +588,26 @@ def get_system_stats() -> Dict[str, Any]:
     with get_main_db() as mconn:
         total_users = mconn.execute("SELECT COUNT(*) FROM users;").fetchone()[0]
         total_consumed = mconn.execute("SELECT COALESCE(SUM(numbers_consumed), 0) FROM users;").fetchone()[0]
+        total_secret_users = mconn.execute("SELECT COUNT(*) FROM users WHERE has_secret_access = 1;").fetchone()[0]
 
     all_countries = get_all_countries_with_stock(only_active=False)
-    total_available = sum(c["available"] for c in all_countries)
-    active_countries_count = sum(1 for c in all_countries if c["available"] > 0)
+    total_std_avail = sum(c["available_std"] for c in all_countries)
+    total_sec_avail = sum(c["available_sec"] for c in all_countries)
+    active_countries_count = sum(1 for c in all_countries if (c["available_std"] + c["available_sec"]) > 0)
 
     return {
-        "total_available": total_available,
+        "total_available": total_std_avail + total_sec_avail,
+        "total_std_available": total_std_avail,
+        "total_sec_available": total_sec_avail,
         "total_consumed": total_consumed,
         "total_users": total_users,
+        "total_secret_users": total_secret_users,
         "total_countries": len(all_countries),
         "active_countries": active_countries_count,
     }
 
 # ==========================================
-# Group Management Functions
+# Group Management Functions (Direct OTP Links)
 # ==========================================
 def add_linked_group(title: str = "", invite_link: str = "") -> bool:
     try:
@@ -549,7 +631,6 @@ def add_linked_group(title: str = "", invite_link: str = "") -> bool:
         return False
 
 def remove_linked_group(group_id: int) -> bool:
-    """Removes a linked group by its DB primary key id."""
     try:
         with get_main_db() as conn:
             conn.execute("DELETE FROM linked_groups WHERE id = ?;", (group_id,))
@@ -560,7 +641,6 @@ def remove_linked_group(group_id: int) -> bool:
         return False
 
 def set_primary_group(title: str = "", invite_link: str = "") -> bool:
-    """Clears old links and sets the new primary OTP group link."""
     try:
         clean_link = invite_link.strip()
         if not clean_link:
@@ -588,16 +668,6 @@ def get_linked_groups() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error fetching linked groups: {e}")
         return []
-
-def get_top_users(limit: int = 10) -> List[Dict[str, Any]]:
-    with get_main_db() as conn:
-        cur = conn.execute("""
-            SELECT user_id, username, first_name, numbers_consumed, last_seen
-            FROM users
-            ORDER BY numbers_consumed DESC, last_seen DESC
-            LIMIT ?;
-        """, (limit,))
-        return [dict(row) for row in cur.fetchall()]
 
 # ==========================================
 # 6. Gist Persistent Storage Sync
@@ -655,7 +725,7 @@ class GistStorage:
                         "public": False,
                         "files": {
                             self.filename: {
-                                "content": json.dumps({"bot": self.bot_name, "countries": {}, "updated_at": datetime.now(timezone.utc).isoformat()}, indent=2)
+                                "content": json.dumps({"bot": self.bot_name, "countries": {}, "users": [], "updated_at": datetime.now(timezone.utc).isoformat()}, indent=2)
                             }
                         }
                     }
@@ -681,12 +751,24 @@ class GistStorage:
                     cid = c_row["id"]
                     cname = c_row["name"]
                     with get_country_db(cid) as cconn:
-                        num_list = [r["number"] for r in cconn.execute("SELECT number FROM available_numbers;").fetchall()]
-                        u_list = [r["number"] for r in cconn.execute("SELECT number FROM used_numbers;").fetchall()]
-                        if num_list:
-                            countries_data[cname] = num_list
+                        std_list = [r["number"] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 0;").fetchall()]
+                        sec_list = [r["number"] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 1;").fetchall()]
+                        u_list   = [r["number"] for r in cconn.execute("SELECT number FROM used_numbers;").fetchall()]
+                        if std_list or sec_list:
+                            countries_data[cname] = {
+                                "standard": std_list,
+                                "secret": sec_list,
+                            }
                         if u_list:
                             used_data[cname] = u_list
+
+                # Export users
+                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at FROM users;")
+                users_data = [dict(r) for r in users_cur.fetchall()]
+
+                # Export linked groups
+                groups_cur = conn.execute("SELECT title, invite_link FROM linked_groups;")
+                groups_data = [dict(r) for r in groups_cur.fetchall()]
 
             payload = {
                 "description": self.description,
@@ -698,6 +780,8 @@ class GistStorage:
                             "total_countries": len(countries_data),
                             "countries": countries_data,
                             "used_countries": used_data,
+                            "users": users_data,
+                            "linked_groups": groups_data,
                         }, indent=2)
                     }
                 }
@@ -705,7 +789,7 @@ class GistStorage:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
                 if res.is_success:
-                    logger.info("☁️ Database & Used Numbers archive backed up to GitHub Gist.")
+                    logger.info("☁️ Database, Users & Numbers backed up to GitHub Gist.")
                     return True
         except Exception as e:
             logger.warning(f"Gist export error: {e}")
@@ -725,10 +809,40 @@ class GistStorage:
                         parsed = json.loads(content)
                         countries_data = parsed.get("countries", {})
                         used_data = parsed.get("used_countries", {})
-                        total_restored = 0
-                        total_used_restored = 0
+                        users_data = parsed.get("users", [])
+                        groups_data = parsed.get("linked_groups", [])
 
-                        # 1. Restore used numbers archive first so deduplication cache is 100% armed
+                        # 1. Restore Users & Permissions
+                        with get_main_db() as mconn:
+                            for u in users_data:
+                                uid = u.get("user_id")
+                                if not uid:
+                                    continue
+                                mconn.execute("""
+                                    INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen)
+                                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    ON CONFLICT(user_id) DO UPDATE SET
+                                        username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+                                        first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
+                                        numbers_consumed = max(users.numbers_consumed, excluded.numbers_consumed),
+                                        has_secret_access = excluded.has_secret_access;
+                                """, (
+                                    uid,
+                                    u.get("username", ""),
+                                    u.get("first_name", ""),
+                                    u.get("numbers_consumed", 0),
+                                    u.get("has_secret_access", 0),
+                                    u.get("joined_at", datetime.now(timezone.utc).isoformat())
+                                ))
+                            mconn.commit()
+
+                        # 2. Restore Linked Groups
+                        for g in groups_data:
+                            if isinstance(g, dict) and "invite_link" in g:
+                                add_linked_group(g.get("title", ""), g["invite_link"])
+
+                        # 3. Restore used numbers archive
+                        total_used_restored = 0
                         for cname, u_list in used_data.items():
                             cid = get_or_create_country(cname)
                             with get_country_db(cid) as cconn:
@@ -743,13 +857,28 @@ class GistStorage:
                                             pass
                                 cconn.commit()
 
-                        # 2. Restore available stock (strictly deduplicated against used archive)
-                        for cname, num_list in countries_data.items():
+                        # 4. Restore available numbers (Standard & Secret)
+                        total_std_restored = 0
+                        total_sec_restored = 0
+                        for cname, c_stock in countries_data.items():
                             cid = get_or_create_country(cname)
-                            added, _ = add_numbers_to_country(cid, num_list)
-                            total_restored += added
+                            if isinstance(c_stock, dict):
+                                std_nums = c_stock.get("standard", [])
+                                sec_nums = c_stock.get("secret", [])
+                                if std_nums:
+                                    added_std, _ = add_numbers_to_country(cid, std_nums, is_secret=False)
+                                    total_std_restored += added_std
+                                if sec_nums:
+                                    added_sec, _ = add_numbers_to_country(cid, sec_nums, is_secret=True)
+                                    total_sec_restored += added_sec
+                            elif isinstance(c_stock, list):
+                                added, _ = add_numbers_to_country(cid, c_stock, is_secret=False)
+                                total_std_restored += added
 
-                        logger.info(f"☁️ Restored {total_restored} available numbers & {total_used_restored} archived used numbers from GitHub Gist.")
+                        logger.info(
+                            f"☁️ Restored {len(users_data)} users, {total_std_restored} standard numbers, "
+                            f"{total_sec_restored} secret numbers & {total_used_restored} archived used numbers from GitHub Gist."
+                        )
                         return True
         except Exception as e:
             logger.warning(f"Gist restore error: {e}")
@@ -758,7 +887,6 @@ class GistStorage:
 gist_storage = GistStorage(GIST_ID, GIST_TOKEN)
 
 # Admin interactive state management
-# admin_id -> {"numbers": List[str], "filename": str, "mode": "add"|"remove", "awaiting_country_name": bool, "awaiting_broadcast": bool}
 ADMIN_STATES: Dict[int, Dict[str, Any]] = {}
 
 # ==========================================
@@ -799,14 +927,15 @@ async def send_startup_announcement(application: Application):
 
     stats = get_system_stats()
     admin_msg = (
-        "🚀 <b>NUMBER BOTMAN ONLINE (Admin Alert)</b>\n"
+        "🚀 <b>NUMBER BOTMAN ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• <b>Status:</b> <code>Active & Serving Live Numbers ✅</code>\n"
-        "• <b>Storage:</b> <code>Per-Country Database Active ☁️</code>\n"
-        f"• <b>Active Stock:</b> <code>{stats['total_available']} Available Numbers</code>\n"
-        f"• <b>Delivered Total:</b> <code>{stats['total_consumed']} Numbers Consumed</code>\n"
-        f"• <b>Country Pools:</b> <code>{stats['active_countries']} Active Countries</code>\n"
-        "🔔 <i>Single-use exclusive delivery & .txt management ready.</i>\n"
+        "• <b>Storage:</b> <code>SQLite WAL + Gist Cloud Backup ☁️</code>\n"
+        f"• <b>Standard Stock:</b> <code>{stats['total_std_available']} Numbers</code>\n"
+        f"• <b>Secret Stock:</b> <code>{stats['total_sec_available']} Numbers 🔒</code>\n"
+        f"• <b>Total Delivered:</b> <code>{stats['total_consumed']} Numbers</code>\n"
+        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
+        "🔔 <i>Single-use exclusive delivery & secret permission engine ready.</i>\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     for aid in ADMIN_USER_IDS:
@@ -821,25 +950,37 @@ async def send_startup_announcement(application: Application):
 # 9. Keyboards & Views
 # ==========================================
 def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
-    """Builds the main menu keyboard. Admin panel button only shown to confirmed admins."""
+    """Builds the main menu keyboard with standard and secret number options."""
     buttons = [
-        [InlineKeyboardButton("📱 Get Number", callback_data="btn_get_number")],
-        [InlineKeyboardButton("📊 Number Inventory", callback_data="btn_inventory"), InlineKeyboardButton("ℹ️ Help / Info", callback_data="btn_help")]
+        [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")],
     ]
+
+    # Display Secret Numbers button if admin or user has whitelisted secret access
+    if user_id and user_has_secret_access(user_id):
+        buttons.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
+
+    buttons.append([
+        InlineKeyboardButton("📊 Number Inventory", callback_data="btn_inventory"),
+        InlineKeyboardButton("ℹ️ Help / Info", callback_data="btn_help")
+    ])
+
     if user_id and is_admin(user_id):
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+
     return InlineKeyboardMarkup(buttons)
 
-def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool = False) -> InlineKeyboardMarkup:
-    countries = get_all_countries_with_stock(only_active=(not is_admin_mode))
+def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool = False, is_secret_mode: bool = False) -> InlineKeyboardMarkup:
+    countries = get_all_countries_with_stock(only_active=(not is_admin_mode), secret_mode=is_secret_mode)
     if not countries:
         if is_admin_mode:
             return InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                [InlineKeyboardButton("🔒 Upload Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
             ])
+        back_data = "btn_main_menu"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data=back_data)]
         ])
 
     start = page * per_page
@@ -849,8 +990,16 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons = []
     row = []
     for c in current_page_countries:
-        prefix = "adm_country_" if is_admin_mode else "c_"
-        label = f"{c['name']} ({c['available']})"
+        if is_admin_mode:
+            prefix = "adm_country_"
+            label = f"{c['name']} (S:{c['available_std']} | 🔒:{c['available_sec']})"
+        elif is_secret_mode:
+            prefix = "sec_c_"
+            label = f"🔒 {c['name']} ({c['available']})"
+        else:
+            prefix = "c_"
+            label = f"{c['name']} ({c['available']})"
+
         row.append(InlineKeyboardButton(label, callback_data=f"{prefix}{c['id']}"))
         if len(row) == 2:
             buttons.append(row)
@@ -859,10 +1008,11 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
         buttons.append(row)
 
     nav_row = []
+    page_prefix = "page_adm_" if is_admin_mode else ("page_sec_" if is_secret_mode else "page_")
     if page > 0:
-        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"page_{'adm_' if is_admin_mode else ''}{page-1}"))
+        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"{page_prefix}{page-1}"))
     if end < len(countries):
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"page_{'adm_' if is_admin_mode else ''}{page+1}"))
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"{page_prefix}{page+1}"))
     if nav_row:
         buttons.append(nav_row)
 
@@ -870,12 +1020,15 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
     return InlineKeyboardMarkup(buttons)
 
-def get_numbers_view_keyboard(country_id: int) -> InlineKeyboardMarkup:
+def get_numbers_view_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:
     """Builds number result keyboard. Includes OTP group URL buttons at the bottom."""
+    change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
+    country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
+
     buttons = [
         [
-            InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=f"change_num_{country_id}"),
-            InlineKeyboardButton("🌍 Change Country", callback_data="btn_get_number")
+            InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=change_cb),
+            InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
         ],
     ]
 
@@ -884,7 +1037,7 @@ def get_numbers_view_keyboard(country_id: int) -> InlineKeyboardMarkup:
     for g in groups:
         link = g.get("invite_link", "").strip()
         title = g.get("title", "").strip() or f"OTP Group {g['id']}"
-        if link:  # Only show if invite link is configured
+        if link:
             buttons.append([InlineKeyboardButton(f"💬 {title}", url=link)])
 
     buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
@@ -900,6 +1053,53 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_user(user.id, user.username, user.first_name)
 
+    # Deep-link support
+    if context.args:
+        arg = context.args[0].strip()
+        if arg == "getnumber":
+            countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
+            if countries:
+                await update.message.reply_text(
+                    "🌍 <b>Select a Country:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>Choose the country you want numbers for:</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
+                )
+                return
+        elif arg == "secretnumbers" and user_has_secret_access(user.id):
+            countries = get_all_countries_with_stock(only_active=True, secret_mode=True)
+            if countries:
+                await update.message.reply_text(
+                    "🔒 <b>Secret Numbers Pool:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>Select a country to receive exclusive secret numbers:</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=True)
+                )
+                return
+        elif arg.startswith("c_"):
+            try:
+                cid = int(arg.split("_")[1])
+                numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=10, is_secret=False)
+                if numbers:
+                    num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
+                    msg = (
+                        f"📱 <b>Your Exclusive Numbers — {cname}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚡ <i>Tap any number below to copy it:</i>\n\n"
+                        + "\n".join(num_lines) + "\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 <b>Remaining in Stock:</b> <code>{remaining} numbers</code>\n"
+                        f"🔒 <i>All {len(numbers)} numbers are reserved for you and removed from stock.</i>"
+                    )
+                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False))
+                    if gist_storage.enabled:
+                        asyncio.create_task(gist_storage.export_and_sync())
+                    return
+            except Exception as e:
+                logger.warning(f"Error handling start deep link {arg}: {e}")
+
     welcome_text = (
         f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
         f"Select an option below to get numbers:"
@@ -910,84 +1110,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        # Silently ignore or send generic message — do not confirm admin exists
         await update.message.reply_text("⛔ <b>Access Restricted.</b> This command is not available.", parse_mode=ParseMode.HTML)
         return
 
     stats = get_system_stats()
+    groups = get_linked_groups()
+    groups_count = len(groups)
+
     admin_text = (
         f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Real-time Live Inventory:</b>\n"
-        f"• <b>Available in Stock:</b> <code>{stats['total_available']} numbers</code>\n"
-        f"• <b>Delivered / Used:</b> <code>{stats['total_consumed']} numbers</code>\n"
+        f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
+        f"• <b>Secret Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
+        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
         f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
-        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
+        f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
+        f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
+        f"• <b>Linked OTP Groups:</b> <code>{groups_count} active</code>\n"
         f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Upload .txt to Add or Remove numbers in bulk:</i>"
+        f"⚡ <i>Upload .txt to manage Standard or Secret numbers:</i>"
     )
-    groups = get_linked_groups()
-    groups_count = len(groups)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("🗑️ Remove Numbers (.txt)", callback_data="admin_remove_prompt")],
-        [InlineKeyboardButton("🌍 Manage Countries & Stock", callback_data="admin_manage_countries")],
-        [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
-        [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
-        [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
+        [InlineKeyboardButton("📁 Uploaded Files & Pools", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
+        [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
+        [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
         [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
         [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
     ])
     await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return  # Silently ignore — do not leak admin existence
-
-    msg_text = update.message.text.replace("/broadcast", "", 1).strip()
-    if not msg_text:
-        ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
-        await update.message.reply_text(
-            "📢 <b>Broadcast Message to All Users</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Please type your broadcast message below.\n"
-            "You will see a <b>preview before it's sent</b> — so double-check your text!\n\n"
-            "<i>Supports HTML: <code>&lt;b&gt;bold&lt;/b&gt;</code>, <code>&lt;i&gt;italic&lt;/i&gt;</code>, "
-            "<code>&lt;code&gt;code&lt;/code&gt;</code></i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
-            ])
-        )
-        return
-
-    # Direct /broadcast <text> — show preview
-    ADMIN_STATES[user.id] = {"preview_broadcast": msg_text}
-    user_count = len(get_all_user_ids())
-    await update.message.reply_text(
-        f"👁️ <b>Broadcast Preview</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>This is how your message will look:</i>\n\n"
-        f"{msg_text}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Will be sent to:</b> <code>{user_count}</code> users\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Confirm and send?</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Send Broadcast", callback_data="bc_confirm_send"),
-             InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")],
-            [InlineKeyboardButton("✏️ Edit Message", callback_data="bc_edit_message")]
-        ])
-    )
 
 async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
     register_user(user.id, user.username, user.first_name)
-    countries = get_all_countries_with_stock(only_active=True)
+    countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
     if not countries:
         await update.message.reply_text(
             "⚠️ <b>No numbers are currently available in stock.</b>\n"
@@ -1004,7 +1163,43 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<i>Choose the country you want numbers for:</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False)
+        reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
+    )
+
+async def secretnumbers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    register_user(user.id, user.username, user.first_name)
+
+    if not user_has_secret_access(user.id):
+        await update.message.reply_text(
+            "⛔ <b>Access Restricted.</b>\n"
+            "Secret numbers are reserved for authorized users only.\n"
+            "Please contact the administrator to request access.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    countries = get_all_countries_with_stock(only_active=True, secret_mode=True)
+    if not countries:
+        await update.message.reply_text(
+            "🔒 <b>Secret Numbers Pool</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>No secret numbers currently available in stock.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+            ])
+        )
+        return
+
+    await update.message.reply_text(
+        "🔒 <b>Secret Numbers Pool:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Select a country to receive exclusive secret numbers:</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=True)
     )
 
 async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1013,7 +1208,7 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     register_user(user.id, user.username, user.first_name)
     stats = get_system_stats()
-    countries = get_all_countries_with_stock(only_active=True)
+    countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
     c_lines = ""
     for c in countries[:10]:
         c_lines += f"• {c['name']}: <code>{c['available']} available</code>\n"
@@ -1023,10 +1218,15 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not c_lines:
         c_lines = "<i>No numbers available in stock right now.</i>\n"
 
+    secret_info = ""
+    if user_has_secret_access(user.id):
+        secret_info = f"• <b>Secret Stock Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
+
     inv_text = (
         f"📊 <b>Live Number Inventory</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Available in Stock:</b> <code>{stats['total_available']} numbers</code>\n"
+        f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
+        f"{secret_info}"
         f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
         f"• <b>Active Countries:</b> <code>{stats['active_countries']}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1034,14 +1234,14 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{c_lines}"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-    await update.message.reply_text(
-        inv_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
-        ])
-    )
+    buttons = [
+        [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
+    ]
+    if user_has_secret_access(user.id):
+        buttons.append([InlineKeyboardButton("🔒 Secret Numbers", callback_data="btn_get_secret_number")])
+    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
+
+    await update.message.reply_text(inv_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1051,12 +1251,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         f"ℹ️ <b>How NUMBER BOTMAN Works:</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"1️⃣ Use <code>/getnumber</code> or tap <b>'📱 Get Number'</b> to choose a country.\n"
+        f"1️⃣ Use <code>/getnumber</code> or tap <b>'📱 Get Numbers'</b> to choose a country.\n"
         f"2️⃣ Select your country button.\n"
         f"3️⃣ Bot delivers <b>10 copyable numbers</b> (all starting with <code>+</code>).\n"
         f"4️⃣ Tap any number to copy it to clipboard.\n"
-        f"5️⃣ Click <b>'🔄 Change Numbers'</b> to get 10 brand-new numbers!\n"
-        f"6️⃣ Old numbers are removed from stock so no other user will receive them.\n"
+        f"5️⃣ Click <b>'🔄 Get 10 More Numbers'</b> to rotate new numbers!\n"
+        f"6️⃣ Numbers are exclusive and removed upon issue.\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ <i>Fast, reliable, and available 24/7.</i>"
     )
@@ -1064,7 +1264,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📱 Get Number", callback_data="btn_get_number")],
+            [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
         ])
     )
@@ -1077,8 +1277,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats_text = (
         f"📈 <b>NUMBER BOTMAN Live Statistics</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Available Stock:</b> <code>{stats['total_available']} numbers</code>\n"
-        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
+        f"• <b>Standard Available Stock:</b> <code>{stats['total_std_available']} numbers</code>\n"
+        f"• <b>Secret Available Stock:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
+        f"• <b>Total Numbers Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
         f"• <b>Active Countries:</b> <code>{stats['active_countries']}</code>\n"
         f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
@@ -1088,12 +1289,28 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        return  # Silently ignore
+        return
     ADMIN_STATES[user.id] = {"mode": "add"}
     await update.message.reply_text(
-        "➕ <b>Add Numbers (.txt) File:</b>\n"
+        "➕ <b>Add Standard Numbers (.txt):</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Please send a <b>.txt</b> file containing phone numbers to this chat.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
+async def secretupload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    ADMIN_STATES[user.id] = {"mode": "add_secret"}
+    await update.message.reply_text(
+        "🔒 <b>Add Secret Numbers (.txt):</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Please send a <b>.txt</b> file containing secret phone numbers to this chat.\n"
+        "<i>These will only be accessible by Admin and Whitelisted users.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
@@ -1103,10 +1320,10 @@ async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        return  # Silently ignore
+        return
     ADMIN_STATES[user.id] = {"mode": "remove"}
     await update.message.reply_text(
-        "🗑️ <b>Remove Numbers (.txt) File:</b>\n"
+        "🗑️ <b>Remove Numbers (.txt):</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Please send a <b>.txt</b> file containing phone numbers you want to delete from stock.",
         parse_mode=ParseMode.HTML,
@@ -1116,10 +1333,6 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def resolve_telegram_group_link(bot: Bot, input_text: str) -> tuple[str, str]:
-    """
-    Given an input string (e.g. 'https://t.me/KKH_OTP_GROUP' or '@KKH_OTP_GROUP' or 'My Group | https://t.me/...'),
-    resolves the real chat title and permanent invite link via Telegram Bot API if possible.
-    """
     parts = input_text.split("|", 1)
     if len(parts) == 2:
         title = parts[0].strip()
@@ -1128,7 +1341,6 @@ async def resolve_telegram_group_link(bot: Bot, input_text: str) -> tuple[str, s
         title = ""
         link = input_text.strip()
 
-    # Extract username if it's a public link like https://t.me/username
     clean_username = link
     for prefix in ["https://t.me/", "http://t.me/", "t.me/", "https://telegram.me/", "@"]:
         if clean_username.startswith(prefix):
@@ -1136,7 +1348,6 @@ async def resolve_telegram_group_link(bot: Bot, input_text: str) -> tuple[str, s
             break
     clean_username = clean_username.strip("/").strip()
 
-    # If it's a plain username (no +), try to get official chat info from Telegram
     if clean_username and not clean_username.startswith("+"):
         try:
             chat = await bot.get_chat(f"@{clean_username}")
@@ -1160,7 +1371,7 @@ async def resolve_telegram_group_link(bot: Bot, input_text: str) -> tuple[str, s
 async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        return  # Silently ignore
+        return
 
     text = update.message.text.replace("/addgroup", "", 1).strip()
     if not text:
@@ -1180,16 +1391,16 @@ async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title, link = await resolve_telegram_group_link(context.bot, text)
-
     ok = add_linked_group(title=title, invite_link=link)
     if ok:
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(
             f"✅ <b>OTP Group Linked Successfully!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏷️ <b>Title:</b> <code>{title}</code>\n"
             f"🔗 <b>Link:</b> <code>{link}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✨ <i>This group will now appear as a direct redirect button at the bottom of the numbers screen!</i>",
+            f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
@@ -1202,7 +1413,7 @@ async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        return  # Silently ignore
+        return
 
     text = update.message.text.replace("/setgroup", "", 1).strip()
     if not text:
@@ -1212,9 +1423,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Send your group link or username to replace any old/expired links:\n\n"
             "<b>Format:</b>\n"
-            "<code>Group Name | https://t.me/your_link</code>\n"
-            "<i>Or simply send the link or username:</i>\n"
-            "<code>https://t.me/your_otp_group</code>",
+            "<code>Group Name | https://t.me/your_link</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
@@ -1223,16 +1432,16 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title, link = await resolve_telegram_group_link(context.bot, text)
-
     ok = set_primary_group(title=title, invite_link=link)
     if ok:
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(
             f"✅ <b>Primary OTP Group Link Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏷️ <b>Title:</b> <code>{title}</code>\n"
             f"🔗 <b>Link:</b> <code>{link}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✨ <i>All old/expired links cleared. This new link is now active at the bottom of the numbers screen!</i>",
+            f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
@@ -1242,192 +1451,116 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ <b>Failed to update group link.</b>", parse_mode=ParseMode.HTML)
 
-# ──────────────────────────────────────────────────────────────────
-#  BROADCAST DB HELPERS
-# ──────────────────────────────────────────────────────────────────
-def create_broadcast_record(text: str, sent_by: int, total_users: int) -> int:
-    with get_main_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO broadcasts (text, sent_by, total_users, status) VALUES (?, ?, ?, 'sending')",
-            (text, sent_by, total_users)
-        )
-        conn.commit()
-        return cur.lastrowid
+# ── Admin User Management Commands ──
+async def grantsecret_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
 
-def finalize_broadcast_record(bc_id: int, success: int, failed: int):
-    with get_main_db() as conn:
-        conn.execute(
-            "UPDATE broadcasts SET success_count=?, failed_count=?, status='done' WHERE id=?",
-            (success, failed, bc_id)
-        )
-        conn.commit()
-
-def save_delivery(bc_id: int, user_id: int, message_id: int):
-    try:
-        with get_main_db() as conn:
-            conn.execute(
-                "INSERT INTO broadcast_deliveries (broadcast_id, user_id, message_id) VALUES (?, ?, ?)",
-                (bc_id, user_id, message_id)
-            )
-            conn.commit()
-    except Exception:
-        pass
-
-def get_broadcast_history(limit: int = 10):
-    with get_main_db() as conn:
-        rows = conn.execute(
-            """SELECT id, text, success_count, failed_count, total_users, status, created_at
-               FROM broadcasts ORDER BY id DESC LIMIT ?""",
-            (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-def get_broadcast_deliveries(bc_id: int):
-    with get_main_db() as conn:
-        rows = conn.execute(
-            "SELECT user_id, message_id FROM broadcast_deliveries WHERE broadcast_id=?",
-            (bc_id,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-def delete_broadcast_record(bc_id: int):
-    with get_main_db() as conn:
-        conn.execute("DELETE FROM broadcast_deliveries WHERE broadcast_id=?", (bc_id,))
-        conn.execute("DELETE FROM broadcasts WHERE id=?", (bc_id,))
-        conn.commit()
-
-# ──────────────────────────────────────────────────────────────────
-#  CORE BROADCAST ENGINE
-# ──────────────────────────────────────────────────────────────────
-def _make_progress_bar(done: int, total: int, width: int = 12) -> str:
-    filled = int(width * done / max(total, 1))
-    bar = "█" * filled + "░" * (width - filled)
-    pct = int(100 * done / max(total, 1))
-    return f"[{bar}] {pct}%"
-
-async def execute_broadcast(bot: Bot, admin_chat_id: int, text: str, admin_id: int = 0):
-    user_ids = get_all_user_ids()
-    if not user_ids:
-        await bot.send_message(
-            admin_chat_id,
-            "⚠️ <b>No registered users found.</b>\nNo one to broadcast to yet.",
+    args = update.message.text.replace("/grantsecret", "", 1).strip()
+    if not args or not args.isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/grantsecret &lt;user_id&gt;</code>\n"
+            "Example: <code>/grantsecret 123456789</code>",
             parse_mode=ParseMode.HTML
         )
         return
 
-    total = len(user_ids)
-    bc_id = create_broadcast_record(text, admin_id or admin_chat_id, total)
+    target_id = int(args)
+    set_user_secret_access(target_id, True)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
 
-    status_msg = await bot.send_message(
-        admin_chat_id,
-        f"📡 <b>Broadcast Initiated</b>\n"
+    u = get_user_details(target_id)
+    uname = f"@{u['username']}" if u and u.get('username') else (u.get('first_name') if u else str(target_id))
+    await update.message.reply_text(
+        f"🔓 <b>Secret Numbers Access Granted!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
-        f"👥 <b>Target Users:</b> <code>{total}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ Sending...  {_make_progress_bar(0, total)}",
-        parse_mode=ParseMode.HTML
-    )
-
-    success = 0
-    failed = 0
-    last_edit_pct = -1
-
-    for idx, uid in enumerate(user_ids, 1):
-        try:
-            sent_msg = await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
-            save_delivery(bc_id, uid, sent_msg.message_id)
-            success += 1
-        except Exception:
-            failed += 1
-
-        # Throttle: Telegram allows ~30 msg/sec; 0.04s ≈ 25 msg/sec (safe)
-        await asyncio.sleep(0.04)
-
-        # Live progress update every 5% or every 10 users
-        current_pct = int(100 * idx / total)
-        if (current_pct - last_edit_pct >= 5 or idx % 10 == 0) and current_pct != last_edit_pct:
-            last_edit_pct = current_pct
-            try:
-                await status_msg.edit_text(
-                    f"📡 <b>Broadcasting...</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
-                    f"👥 <b>Progress:</b> <code>{idx}/{total}</code>\n"
-                    f"✅ <b>Sent:</b> <code>{success}</code>  ❌ <b>Failed:</b> <code>{failed}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚡ {_make_progress_bar(idx, total)}",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
-
-    finalize_broadcast_record(bc_id, success, failed)
-
-    await status_msg.edit_text(
-        f"📢 <b>Broadcast Complete!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>Broadcast ID:</b> <code>#{bc_id}</code>\n"
-        f"✅ <b>Delivered:</b> <code>{success}</code> users\n"
-        f"❌ <b>Failed/Blocked:</b> <code>{failed}</code> users\n"
-        f"👥 <b>Total Targeted:</b> <code>{total}</code>\n"
-        f"📊 <b>Delivery Rate:</b> <code>{int(success/max(total,1)*100)}%</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✨ <i>Users can now see your message. You can delete it anytime from Broadcast History.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑️ Delete This Broadcast", callback_data=f"bc_delete_{bc_id}")],
-            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-    )
-
-async def execute_delete_broadcast(bot: Bot, admin_chat_id: int, bc_id: int):
-    """Retract/delete a broadcast — removes the message from every user's chat."""
-    deliveries = get_broadcast_deliveries(bc_id)
-    if not deliveries:
-        await bot.send_message(
-            admin_chat_id,
-            f"⚠️ <b>Broadcast #{bc_id} has no tracked deliveries to delete.</b>\n"
-            f"<i>The broadcast record will be removed.</i>",
-            parse_mode=ParseMode.HTML
-        )
-        delete_broadcast_record(bc_id)
-        return
-
-    status_msg = await bot.send_message(
-        admin_chat_id,
-        f"🗑️ <b>Deleting Broadcast #{bc_id}...</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ Retracting from <code>{len(deliveries)}</code> users...",
-        parse_mode=ParseMode.HTML
-    )
-
-    deleted = 0
-    failed = 0
-    for row in deliveries:
-        try:
-            await bot.delete_message(chat_id=row["user_id"], message_id=row["message_id"])
-            deleted += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.04)
-
-    delete_broadcast_record(bc_id)
-
-    await status_msg.edit_text(
-        f"🗑️ <b>Broadcast #{bc_id} Retracted!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>Deleted from:</b> <code>{deleted}</code> users\n"
-        f"⚠️ <b>Could not delete:</b> <code>{failed}</code> users\n"
-        f"<i>(Some users may have already deleted the message manually.)</i>\n"
+        f"👤 <b>User:</b> <code>{uname}</code> (<code>{target_id}</code>)\n"
+        f"✅ <b>Status:</b> <code>Authorized to access Secret Numbers Pool</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            [InlineKeyboardButton("👤 View User Details", callback_data=f"u_inspect_{target_id}")],
+            [InlineKeyboardButton("👥 User Management", callback_data="admin_users")]
         ])
     )
+
+async def revokesecret_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    args = update.message.text.replace("/revokesecret", "", 1).strip()
+    if not args or not args.isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/revokesecret &lt;user_id&gt;</code>\n"
+            "Example: <code>/revokesecret 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = int(args)
+    set_user_secret_access(target_id, False)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    u = get_user_details(target_id)
+    uname = f"@{u['username']}" if u and u.get('username') else (u.get('first_name') if u else str(target_id))
+    await update.message.reply_text(
+        f"🔒 <b>Secret Numbers Access Revoked!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>User:</b> <code>{uname}</code> (<code>{target_id}</code>)\n"
+        f"❌ <b>Status:</b> <code>Secret access removed</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 View User Details", callback_data=f"u_inspect_{target_id}")],
+            [InlineKeyboardButton("👥 User Management", callback_data="admin_users")]
+        ])
+    )
+
+async def user_lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    args = update.message.text.replace("/user", "", 1).strip()
+    if not args or not args.isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/user &lt;user_id&gt;</code>\n"
+            "Example: <code>/user 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = int(args)
+    u = get_user_details(target_id)
+    if not u:
+        await update.message.reply_text(f"⚠️ User <code>{target_id}</code> not found in database.", parse_mode=ParseMode.HTML)
+        return
+
+    secret_badge = "✅ Authorized" if u.get("has_secret_access") else "❌ Restricted"
+    toggle_btn_text = "🔒 Revoke Secret Access" if u.get("has_secret_access") else "🔓 Grant Secret Access"
+
+    text = (
+        f"👤 <b>User Account Profile</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
+        f"📛 <b>First Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
+        f"🔗 <b>Username:</b> @{u.get('username') or 'None'}\n"
+        f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
+        f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
+        f"📅 <b>Registered At:</b> <code>{u.get('joined_at', 'N/A')[:19]}</code>\n"
+        f"⏱️ <b>Last Seen:</b> <code>{u.get('last_seen', 'N/A')[:19]}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_btn_text, callback_data=f"u_toggle_sec_{target_id}")],
+        [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 # ==========================================
 # 11. Admin File (.txt) & Text Upload Handlers
@@ -1468,7 +1601,6 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             await msg.edit_text("❌ <b>No valid phone numbers found in this file.</b>", parse_mode=ParseMode.HTML)
             return
 
-        # Check if admin previously selected "remove" mode
         prev_mode = ADMIN_STATES.get(user.id, {}).get("mode", "add")
 
         ADMIN_STATES[user.id] = {
@@ -1491,11 +1623,17 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         buttons.append([InlineKeyboardButton("➕ Type New Country Name", callback_data="prompt_new_country")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")])
 
-        action_label = "➕ ADD to" if prev_mode == "add" else "🗑️ REMOVE from"
+        if prev_mode == "add_secret":
+            action_label = "🔒 ADD to SECRET Stock"
+        elif prev_mode == "remove":
+            action_label = "🗑️ REMOVE from Stock"
+        else:
+            action_label = "➕ ADD to Standard Stock"
+
         await msg.edit_text(
             f"📄 <b>File Parsed:</b> <code>{file_name}</code>\n"
             f"🔢 <b>Valid Numbers (with +):</b> <code>{len(extracted_numbers)}</code>\n"
-            f"⚙️ <b>Action:</b> <code>{action_label} Stock</code>\n"
+            f"⚙️ <b>Action:</b> <code>{action_label}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 <b>Select Country:</b>\n"
             f"<i>Tap an existing country below or tap 'Type New Country Name':</i>",
@@ -1517,42 +1655,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not admin_state:
         return
 
-    if admin_state.get("awaiting_broadcast"):
-        # Store message for preview, don't send yet
-        ADMIN_STATES[user.id] = {"preview_broadcast": text}
-        user_count = len(get_all_user_ids())
-        await update.message.reply_text(
-            f"👁️ <b>Broadcast Preview</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>This is exactly how your message will appear to users:</i>\n\n"
-            f"{text}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 <b>Will be sent to:</b> <code>{user_count}</code> registered users\n"
-            f"📅 <b>Time:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Ready to broadcast? Click <b>Send Broadcast</b> to confirm.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Send Broadcast", callback_data="bc_confirm_send"),
-                 InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")],
-                [InlineKeyboardButton("✏️ Edit Message", callback_data="bc_edit_message")]
-            ])
-        )
-        return
-
     if admin_state.get("awaiting_group_link"):
-        del ADMIN_STATES[user.id]
         title, link = await resolve_telegram_group_link(context.bot, text)
-
         ok = add_linked_group(title=title, invite_link=link)
+        del ADMIN_STATES[user.id]
         if ok:
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
             await update.message.reply_text(
-                f"✅ <b>OTP Group Linked Successfully!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <b>OTP Group Linked!</b>\n"
                 f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-                f"🔗 <b>Link:</b> <code>{link}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✨ <i>This group is now added as a direct redirect button at the bottom of the numbers screen!</i>",
+                f"🔗 <b>Link:</b> <code>{link}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
@@ -1560,28 +1673,22 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ])
             )
         else:
-            await update.message.reply_text(
-                "❌ <b>Failed to save group.</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
+            await update.message.reply_text("❌ Failed to add group.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ]))
         return
 
     if admin_state.get("awaiting_set_group_link"):
-        del ADMIN_STATES[user.id]
         title, link = await resolve_telegram_group_link(context.bot, text)
-
         ok = set_primary_group(title=title, invite_link=link)
+        del ADMIN_STATES[user.id]
         if ok:
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
             await update.message.reply_text(
                 f"✅ <b>Primary OTP Group Link Updated!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-                f"🔗 <b>Link:</b> <code>{link}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✨ <i>All previous/expired links removed. The new link is now active!</i>",
+                f"🔗 <b>Link:</b> <code>{link}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
@@ -1589,13 +1696,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ])
             )
         else:
-            await update.message.reply_text(
-                "❌ <b>Failed to update group link.</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
+            await update.message.reply_text("❌ Failed to update group link.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ]))
         return
 
     if admin_state.get("awaiting_country_name"):
@@ -1620,7 +1723,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"🌍 <b>Country:</b> <code>{c_info.get('name', country_name)}</code>\n"
                 f"📄 <b>Source File:</b> <code>{filename}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
-                f"📊 <b>Remaining Stock:</b> <code>{c_info.get('available', 0)}</code>\n"
+                f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
@@ -1629,7 +1732,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        added, duplicates = add_numbers_to_country(cid, numbers)
+        is_secret_upload = (mode == "add_secret")
+        added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret_upload)
         del ADMIN_STATES[user.id]
 
         if gist_storage.enabled:
@@ -1637,19 +1741,21 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get('name', country_name)
+        sec_label = "🔒 Secret" if is_secret_upload else "Standard"
 
         await update.message.reply_text(
-            f"✅ <b>Upload Complete!</b>\n"
+            f"✅ <b>Upload Complete! ({sec_label})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_info.get('name', country_name)}</code>\n"
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
             f"📄 <b>Source File:</b> <code>{filename}</code>\n"
-            f"📥 <b>Added Numbers:</b> <code>{added}</code>\n"
+            f"📥 <b>Added Numbers (with +):</b> <code>{added}</code>\n"
             f"⚠️ <b>Duplicates Skipped:</b> <code>{duplicates}</code>\n"
-            f"📊 <b>Total Available:</b> <code>{c_info.get('available', added)}</code>\n"
+            f"📊 <b>Pool Stock:</b> <code>{c_info.get('available_sec', 0) if is_secret_upload else c_info.get('available_std', 0)} available</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"c_{cid}")],
+                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"{'sec_c_' if is_secret_upload else 'c_'}{cid}")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
@@ -1680,10 +1786,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=get_main_menu_keyboard(user.id)
         )
 
-    # 2. Get Number -> Choose Country
-    elif data == "btn_get_number" or (data.startswith("page_") and not data.startswith("page_adm_")):
-        page = int(data.split("_")[1]) if data.startswith("page_") else 0
-        countries = get_all_countries_with_stock(only_active=True)
+    # 2. Get Standard Numbers -> Choose Country
+    elif data == "btn_get_number" or data.startswith("page_std_") or (data.startswith("page_") and not data.startswith("page_adm_") and not data.startswith("page_sec_") and not data.startswith("page_users_") and not data.startswith("page_rmfiles_") and not data.startswith("page_upfiles_")):
+        page = int(data.split("_")[-1]) if "_" in data and data.split("_")[-1].isdigit() else 0
+        countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
         if not countries:
             await query.edit_message_text(
                 "⚠️ <b>No numbers are currently available in stock.</b>\n\n"
@@ -1700,17 +1806,47 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<i>Choose the country you want numbers for:</i>",
             parse_mode=ParseMode.HTML,
-            reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False)
+            reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=False)
         )
 
-    # 3. Selected Country / Change Numbers -> Consume & Deliver 10 Numbers
-    elif data.startswith("c_") or data.startswith("change_num_"):
+    # 2b. Get Secret Numbers -> Choose Country
+    elif data == "btn_get_secret_number" or data.startswith("page_sec_"):
+        if not user_has_secret_access(user.id):
+            await query.answer("⛔ Access Denied! Secret numbers are restricted to authorized users.", show_alert=True)
+            return
+
+        page = int(data.split("_")[-1]) if "_" in data and data.split("_")[-1].isdigit() else 0
+        countries = get_all_countries_with_stock(only_active=True, secret_mode=True)
+        if not countries:
+            await query.edit_message_text(
+                "🔒 <b>Secret Numbers Pool:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No secret numbers are currently available in stock.</i>\n\n"
+                "Please check back soon or contact admin.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
+                ])
+            )
+            return
+
+        await query.edit_message_text(
+            "🔒 <b>Secret Numbers Pool — Select Country:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Exclusive numbers reserved for authorized accounts:</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=True)
+        )
+
+    # 3. Deliver Standard Numbers
+    elif (data.startswith("c_") and not data.startswith("change_num_") and not data.startswith("cancel_")) or data.startswith("change_num_"):
         country_id = int(data.split("_")[1]) if data.startswith("c_") else int(data.split("_")[2])
 
         numbers, remaining_count, country_name = consume_numbers_for_user(
             country_id=country_id,
             user_id=user.id,
-            limit=10
+            limit=10,
+            is_secret=False
         )
 
         if not numbers:
@@ -1725,13 +1861,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        # Auto-sync Gist after consumption
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        num_lines = []
-        for idx, n in enumerate(numbers, 1):
-            num_lines.append(f"  {idx}. <code>{n}</code>")
+        num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
         numbers_formatted = "\n".join(num_lines)
 
         group_notice = ""
@@ -1752,13 +1885,67 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False)
+        )
+
+    # 3b. Deliver Secret Numbers
+    elif data.startswith("sec_c_") or data.startswith("sec_change_num_"):
+        if not user_has_secret_access(user.id):
+            await query.answer("⛔ Access Denied! Secret numbers are restricted.", show_alert=True)
+            return
+
+        country_id = int(data.split("_")[2]) if data.startswith("sec_c_") else int(data.split("_")[3])
+
+        numbers, remaining_count, country_name = consume_numbers_for_user(
+            country_id=country_id,
+            user_id=user.id,
+            limit=10,
+            is_secret=True
+        )
+
+        if not numbers:
+            await query.edit_message_text(
+                f"⚠️ <b>No more secret numbers available for {country_name}.</b>\n"
+                f"Please select another country from the Secret Pool.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔒 Choose Another Country", callback_data="btn_get_secret_number")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+                ])
+            )
+            return
+
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
+        numbers_formatted = "\n".join(num_lines)
+
+        group_notice = ""
+        groups = get_linked_groups()
+        if groups:
+            group_notice = "\n\n💬 <b>Need OTP codes? Click the group button below!</b>"
+
+        response_text = (
+            f"🔒 <b>Your SECRET Numbers — {country_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{numbers_formatted}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡️ <i>Exclusive Secret Pool Numbers (100% single-user guaranteed).</i>\n"
+            f"📊 <b>Remaining Secret Stock:</b> <code>{remaining_count}</code>\n"
+            f"💡 <b>Tap any number to copy instantly!</b>"
+            f"{group_notice}"
+        )
+        await query.edit_message_text(
+            response_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True)
         )
 
     # 4. Inventory Overview
     elif data == "btn_inventory":
         stats = get_system_stats()
-        countries = get_all_countries_with_stock(only_active=True)
+        countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
         c_lines = ""
         for c in countries[:10]:
             c_lines += f"• {c['name']}: <code>{c['available']} available</code>\n"
@@ -1768,10 +1955,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not c_lines:
             c_lines = "<i>No numbers available in stock right now.</i>\n"
 
+        secret_info = ""
+        if user_has_secret_access(user.id):
+            secret_info = f"• <b>Secret Stock Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
+
         inv_text = (
             f"📊 <b>Live Number Inventory</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Available in Stock:</b> <code>{stats['total_available']} numbers</code>\n"
+            f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
+            f"{secret_info}"
             f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
             f"• <b>Active Countries:</b> <code>{stats['active_countries']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1779,26 +1971,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"{c_lines}"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        await query.edit_message_text(
-            inv_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
-                [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
-            ])
-        )
+        buttons = [
+            [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
+        ]
+        if user_has_secret_access(user.id):
+            buttons.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")])
+
+        await query.edit_message_text(inv_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     # 5. Help / Info
     elif data == "btn_help":
         help_text = (
             f"ℹ️ <b>How NUMBER BOTMAN Works:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"1️⃣ Click <b>'📱 Get Number'</b> to view available countries.\n"
+            f"1️⃣ Click <b>'📱 Get Numbers'</b> to view available countries.\n"
             f"2️⃣ Select your country button.\n"
-            f"3️⃣ Bot delivers <b>10 copyable numbers</b> (all formatted with <code>+</code>).\n"
+            f"3️⃣ Bot delivers <b>10 copyable numbers</b> (formatted with <code>+</code>).\n"
             f"4️⃣ Tap any number to copy it to clipboard.\n"
-            f"5️⃣ Click <b>'🔄 Change Numbers'</b> to get 10 brand-new numbers!\n"
-            f"6️⃣ Old numbers are automatically removed from stock so no other user will receive them.\n"
+            f"5️⃣ Click <b>'🔄 Get 10 More Numbers'</b> to rotate new numbers!\n"
+            f"6️⃣ Numbers are exclusive and removed upon delivery.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ <i>Fast, reliable, and available 24/7.</i>"
         )
@@ -1806,7 +1998,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             help_text,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Get Number", callback_data="btn_get_number")],
+                [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")],
                 [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
             ])
         )
@@ -1820,20 +2012,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Real-time Live Inventory:</b>\n"
-            f"• <b>Available in Stock:</b> <code>{stats['total_available']} numbers</code>\n"
-            f"• <b>Delivered / Used:</b> <code>{stats['total_consumed']} numbers</code>\n"
+            f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
+            f"• <b>Secret Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
+            f"• <b>Total Delivered:</b> <code>{stats['total_consumed']} numbers</code>\n"
             f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
             f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
+            f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
             f"• <b>Linked OTP Groups:</b> <code>{groups_count} active</code>\n"
             f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Upload .txt to Add or Remove numbers in bulk:</i>"
+            f"⚡ <i>Manage numbers, secret access, and users:</i>"
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📁 Uploaded Number Files", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
-            [InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu"), InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
-            [InlineKeyboardButton("👥 User Analytics", callback_data="admin_users"), InlineKeyboardButton("📋 Broadcast History", callback_data="bc_history")],
-            [InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
+            [InlineKeyboardButton("📁 Uploaded Files & Pools", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
+            [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
+            [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
+            [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -1846,13 +2040,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         if not countries:
             await query.edit_message_text(
-                "📁 <b>Uploaded Number Files</b>\n"
+                "📁 <b>Uploaded Number Files & Pools</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>No number files or country pools uploaded yet.</i>\n\n"
-                "Click below to upload your first country numbers file (.txt)!",
+                "<i>No country pools uploaded yet.</i>\n\n"
+                "Upload your first file (.txt) to start serving numbers!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                    [InlineKeyboardButton("➕ Upload Standard Numbers (.txt)", callback_data="admin_upload_prompt")],
+                    [InlineKeyboardButton("🔒 Upload Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
                     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )
@@ -1864,30 +2059,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         page_c = countries[start:end]
 
         lines = [
-            "📁 <b>Uploaded Number Files & Stocks</b>",
+            "📁 <b>Uploaded Number Files & Stock Pools</b>",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"• <b>Total in Stock:</b> <code>{stats['total_available']} numbers</code>",
-            f"• <b>Delivered / Used:</b> <code>{stats['total_consumed']} numbers</code>",
-            f"• <b>Active Pools:</b> <code>{len(countries)} countries</code>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "📋 <b>Active Country Files:</b>"
+            f"📊 <b>Total Stock:</b> <code>{stats['total_available']} numbers</code> (Standard: <code>{stats['total_std_available']}</code> | Secret: <code>{stats['total_sec_available']} 🔒</code>)",
+            f"👥 <b>Total Delivered:</b> <code>{stats['total_consumed']} numbers</code>",
+            "━━━━━━━━━━━━━━━━━━━━"
         ]
 
-        for idx, c in enumerate(page_c, start + 1):
-            lines.append(f"{idx}. <b>{c['name']}</b>: <code>{c['available']} available</code> (Used: <code>{c['used']}</code>)")
-
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("👇 <i>Click any country below to view details or manage:</i>")
-
         buttons = []
-        row = []
         for c in page_c:
-            row.append(InlineKeyboardButton(f"{c['name']} ({c['available']})", callback_data=f"adm_country_{c['id']}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
+            lines.append(
+                f"🌍 <b>{c['name']}</b>\n"
+                f"   • Standard Available: <code>{c['available_std']}</code>\n"
+                f"   • Secret Available: <code>{c['available_sec']} 🔒</code>\n"
+                f"   • Delivered: <code>{c['used_std'] + c['used_sec']}</code>\n"
+            )
+            buttons.append([InlineKeyboardButton(f"⚙️ Manage {c['name']}", callback_data=f"adm_country_{c['id']}")])
 
         nav_row = []
         if page > 0:
@@ -1897,14 +2084,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([
-            InlineKeyboardButton("➕ Upload New .txt", callback_data="admin_upload_prompt"),
-            InlineKeyboardButton("🗑️ Remove Numbers", callback_data="admin_remove_files_menu")
-        ])
+        buttons.append([InlineKeyboardButton("➕ Add Standard Numbers (.txt)", callback_data="admin_upload_prompt")])
+        buttons.append([InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")])
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
-    # 6c. Admin Remove Numbers / Files Menu (1-Click Removal)
+    # 6c. Admin Remove Files & Numbers Menu
     elif (data == "admin_remove_files_menu" or data.startswith("page_rmfiles_")) and user_admin:
         page = int(data.split("_")[2]) if data.startswith("page_rmfiles_") else 0
         countries = get_all_countries_with_stock(only_active=False)
@@ -1931,13 +2117,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "🗑️ <b>Remove Numbers & Country Files</b>",
             "━━━━━━━━━━━━━━━━━━━━",
             "⚡ <b>1-Click Removal:</b>",
-            "<i>Click any country file button below to delete all its numbers from stock instantly without uploading any file:</i>",
+            "<i>Click any country button below to delete all its numbers from stock instantly:</i>",
             "━━━━━━━━━━━━━━━━━━━━"
         ]
 
         buttons = []
         for c in page_c:
-            buttons.append([InlineKeyboardButton(f"🗑️ Delete {c['name']} ({c['available']} nums)", callback_data=f"adm_quick_del_{c['id']}")])
+            buttons.append([InlineKeyboardButton(f"🗑️ Delete {c['name']} ({c['total_available']} nums)", callback_data=f"adm_quick_del_{c['id']}")])
 
         nav_row = []
         if page > 0:
@@ -1948,7 +2134,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             buttons.append(nav_row)
 
         buttons.append([InlineKeyboardButton("📄 Remove Specific Numbers (.txt)", callback_data="admin_remove_prompt")])
-        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")] )
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     # 6d. Quick Delete Confirmation
@@ -1957,14 +2143,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
-        c_avail = c_info.get("available", 0)
+        c_avail = c_info.get("total_available", 0)
 
         text = (
             f"⚠️ <b>Confirm Deletion — {c_name}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Are you sure you want to remove <b>{c_name}</b> and delete all <b>{c_avail} available numbers</b> from stock?\n\n"
-            f"• <i>The file & numbers will be removed immediately from stock.</i>\n"
-            f"• <i>Cloud Gist will sync automatically.</i>\n"
+            f"Are you sure you want to remove <b>{c_name}</b> and delete all <b>{c_avail} numbers</b> from stock?\n\n"
+            f"• <i>The country pool will be removed from stock immediately.</i>\n"
+            f"• <i>Cloud Gist will synchronize automatically.</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         keyboard = InlineKeyboardMarkup([
@@ -1979,7 +2165,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
-        c_avail = c_info.get("available", 0)
+        c_avail = c_info.get("total_available", 0)
 
         delete_country_and_stock(cid)
         if gist_storage.enabled:
@@ -2000,16 +2186,32 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # 7. Admin Add Numbers Prompt
+    # 7. Admin Add Standard Numbers Prompt
     elif data == "admin_upload_prompt" and user_admin:
         ADMIN_STATES[user.id] = {"mode": "add"}
         await query.edit_message_text(
-            "➕ <b>Add Numbers (.txt) File:</b>\n"
+            "➕ <b>Add Standard Numbers (.txt):</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Please send a <b>.txt</b> file containing phone numbers (one number per line) directly to this chat.\n\n"
             "<b>Example:</b>\n"
             "<code>+12025550143\n12025550189\n+12025550192</code>\n\n"
-            "<i>(All numbers will automatically be formatted with a leading <code>+</code>).</i>",
+            "<i>(All numbers will automatically be formatted with leading <code>+</code>).</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+            ])
+        )
+
+    # 7b. Admin Add Secret Numbers Prompt
+    elif data == "admin_upload_secret_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"mode": "add_secret"}
+        await query.edit_message_text(
+            "🔒 <b>Add Secret Numbers (.txt):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send a <b>.txt</b> file containing phone numbers for the <b>Secret Numbers Pool</b>.\n\n"
+            "• <i>These numbers will only be accessible by Admin and Whitelisted users!</i>\n"
+            "• <i>Standard users cannot see or receive these numbers.</i>\n\n"
+            "<b>Format:</b> One phone number per line.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
@@ -2030,183 +2232,123 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
-    # 9. Admin User Analytics
-    elif data == "admin_users" and user_admin:
+    # 9. Admin User Analytics & Management (Paginated User List)
+    elif (data == "admin_users" or data.startswith("page_users_")) and user_admin:
+        page = int(data.split("_")[2]) if data.startswith("page_users_") else 0
+        per_page = 5
+        offset = page * per_page
+        users_list, total_users = get_all_users_detailed(limit=per_page, offset=offset)
         stats = get_system_stats()
-        top_users = get_top_users(limit=10)
-        u_lines = ""
-        for idx, u in enumerate(top_users, 1):
-            name = u["first_name"] or u["username"] or str(u["user_id"])
-            u_lines += f"{idx}. <b>{name}</b> (<code>{u['user_id']}</code>) — <code>{u['numbers_consumed']} consumed</code>\n"
 
-        if not u_lines:
-            u_lines = "<i>No active users yet.</i>\n"
+        u_lines = []
+        buttons = []
+
+        if not users_list:
+            u_lines.append("<i>No registered users found.</i>")
+        else:
+            for idx, u in enumerate(users_list, start=offset + 1):
+                uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "No name")
+                sec_status = "🔓 Whitelisted" if u.get("has_secret_access") else "🔒 Restricted"
+                u_lines.append(
+                    f"{idx}. <b>{uname}</b>\n"
+                    f"   🆔 <code>{u['user_id']}</code> | 🔢 Consumed: <code>{u['numbers_consumed']}</code>\n"
+                    f"   🔒 Secret: <code>{sec_status}</code>\n"
+                )
+                buttons.append([InlineKeyboardButton(f"👤 Manage ID: {u['user_id']} ({uname[:12]})", callback_data=f"u_inspect_{u['user_id']}")])
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"page_users_{page-1}"))
+        if offset + per_page < total_users:
+            nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"page_users_{page+1}"))
+        if nav_row:
+            buttons.append(nav_row)
+
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
 
         users_text = (
-            f"👥 <b>User Analytics & Activity</b>\n"
+            f"👥 <b>User Management & Access Control</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Total Registered Users:</b> <code>{stats['total_users']}</code>\n"
+            f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
             f"• <b>Total Numbers Consumed:</b> <code>{stats['total_consumed']}</code>\n"
+            f"• <b>Secret Whitelisted Users:</b> <code>{stats['total_secret_users']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏆 <b>Top Active Users:</b>\n"
-            f"{u_lines}"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            + "\n".join(u_lines) +
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>Tip: Click any user button above or use <code>/user &lt;id&gt;</code> to grant/revoke Secret Access!</i>"
         )
-        await query.edit_message_text(
-            users_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Broadcast to All Users", callback_data="admin_broadcast_prompt")],
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
-            ])
-        )
+        await query.edit_message_text(users_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
-    # 10. Admin Broadcast Prompt
-    elif data == "admin_broadcast_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
-        await query.edit_message_text(
-            "📢 <b>Broadcast Message to All Users</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 Type your broadcast message below.\n"
-            "You will see a <b>preview</b> before it's sent.\n\n"
-            "✨ <i>Supports HTML formatting:</i>\n"
-            "• <code>&lt;b&gt;bold&lt;/b&gt;</code> → <b>bold</b>\n"
-            "• <code>&lt;i&gt;italic&lt;/i&gt;</code> → <i>italic</i>\n"
-            "• <code>&lt;code&gt;code&lt;/code&gt;</code> → <code>code</code>\n\n"
-            "💡 <i>Tip: Include emojis to make it look great!</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
-            ])
-        )
-
-    # 11. Cancel Broadcast
-    elif data == "cancel_broadcast" and user_admin:
-        if user.id in ADMIN_STATES:
-            del ADMIN_STATES[user.id]
-        await query.edit_message_text(
-            "❌ <b>Broadcast Cancelled.</b>\n"
-            "<i>Your message was not sent.</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
-        )
-
-    # 11b. Confirm & Send Broadcast
-    elif data == "bc_confirm_send" and user_admin:
-        state = ADMIN_STATES.get(user.id, {})
-        bc_text = state.get("preview_broadcast")
-        if not bc_text:
-            await query.answer("⚠️ No pending broadcast found. Please start again.", show_alert=True)
-            return
-        del ADMIN_STATES[user.id]
-        await query.edit_message_text(
-            "📡 <b>Broadcast is launching...</b>\n"
-            "<i>You'll receive live progress updates below.</i>",
-            parse_mode=ParseMode.HTML
-        )
-        asyncio.create_task(
-            execute_broadcast(context.bot, query.message.chat_id, bc_text, admin_id=user.id)
-        )
-
-    # 11c. Edit broadcast message (go back to awaiting state)
-    elif data == "bc_edit_message" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_broadcast": True}
-        await query.edit_message_text(
-            "✏️ <b>Edit Your Broadcast Message</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Type your updated message below:\n\n"
-            "<i>Supports HTML: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
-            ])
-        )
-
-    # 11d. Broadcast History
-    elif data == "bc_history" and user_admin:
-        history = get_broadcast_history(limit=8)
-        if not history:
-            await query.edit_message_text(
-                "📋 <b>Broadcast History</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>No broadcasts have been sent yet.</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")],
-                    [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
+    # 9b. User Inspection Profile & 1-Click Secret Access Toggle
+    elif data.startswith("u_inspect_") and user_admin:
+        target_id = int(data.split("_")[2])
+        u = get_user_details(target_id)
+        if not u:
+            await query.answer("⚠️ User not found in database.", show_alert=True)
             return
 
-        lines = ["📋 <b>Broadcast History</b>\n━━━━━━━━━━━━━━━━━━━━"]
-        buttons = []
-        for bc in history:
-            bc_id = bc["id"]
-            preview = (bc["text"][:40] + "...") if len(bc["text"]) > 40 else bc["text"]
-            status_icon = "✅" if bc["status"] == "done" else "⏳"
-            lines.append(
-                f"\n{status_icon} <b>#{bc_id}</b> — <code>{preview}</code>\n"
-                f"   👥 {bc['success_count']}/{bc['total_users']} delivered · "
-                f"📅 {bc['created_at'][:16]}"
-            )
-            buttons.append([InlineKeyboardButton(
-                f"🗑️ Delete #{bc_id}", callback_data=f"bc_delete_{bc_id}"
-            )])
-        buttons.append([InlineKeyboardButton("📢 New Broadcast", callback_data="admin_broadcast_prompt")])
-        buttons.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
-        await query.edit_message_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        is_whitelisted = bool(u.get("has_secret_access"))
+        secret_badge = "✅ Authorized (Whitelisted)" if is_whitelisted else "❌ Restricted"
+        toggle_label = "🔒 Revoke Secret Access" if is_whitelisted else "🔓 Grant Secret Access"
 
-    # 11e. Delete a specific Broadcast
-    elif data.startswith("bc_delete_") and user_admin:
-        bc_id_str = data.replace("bc_delete_", "", 1)
-        if not bc_id_str.isdigit():
-            await query.answer("Invalid broadcast ID.", show_alert=True)
-            return
-        bc_id = int(bc_id_str)
-        # Confirm first
-        with get_main_db() as conn:
-            row = conn.execute("SELECT text, success_count, total_users FROM broadcasts WHERE id=?", (bc_id,)).fetchone()
-        if not row:
-            await query.answer(f"⚠️ Broadcast #{bc_id} not found.", show_alert=True)
-            return
-        preview = (dict(row)["text"][:50] + "...") if len(dict(row)["text"]) > 50 else dict(row)["text"]
-        await query.edit_message_text(
-            f"🗑️ <b>Delete Broadcast #{bc_id}?</b>\n"
+        profile_text = (
+            f"👤 <b>User Account Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📝 <b>Message:</b> <i>{preview}</i>\n"
-            f"👥 <b>Delivered to:</b> <code>{dict(row)['success_count']}/{dict(row)['total_users']}</code> users\n"
+            f"🆔 <b>User Account ID:</b> <code>{u['user_id']}</code>\n"
+            f"📛 <b>Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
+            f"🔗 <b>Username:</b> @{u.get('username') or 'None'}\n"
+            f"🔢 <b>Total Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code> numbers\n"
+            f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
+            f"📅 <b>Joined Date:</b> <code>{u.get('joined_at', 'N/A')[:19]}</code>\n"
+            f"⏱️ <b>Last Activity:</b> <code>{u.get('last_seen', 'N/A')[:19]}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <b>This will delete the message from ALL users' chats!</b>\n"
-            f"<i>(Users who deleted it manually won't be affected.)</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🗑️ Yes, Delete #{bc_id}", callback_data=f"bc_confirm_delete_{bc_id}"),
-                 InlineKeyboardButton("❌ Cancel", callback_data="bc_history")]
-            ])
+            f"⚡ <i>Click below to toggle Secret Numbers permission for this user:</i>"
         )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # 11f. Confirm Delete Broadcast
-    elif data.startswith("bc_confirm_delete_") and user_admin:
-        bc_id_str = data.replace("bc_confirm_delete_", "", 1)
-        if not bc_id_str.isdigit():
-            await query.answer("Invalid broadcast ID.", show_alert=True)
-            return
-        bc_id = int(bc_id_str)
-        await query.edit_message_text(
-            f"🗑️ <b>Retracting Broadcast #{bc_id}...</b>\n"
-            f"<i>Deleting from all users' chats. Please wait...</i>",
-            parse_mode=ParseMode.HTML
+    # 9c. Execute Toggle Secret Access
+    elif data.startswith("u_toggle_sec_") and user_admin:
+        target_id = int(data.split("_")[3])
+        u = get_user_details(target_id)
+        current_val = bool(u.get("has_secret_access")) if u else False
+        new_val = not current_val
+
+        set_user_secret_access(target_id, new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        u_updated = get_user_details(target_id)
+        is_whitelisted = bool(u_updated.get("has_secret_access")) if u_updated else new_val
+        secret_badge = "✅ Authorized (Whitelisted)" if is_whitelisted else "❌ Restricted"
+        toggle_label = "🔒 Revoke Secret Access" if is_whitelisted else "🔓 Grant Secret Access"
+
+        status_alert = "🔓 Secret Access Granted!" if new_val else "🔒 Secret Access Revoked!"
+        await query.answer(status_alert, show_alert=True)
+
+        profile_text = (
+            f"👤 <b>User Account Details</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>User Account ID:</b> <code>{u_updated['user_id']}</code>\n"
+            f"📛 <b>Name:</b> <code>{u_updated.get('first_name') or 'N/A'}</code>\n"
+            f"🔗 <b>Username:</b> @{u_updated.get('username') or 'None'}\n"
+            f"🔢 <b>Total Numbers Consumed:</b> <code>{u_updated.get('numbers_consumed', 0)}</code> numbers\n"
+            f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
+            f"📅 <b>Joined Date:</b> <code>{u_updated.get('joined_at', 'N/A')[:19]}</code>\n"
+            f"⏱️ <b>Last Activity:</b> <code>{u_updated.get('last_seen', 'N/A')[:19]}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ <i>Permissions updated and saved to persistent database!</i>"
         )
-        asyncio.create_task(
-            execute_delete_broadcast(context.bot, query.message.chat_id, bc_id)
-        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 12. Admin Select Existing Country for Upload / Removal
     elif data.startswith("sel_upload_c_") and user_admin:
@@ -2234,7 +2376,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"🌍 <b>Country:</b> <code>{c_info.get('name', 'Unknown')}</code>\n"
                 f"📄 <b>Source File:</b> <code>{filename}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
-                f"📊 <b>Remaining Stock:</b> <code>{c_info.get('available', 0)}</code>\n"
+                f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
@@ -2243,7 +2385,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        added, duplicates = add_numbers_to_country(cid, numbers)
+        is_secret_upload = (mode == "add_secret")
+        added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret_upload)
         del ADMIN_STATES[user.id]
 
         if gist_storage.enabled:
@@ -2251,19 +2394,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get('name', 'Unknown')
+        sec_label = "🔒 Secret" if is_secret_upload else "Standard"
+        pool_stock = c_info.get('available_sec', added) if is_secret_upload else c_info.get('available_std', added)
 
         await query.edit_message_text(
-            f"✅ <b>Upload Complete!</b>\n"
+            f"✅ <b>Upload Complete! ({sec_label})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_info.get('name', 'Unknown')}</code>\n"
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
             f"📄 <b>Source File:</b> <code>{filename}</code>\n"
             f"📥 <b>Added Numbers (with +):</b> <code>{added}</code>\n"
             f"⚠️ <b>Duplicates Skipped:</b> <code>{duplicates}</code>\n"
-            f"📊 <b>Total Available Stock:</b> <code>{c_info.get('available', added)}</code>\n"
+            f"📊 <b>Pool Stock Available:</b> <code>{pool_stock}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"c_{cid}")],
+                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"{'sec_c_' if is_secret_upload else 'c_'}{cid}")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
@@ -2300,7 +2446,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "🌍 <b>No countries created yet.</b>\nUpload a .txt file to create your first country pool!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
+                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
                     [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
                 ])
             )
@@ -2323,14 +2469,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 <b>Available in Stock:</b> <code>{c_info.get('available', 0)}</code>\n"
-            f"🔒 <b>Delivered / Used:</b> <code>{c_info.get('used', 0)}</code>\n"
-            f"📊 <b>Total Numbers Added:</b> <code>{c_info.get('total', 0)}</code>\n"
+            f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
+            f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
+            f"📊 <b>Total Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
+            f"🔒 <b>Delivered / Used:</b> <code>{c_info.get('total_used', 0)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-                [InlineKeyboardButton("➕ Add More Numbers (.txt)", callback_data="admin_upload_prompt")],
+                [InlineKeyboardButton("➕ Add Standard Numbers (.txt)", callback_data="admin_upload_prompt")],
+                [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
                 [InlineKeyboardButton("📁 All Uploaded Files", callback_data="admin_uploaded_files")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
@@ -2379,7 +2527,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         ok = await gist_storage.export_and_sync()
-        status_msg = "✅ <b>Database backed up to GitHub Gist successfully!</b>" if ok else "❌ <b>Backup to Gist failed.</b> Check logs."
+        status_msg = "✅ <b>Database and User permissions backed up to GitHub Gist!</b>" if ok else "❌ <b>Backup to Gist failed.</b> Check logs."
         await query.edit_message_text(
             status_msg,
             parse_mode=ParseMode.HTML,
@@ -2403,10 +2551,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             f"💬 <b>Linked OTP Groups Management</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"These group buttons appear at the bottom of the <b>Get Number</b> results screen so users can click and be redirected straight to your OTP group for codes.\n\n"
+            f"These group buttons appear at the bottom of the numbers screen so users can click and join your OTP group for codes.\n\n"
             f"{groups_list_text}"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>Tip: For private groups, make sure to generate a permanent link with 'No expiration' so users never see an 'Expired link' error!</i>"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         buttons.append([InlineKeyboardButton("🔄 Set / Replace Primary Link", callback_data="prompt_set_group")])
         buttons.append([InlineKeyboardButton("➕ Add Additional Group", callback_data="prompt_add_group")])
@@ -2423,9 +2570,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "<b>Format:</b>\n"
             "<code>Group Name | https://t.me/your_otp_group</code>\n\n"
             "<i>Or simply send just the Telegram link:</i>\n"
-            "<code>https://t.me/your_otp_group</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 <i>Type and send the message below:</i>"
+            "<code>https://t.me/your_otp_group</code>"
         )
         await query.edit_message_text(
             text,
@@ -2441,17 +2586,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             "🔄 <b>Set / Replace Primary OTP Group Link:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "This will <b>clear any old/expired links</b> and set your new permanent link active.\n\n"
+            "This will clear old links and set your new permanent link.\n\n"
             "<b>Format:</b>\n"
-            "<code>Group Name | https://t.me/your_permanent_group</code>\n\n"
-            "<i>Or simply send just the Telegram link:</i>\n"
-            "<code>https://t.me/your_otp_group</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 <b>To prevent expired link error:</b>\n"
-            "• <b>Public group:</b> Use <code>https://t.me/group_username</code>\n"
-            "• <b>Private group:</b> Edit group > Invite links > Create Link > Set <b>No time limit</b> & <b>No user limit</b>!\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 <i>Type and send your new link below:</i>"
+            "<code>Group Name | https://t.me/your_permanent_group</code>"
         )
         await query.edit_message_text(
             text,
@@ -2465,6 +2602,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("del_group_") and user_admin:
         gid = int(data.split("_")[2])
         remove_linked_group(gid)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
         groups = get_linked_groups()
         groups_list_text = ""
         buttons = []
@@ -2516,11 +2656,11 @@ async def run_diagnostics():
         print(f"❌ [FAIL] Telegram connection error: {e}")
         return False
 
-    # Test 2: Database Initialization
+    # Test 2: Database Initialization & Migrations
     try:
         init_db()
         stats = get_system_stats()
-        print(f"✅ [PASS] Main Database active: {stats['total_available']} available, {stats['total_consumed']} consumed, {stats['total_users']} users")
+        print(f"✅ [PASS] Main Database active: {stats['total_std_available']} standard, {stats['total_sec_available']} secret, {stats['total_consumed']} consumed, {stats['total_users']} users")
     except Exception as e:
         print(f"❌ [FAIL] SQLite error: {e}")
         return False
@@ -2570,15 +2710,21 @@ def main():
     # Command & Message Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("getnumber", getnumber_command))
+    app.add_handler(CommandHandler("secretnumbers", secretnumbers_command))
     app.add_handler(CommandHandler("inventory", inventory_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("upload", upload_command))
+    app.add_handler(CommandHandler("secretupload", secretupload_command))
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("addgroup", addgroup_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("grantsecret", grantsecret_command))
+    app.add_handler(CommandHandler("revokesecret", revokesecret_command))
+    app.add_handler(CommandHandler("user", user_lookup_command))
+    app.add_handler(CommandHandler("users", admin_command))
+
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
@@ -2600,12 +2746,16 @@ def main():
             admin_commands = [
                 BotCommand("start", "🚀 Main Menu"),
                 BotCommand("getnumber", "📱 Get Numbers"),
+                BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
-                BotCommand("upload", "➕ Add Numbers (.txt file)"),
-                BotCommand("remove", "🗑️ Remove Numbers (.txt file)"),
+                BotCommand("upload", "➕ Add Standard Numbers (.txt)"),
+                BotCommand("secretupload", "🔒 Add Secret Numbers (.txt)"),
+                BotCommand("remove", "🗑️ Remove Numbers (.txt)"),
                 BotCommand("setgroup", "🔄 Set / Replace Primary OTP Group link"),
                 BotCommand("addgroup", "💬 Link additional OTP Group"),
-                BotCommand("broadcast", "📢 Broadcast message to all users"),
+                BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
+                BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
+                BotCommand("user", "👤 Lookup user details & usage"),
                 BotCommand("stats", "📊 View live system statistics"),
                 BotCommand("help", "ℹ️ How to use the bot"),
             ]
@@ -2620,10 +2770,6 @@ def main():
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 
     async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Global crash protection: Prevents transient Telegram API network/timeout
-        glitches from terminating the bot process.
-        """
         err = context.error
         if isinstance(err, (NetworkError, TimedOut)):
             logger.warning(f"⚠️ Telegram network glitch (auto-recovering): {err}")
@@ -2639,11 +2785,6 @@ def main():
     app.add_error_handler(global_error_handler)
 
     async def auto_session_handover(application: Application, duration_seconds: int):
-        """
-        Ensures 24/7 continuous operation without downtime:
-        Before GitHub Actions hits runner limits, cleanly exports data to Gist,
-        stops polling, and exits with code 0 so the next runner takes over seamlessly.
-        """
         logger.info(f"⏱️ Session handover timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
         await asyncio.sleep(duration_seconds)
         logger.info("⏱️ Scheduled session limit reached. Initiating graceful zero-downtime handover...")
@@ -2659,7 +2800,6 @@ def main():
             logger.warning(f"Notice calling stop_running: {e}")
 
     async def post_init(application: Application):
-        # Cloud Gist restore safely inside active loop
         if gist_storage.enabled:
             try:
                 await gist_storage.ensure_gist()
@@ -2669,7 +2809,6 @@ def main():
         await setup_bot_commands(application)
         await send_startup_announcement(application)
 
-        # Arm handover timer if running on GitHub Actions or SESSION_TIMEOUT specified
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "16200" if is_cloud else "0"))
         if session_timeout > 0:
@@ -2688,6 +2827,4 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         logger.critical(f"UNHANDLED EXCEPTION in bot main: {e}", exc_info=True)
-        # Exit code 2 = transient/recoverable error (runner will auto-restart in 3s)
-        # Exit code 1 is strictly reserved for missing critical configuration/tokens!
         sys.exit(2)

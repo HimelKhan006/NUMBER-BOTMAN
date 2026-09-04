@@ -2473,6 +2473,45 @@ def main():
         except Exception as e:
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Global crash protection: Prevents transient Telegram API network/timeout
+        glitches from terminating the bot process.
+        """
+        err = context.error
+        if isinstance(err, (NetworkError, TimedOut)):
+            logger.warning(f"⚠️ Telegram network glitch (auto-recovering): {err}")
+            return
+        if isinstance(err, Conflict):
+            logger.warning(f"⚠️ Telegram polling conflict (session handover in progress): {err}")
+            return
+        if isinstance(err, RetryAfter):
+            logger.warning(f"⚠️ Telegram rate-limit (RetryAfter {err.retry_after}s): {err}")
+            return
+        logger.error(f"Unhandled error in update processing: {err}", exc_info=err)
+
+    app.add_error_handler(global_error_handler)
+
+    async def auto_session_handover(application: Application, duration_seconds: int):
+        """
+        Ensures 24/7 continuous operation without downtime:
+        Before GitHub Actions hits runner limits, cleanly exports data to Gist,
+        stops polling, and exits with code 0 so the next runner takes over seamlessly.
+        """
+        logger.info(f"⏱️ Session handover timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
+        await asyncio.sleep(duration_seconds)
+        logger.info("⏱️ Scheduled session limit reached. Initiating graceful zero-downtime handover...")
+        if gist_storage.enabled:
+            try:
+                await gist_storage.export_and_sync()
+                logger.info("☁️ Pre-handover Gist backup completed successfully.")
+            except Exception as e:
+                logger.warning(f"Pre-handover Gist backup warning: {e}")
+        try:
+            application.stop_running()
+        except Exception as e:
+            logger.warning(f"Notice calling stop_running: {e}")
+
     async def post_init(application: Application):
         # Cloud Gist restore safely inside active loop
         if gist_storage.enabled:
@@ -2484,6 +2523,12 @@ def main():
         await setup_bot_commands(application)
         await send_startup_announcement(application)
 
+        # Arm handover timer if running on GitHub Actions or SESSION_TIMEOUT specified
+        is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
+        session_timeout = int(os.getenv("SESSION_TIMEOUT", "16200" if is_cloud else "0"))
+        if session_timeout > 0:
+            asyncio.create_task(auto_session_handover(application, session_timeout))
+
     app.post_init = post_init
 
     logger.info("🚀 NUMBER BOTMAN is running live in multi-user exclusive mode!")
@@ -2492,6 +2537,11 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped cleanly.")
+        sys.exit(0)
     except Exception as e:
-        logger.critical(f"FATAL BOT SHUTDOWN: {e}", exc_info=True)
-        sys.exit(1)
+        logger.critical(f"UNHANDLED EXCEPTION in bot main: {e}", exc_info=True)
+        # Exit code 2 = transient/recoverable error (runner will auto-restart in 3s)
+        # Exit code 1 is strictly reserved for missing critical configuration/tokens!
+        sys.exit(2)

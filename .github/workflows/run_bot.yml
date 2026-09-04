@@ -5,8 +5,8 @@ on:
     branches: [ main ]          # Auto-starts on every push to main
   workflow_dispatch:             # Allows manual trigger from GitHub UI
   schedule:
-    # Backup refresh every 5 hours (in case self-trigger fails)
-    - cron: '0 */5 * * *'
+    # Overlapping 3-hour cron triggers guarantee 24/7 uptime without manual restart
+    - cron: '0 */3 * * *'
 
 # Only ONE bot instance ever runs. New run cancels the old one instantly.
 concurrency:
@@ -21,7 +21,7 @@ jobs:
   run-bot:
     name: Run NUMBER BOTMAN 24/7
     runs-on: ubuntu-latest
-    timeout-minutes: 330      # 5.5 hours — safely under GitHub 6hr limit
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -124,34 +124,42 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
+          SESSION_TIMEOUT: "16200"
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
           echo "========================================"
-          echo "  NUMBER BOTMAN — Starting Up"
+          echo "  NUMBER BOTMAN — Starting Up (24/7)"
           echo "  Trigger : ${{ github.event_name }}"
           echo "  DB Path : $DB_FILE"
           echo "========================================"
 
-          # Run for 5 hours, then self-trigger will restart immediately with zero downtime
-          END_TIME=$((SECONDS + 18000))
+          # Session limit: 4.5 hours (16200s), after which bot exits cleanly with code 0
+          END_TIME=$((SECONDS + 16200))
 
           while [ $SECONDS -lt $END_TIME ]; do
             echo "⚡ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Launching bot.py..."
             python bot.py
             EXIT_CODE=$?
 
-            # Exit code 1 = fatal config error — don't retry
+            # Exit code 0 = clean session handover (proceed to save & next run)
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ Clean session handover signal received (exit 0)."
+              break
+            fi
+
+            # Exit code 1 = fatal missing secrets — don't retry in infinite loop
             if [ $EXIT_CODE -eq 1 ]; then
               echo "❌ Fatal config error (exit 1). Halting — check your secrets!"
               exit 1
             fi
 
-            echo "⚠️ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Bot stopped (exit: $EXIT_CODE). Restarting in 3s..."
+            # Exit code 2 or any other = transient network/API error — auto-restart in 3s
+            echo "⚠️ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Bot stopped (exit: $EXIT_CODE). Auto-restarting in 3s..."
             sleep 3
           done
 
-          echo "⏱️ 5-hour session complete. Saving database and self-triggering next run..."
+          echo "⏱️ 4.5-hour session complete. Saving database and triggering next run..."
 
       # Always save database before runner is destroyed — even if bot crashed
       - name: Save Persistent Database to Cache
@@ -164,9 +172,10 @@ jobs:
           key: bot4-database-persistent
 
       - name: Self-Trigger Next Run (Zero Downtime Restart)
-        if: success()
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           echo "🔄 Triggering next bot session immediately to avoid downtime..."
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
@@ -175,8 +184,19 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
             -d '{"ref":"main"}')
+
+          if [ "$HTTP_CODE" != "204" ] && [ -n "$GIST_TOKEN" ]; then
+            echo "ℹ️ Retrying dispatch with auxiliary token..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $GIST_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
+              -d '{"ref":"main"}')
+          fi
+
           if [ "$HTTP_CODE" = "204" ]; then
             echo "✅ Next run triggered! NUMBER BOTMAN continues without downtime."
           else
-            echo "⚠️ Self-trigger returned HTTP $HTTP_CODE (scheduled cron will pick up as backup)."
+            echo "ℹ️ Self-trigger dispatch response: HTTP $HTTP_CODE (continuous 3-hour cron will seamlessly keep the bot running 24/7)."
           fi

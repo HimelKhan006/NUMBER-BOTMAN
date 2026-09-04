@@ -901,16 +901,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user.id, user.username, user.first_name)
 
     welcome_text = (
-        f"👋 <b>Welcome, {user.first_name}!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>NUMBER BOTMAN</b> provides fresh, exclusive phone numbers for all your OTP and verification needs.\n\n"
-        f"✨ <b>Features:</b>\n"
-        f"• 🔒 <b>100% Exclusive:</b> Numbers given to you are removed from stock and never given to anyone else.\n"
-        f"• ➕ <b>International Format:</b> All numbers start with <code>+</code>.\n"
-        f"• 🔄 <b>Change Numbers:</b> Tap to get 10 brand-new numbers instantly!\n"
-        f"• 🌍 <b>Multiple Countries:</b> Choose from active global pools.\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 <i>Click below to get numbers:</i>"
+        f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
+        f"Select an option below to get numbers:"
     )
     keyboard = get_main_menu_keyboard(user.id)
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -1679,16 +1671,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 1. Main Menu
     if data == "btn_main_menu":
         welcome_text = (
-            f"👋 <b>Welcome, {user.first_name}!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🤖 <b>NUMBER BOTMAN</b> provides fresh, exclusive phone numbers for all your OTP and verification needs.\n\n"
-            f"✨ <b>Features:</b>\n"
-            f"• 🔒 <b>100% Exclusive:</b> Numbers given to you are removed from stock and never given to anyone else.\n"
-            f"• ➕ <b>International Format:</b> All numbers start with <code>+</code>.\n"
-            f"• 🔄 <b>Change Numbers:</b> Tap to get 10 brand-new numbers instantly!\n"
-            f"• 🌍 <b>Multiple Countries:</b> Choose from active global pools.\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <i>Click below to get numbers:</i>"
+            f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
+            f"Select an option below to get numbers:"
         )
         await query.edit_message_text(
             welcome_text,

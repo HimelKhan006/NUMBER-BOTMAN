@@ -287,14 +287,7 @@ def init_db():
             conn.execute("ALTER TABLE delivery_log ADD COLUMN is_secret INTEGER DEFAULT 0;")
         except Exception:
             pass
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS linked_groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT DEFAULT '',
-                invite_link TEXT UNIQUE NOT NULL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
+
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
@@ -606,68 +599,7 @@ def get_system_stats() -> Dict[str, Any]:
         "active_countries": active_countries_count,
     }
 
-# ==========================================
-# Group Management Functions (Direct OTP Links)
-# ==========================================
-def add_linked_group(title: str = "", invite_link: str = "") -> bool:
-    try:
-        clean_link = invite_link.strip()
-        if not clean_link:
-            return False
-        if not clean_link.startswith("http://") and not clean_link.startswith("https://"):
-            clean_link = "https://" + clean_link
-        clean_title = (title or "Join OTP Group").strip()
-        with get_main_db() as conn:
-            conn.execute("""
-                INSERT INTO linked_groups (title, invite_link)
-                VALUES (?, ?)
-                ON CONFLICT(invite_link) DO UPDATE SET
-                    title = excluded.title;
-            """, (clean_title, clean_link))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Error adding linked group: {e}")
-        return False
 
-def remove_linked_group(group_id: int) -> bool:
-    try:
-        with get_main_db() as conn:
-            conn.execute("DELETE FROM linked_groups WHERE id = ?;", (group_id,))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Error removing linked group: {e}")
-        return False
-
-def set_primary_group(title: str = "", invite_link: str = "") -> bool:
-    try:
-        clean_link = invite_link.strip()
-        if not clean_link:
-            return False
-        if not clean_link.startswith("http://") and not clean_link.startswith("https://"):
-            clean_link = "https://" + clean_link
-        clean_title = (title or "Join OTP Group").strip()
-        with get_main_db() as conn:
-            conn.execute("DELETE FROM linked_groups;")
-            conn.execute("""
-                INSERT INTO linked_groups (title, invite_link)
-                VALUES (?, ?);
-            """, (clean_title, clean_link))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Error setting primary group: {e}")
-        return False
-
-def get_linked_groups() -> List[Dict[str, Any]]:
-    try:
-        with get_main_db() as conn:
-            cur = conn.execute("SELECT id, title, invite_link, added_at FROM linked_groups ORDER BY id ASC;")
-            return [dict(row) for row in cur.fetchall()]
-    except Exception as e:
-        logger.error(f"Error fetching linked groups: {e}")
-        return []
 
 # ==========================================
 # 6. Gist Persistent Storage Sync
@@ -766,9 +698,7 @@ class GistStorage:
                 users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at FROM users;")
                 users_data = [dict(r) for r in users_cur.fetchall()]
 
-                # Export linked groups
-                groups_cur = conn.execute("SELECT title, invite_link FROM linked_groups;")
-                groups_data = [dict(r) for r in groups_cur.fetchall()]
+
 
             payload = {
                 "description": self.description,
@@ -781,7 +711,7 @@ class GistStorage:
                             "countries": countries_data,
                             "used_countries": used_data,
                             "users": users_data,
-                            "linked_groups": groups_data,
+                            
                         }, indent=2)
                     }
                 }
@@ -810,7 +740,7 @@ class GistStorage:
                         countries_data = parsed.get("countries", {})
                         used_data = parsed.get("used_countries", {})
                         users_data = parsed.get("users", [])
-                        groups_data = parsed.get("linked_groups", [])
+                        
 
                         # 1. Restore Users & Permissions
                         with get_main_db() as mconn:
@@ -836,10 +766,7 @@ class GistStorage:
                                 ))
                             mconn.commit()
 
-                        # 2. Restore Linked Groups
-                        for g in groups_data:
-                            if isinstance(g, dict) and "invite_link" in g:
-                                add_linked_group(g.get("title", ""), g["invite_link"])
+
 
                         # 3. Restore used numbers archive
                         total_used_restored = 0
@@ -920,9 +847,9 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
 # 8. Startup Announcement System
 # ==========================================
 async def send_startup_announcement(application: Application):
-    is_auto_restart = (STARTUP_TYPE == "schedule")
+    is_auto_restart = (STARTUP_TYPE == "schedule" or os.getenv("SILENT_STARTUP") == "1")
     if is_auto_restart:
-        logger.info("ℹ️ Silent auto-refresh cycle active. No Telegram alert dispatched.")
+        logger.info("ℹ️ Routine 24-hour restart cycle. Silent startup (no admin notification spam).")
         return
 
     stats = get_system_stats()
@@ -1021,7 +948,7 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     return InlineKeyboardMarkup(buttons)
 
 def get_numbers_view_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:
-    """Builds number result keyboard. Includes OTP group URL buttons at the bottom."""
+    """Builds number result keyboard."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
 
@@ -1030,17 +957,8 @@ def get_numbers_view_keyboard(country_id: int, is_secret: bool = False) -> Inlin
             InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=change_cb),
             InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
         ],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
     ]
-
-    # Add linked OTP group URL buttons
-    groups = get_linked_groups()
-    for g in groups:
-        link = g.get("invite_link", "").strip()
-        title = g.get("title", "").strip() or f"OTP Group {g['id']}"
-        if link:
-            buttons.append([InlineKeyboardButton(f"💬 {title}", url=link)])
-
-    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
     return InlineKeyboardMarkup(buttons)
 
 # ==========================================
@@ -1114,8 +1032,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stats = get_system_stats()
-    groups = get_linked_groups()
-    groups_count = len(groups)
 
     admin_text = (
         f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
@@ -1127,15 +1043,13 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
         f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-        f"• <b>Linked OTP Groups:</b> <code>{groups_count} active</code>\n"
         f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Upload .txt to manage Standard or Secret numbers:</i>"
+        f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Uploaded Files & Pools", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
-        [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
-        [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
+        [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
+        [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
         [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
         [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
     ])
@@ -1332,125 +1246,6 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-async def resolve_telegram_group_link(bot: Bot, input_text: str) -> tuple[str, str]:
-    parts = input_text.split("|", 1)
-    if len(parts) == 2:
-        title = parts[0].strip()
-        link = parts[1].strip()
-    else:
-        title = ""
-        link = input_text.strip()
-
-    clean_username = link
-    for prefix in ["https://t.me/", "http://t.me/", "t.me/", "https://telegram.me/", "@"]:
-        if clean_username.startswith(prefix):
-            clean_username = clean_username[len(prefix):]
-            break
-    clean_username = clean_username.strip("/").strip()
-
-    if clean_username and not clean_username.startswith("+"):
-        try:
-            chat = await bot.get_chat(f"@{clean_username}")
-            if chat:
-                if not title:
-                    title = chat.title or "Join OTP Group"
-                if chat.invite_link:
-                    link = chat.invite_link
-                else:
-                    link = f"https://t.me/{clean_username}"
-                return title, link
-        except Exception as e:
-            logger.warning(f"Could not resolve chat @{clean_username}: {e}")
-
-    if not title:
-        title = "Join OTP Group"
-    if not link.startswith("http://") and not link.startswith("https://"):
-        link = "https://" + link
-    return title, link
-
-async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-
-    text = update.message.text.replace("/addgroup", "", 1).strip()
-    if not text:
-        ADMIN_STATES[user.id] = {"awaiting_group_link": True}
-        await update.message.reply_text(
-            "➕ <b>Add Linked OTP Group:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the group title and invite link, for example:\n"
-            "<code>My OTP Group | https://t.me/yourgroup</code>\n\n"
-            "<i>Or simply send just the Telegram link / username:</i>\n"
-            "<code>https://t.me/yourgroup</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
-        )
-        return
-
-    title, link = await resolve_telegram_group_link(context.bot, text)
-    ok = add_linked_group(title=title, invite_link=link)
-    if ok:
-        if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-        await update.message.reply_text(
-            f"✅ <b>OTP Group Linked Successfully!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-            f"🔗 <b>Link:</b> <code>{link}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
-        )
-    else:
-        await update.message.reply_text("❌ <b>Failed to link group.</b>", parse_mode=ParseMode.HTML)
-
-async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-
-    text = update.message.text.replace("/setgroup", "", 1).strip()
-    if not text:
-        ADMIN_STATES[user.id] = {"awaiting_set_group_link": True}
-        await update.message.reply_text(
-            "🔄 <b>Update / Replace OTP Group Link:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Send your group link or username to replace any old/expired links:\n\n"
-            "<b>Format:</b>\n"
-            "<code>Group Name | https://t.me/your_link</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
-        )
-        return
-
-    title, link = await resolve_telegram_group_link(context.bot, text)
-    ok = set_primary_group(title=title, invite_link=link)
-    if ok:
-        if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-        await update.message.reply_text(
-            f"✅ <b>Primary OTP Group Link Updated!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-            f"🔗 <b>Link:</b> <code>{link}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
-        )
-    else:
-        await update.message.reply_text("❌ <b>Failed to update group link.</b>", parse_mode=ParseMode.HTML)
-
 # ── Admin User Management Commands ──
 async def grantsecret_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1583,11 +1378,11 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         file_bytes = await file_obj.download_as_bytearray()
 
         try:
-            content = file_bytes.decode("utf-8")
+            file_text = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
-            content = file_bytes.decode("latin-1", errors="ignore")
+            file_text = file_bytes.decode("latin-1", errors="ignore")
 
-        lines = content.splitlines()
+        lines = file_text.splitlines()
         extracted_numbers = []
         for line in lines:
             line_str = line.strip()
@@ -1609,6 +1404,31 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             "mode": prev_mode,
         }
 
+        if prev_mode == "remove":
+            countries = get_all_countries_with_stock(only_active=False)
+            buttons = []
+            row = []
+            for c in countries[:8]:
+                row.append(InlineKeyboardButton(f"{c['name']}", callback_data=f"sel_upload_c_{c['id']}"))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")])
+
+            await msg.edit_text(
+                f"🗑️ <b>Remove Numbers from Pool:</b>\n"
+                f"📄 <b>File:</b> <code>{file_name}</code>\n"
+                f"🔢 <b>Numbers:</b> <code>{len(extracted_numbers)}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Select the country pool to remove these numbers from:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return
+
+        # Upload Flow: Step 1 Select Country
         countries = get_all_countries_with_stock(only_active=False)
         buttons = []
         row = []
@@ -1623,19 +1443,13 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         buttons.append([InlineKeyboardButton("➕ Type New Country Name", callback_data="prompt_new_country")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")])
 
-        if prev_mode == "add_secret":
-            action_label = "🔒 ADD to SECRET Stock"
-        elif prev_mode == "remove":
-            action_label = "🗑️ REMOVE from Stock"
-        else:
-            action_label = "➕ ADD to Standard Stock"
-
         await msg.edit_text(
-            f"📄 <b>File Parsed:</b> <code>{file_name}</code>\n"
-            f"🔢 <b>Valid Numbers (with +):</b> <code>{len(extracted_numbers)}</code>\n"
-            f"⚙️ <b>Action:</b> <code>{action_label}</code>\n"
+            f"📄 <b>File Parsed Successfully!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Select Country:</b>\n"
+            f"📁 <b>Filename:</b> <code>{file_name}</code>\n"
+            f"🔢 <b>Valid Numbers (with +):</b> <code>{len(extracted_numbers)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 <b>Step 1: Choose Country:</b>\n"
             f"<i>Tap an existing country below or tap 'Type New Country Name':</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
@@ -1655,52 +1469,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not admin_state:
         return
 
-    if admin_state.get("awaiting_group_link"):
-        title, link = await resolve_telegram_group_link(context.bot, text)
-        ok = add_linked_group(title=title, invite_link=link)
-        del ADMIN_STATES[user.id]
-        if ok:
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
-            await update.message.reply_text(
-                f"✅ <b>OTP Group Linked!</b>\n"
-                f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-                f"🔗 <b>Link:</b> <code>{link}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-        else:
-            await update.message.reply_text("❌ Failed to add group.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ]))
-        return
-
-    if admin_state.get("awaiting_set_group_link"):
-        title, link = await resolve_telegram_group_link(context.bot, text)
-        ok = set_primary_group(title=title, invite_link=link)
-        del ADMIN_STATES[user.id]
-        if ok:
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
-            await update.message.reply_text(
-                f"✅ <b>Primary OTP Group Link Updated!</b>\n"
-                f"🏷️ <b>Title:</b> <code>{title}</code>\n"
-                f"🔗 <b>Link:</b> <code>{link}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 View Linked Groups", callback_data="admin_linked_groups")],
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-        else:
-            await update.message.reply_text("❌ Failed to update group link.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ]))
-        return
-
     if admin_state.get("awaiting_country_name"):
         country_name = text
         numbers = admin_state["numbers"]
@@ -1708,6 +1476,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         mode = admin_state.get("mode", "add")
 
         cid = get_or_create_country(country_name)
+        admin_state["awaiting_country_name"] = False
+        admin_state["country_id"] = cid
+        admin_state["country_name"] = country_name
 
         if mode == "remove":
             removed = remove_numbers_from_country(cid, numbers)
@@ -1720,7 +1491,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>Country:</b> <code>{c_info.get('name', country_name)}</code>\n"
+                f"🌍 <b>Country:</b> <code>{country_name}</code>\n"
                 f"📄 <b>Source File:</b> <code>{filename}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
@@ -1732,33 +1503,23 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        is_secret_upload = (mode == "add_secret")
-        added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret_upload)
-        del ADMIN_STATES[user.id]
-
-        if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-
-        all_c = get_all_countries_with_stock(only_active=False)
-        c_info = next((x for x in all_c if x["id"] == cid), {})
-        c_name = c_info.get('name', country_name)
-        sec_label = "🔒 Secret" if is_secret_upload else "Standard"
-
-        await update.message.reply_text(
-            f"✅ <b>Upload Complete! ({sec_label})</b>\n"
+        # Step 2: Choose Stock Pool (Standard or Secret)
+        choice_text = (
+            f"🌍 <b>Country:</b> <code>{country_name}</code>\n"
+            f"📄 <b>File:</b> <code>{filename}</code> (<b>{len(numbers)}</b> numbers)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-            f"📄 <b>Source File:</b> <code>{filename}</code>\n"
-            f"📥 <b>Added Numbers (with +):</b> <code>{added}</code>\n"
-            f"⚠️ <b>Duplicates Skipped:</b> <code>{duplicates}</code>\n"
-            f"📊 <b>Pool Stock:</b> <code>{c_info.get('available_sec', 0) if is_secret_upload else c_info.get('available_std', 0)} available</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"{'sec_c_' if is_secret_upload else 'c_'}{cid}")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
+            f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
+            f"• <b>Standard Stock:</b> Available for regular users when requesting numbers.\n"
+            f"• <b>Secret Stock:</b> Hidden & reserved for Admin + Whitelisted users only.\n\n"
+            f"<i>Where would you like to add these numbers?</i>"
         )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Add to Standard Stock", callback_data=f"apply_stock_std_{cid}")],
+            [InlineKeyboardButton("🔒 Add to Secret Stock", callback_data=f"apply_stock_sec_{cid}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
+        ])
+        await update.message.reply_text(choice_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
 
 # ==========================================
 # 12. Callback Query Handler (Interactive Buttons)
@@ -2006,8 +1767,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 6. Admin Panel
     elif data == "admin_panel" and user_admin:
         stats = get_system_stats()
-        groups = get_linked_groups()
-        groups_count = len(groups)
         admin_text = (
             f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -2018,15 +1777,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
             f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
             f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-            f"• <b>Linked OTP Groups:</b> <code>{groups_count} active</code>\n"
             f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Manage numbers, secret access, and users:</i>"
+            f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📁 Uploaded Files & Pools", callback_data="admin_uploaded_files"), InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
-            [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
-            [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton(f"💬 Linked OTP Groups ({groups_count})", callback_data="admin_linked_groups")],
+            [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
+            [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
             [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
@@ -2046,8 +1803,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "Upload your first file (.txt) to start serving numbers!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Upload Standard Numbers (.txt)", callback_data="admin_upload_prompt")],
-                    [InlineKeyboardButton("🔒 Upload Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
+                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
                     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )
@@ -2084,8 +1840,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("➕ Add Standard Numbers (.txt)", callback_data="admin_upload_prompt")])
-        buttons.append([InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")])
+        buttons.append([InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")])
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
 
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
@@ -2186,16 +1941,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # 7. Admin Add Standard Numbers Prompt
+    # 7. Admin Add Numbers Prompt
     elif data == "admin_upload_prompt" and user_admin:
         ADMIN_STATES[user.id] = {"mode": "add"}
         await query.edit_message_text(
-            "➕ <b>Add Standard Numbers (.txt):</b>\n"
+            "➕ <b>Add Numbers (.txt):</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send a <b>.txt</b> file containing phone numbers (one number per line) directly to this chat.\n\n"
-            "<b>Example:</b>\n"
+            "Please send a <b>.txt</b> file containing phone numbers directly into this chat.\n\n"
+            "<b>Format:</b> One phone number per line.\n"
+            "<i>Example:</i>\n"
             "<code>+12025550143\n12025550189\n+12025550192</code>\n\n"
-            "<i>(All numbers will automatically be formatted with leading <code>+</code>).</i>",
+            "🔒 <i>You can assign numbers to <b>Standard Stock</b> (all users) or <b>Secret Stock</b> (whitelisted users only) in Step 2.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
@@ -2354,13 +2110,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("sel_upload_c_") and user_admin:
         cid = int(data.split("_")[3])
         pending = ADMIN_STATES.get(user.id)
-        if not pending:
-            await query.edit_message_text("⚠️ <b>Session expired. Please upload the .txt file again.</b>", parse_mode=ParseMode.HTML)
+        if not pending or "numbers" not in pending:
+            await query.edit_message_text("⚠️ <b>Upload session expired. Please upload your .txt file again.</b>", parse_mode=ParseMode.HTML)
             return
 
+        mode = pending.get("mode", "add")
         numbers = pending["numbers"]
         filename = pending["filename"]
-        mode = pending.get("mode", "add")
+
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", f"Country {cid}")
 
         if mode == "remove":
             removed = remove_numbers_from_country(cid, numbers)
@@ -2373,8 +2133,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>Country:</b> <code>{c_info.get('name', 'Unknown')}</code>\n"
-                f"📄 <b>Source File:</b> <code>{filename}</code>\n"
+                f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+                f"📄 <b>File:</b> <code>{filename}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
@@ -2385,8 +2145,41 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        is_secret_upload = (mode == "add_secret")
-        added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret_upload)
+        # Step 2: Choose Destination Pool (Standard or Secret)
+        pending["country_id"] = cid
+        pending["country_name"] = c_name
+
+        text = (
+            f"🌍 <b>Country Selected:</b> <code>{c_name}</code>\n"
+            f"📄 <b>File:</b> <code>{filename}</code> (<b>{len(numbers)}</b> numbers)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
+            f"• <b>Standard:</b> Available for anyone requesting numbers.\n"
+            f"• <b>Secret:</b> Hidden & reserved for Admin + Whitelisted users only.\n\n"
+            f"<i>Where would you like to add these numbers?</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Add to Standard Stock", callback_data=f"apply_stock_std_{cid}")],
+            [InlineKeyboardButton("🔒 Add to Secret Stock", callback_data=f"apply_stock_sec_{cid}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 12b. Execute Stock Application (Standard or Secret)
+    elif (data.startswith("apply_stock_std_") or data.startswith("apply_stock_sec_")) and user_admin:
+        is_secret = data.startswith("apply_stock_sec_")
+        cid = int(data.split("_")[3])
+
+        pending = ADMIN_STATES.get(user.id)
+        if not pending or "numbers" not in pending:
+            await query.edit_message_text("⚠️ <b>Upload session expired. Please upload your .txt file again.</b>", parse_mode=ParseMode.HTML)
+            return
+
+        numbers = pending["numbers"]
+        filename = pending["filename"]
+        c_name = pending.get("country_name", f"Country {cid}")
+
+        added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret)
         del ADMIN_STATES[user.id]
 
         if gist_storage.enabled:
@@ -2394,25 +2187,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
-        c_name = c_info.get('name', 'Unknown')
-        sec_label = "🔒 Secret" if is_secret_upload else "Standard"
-        pool_stock = c_info.get('available_sec', added) if is_secret_upload else c_info.get('available_std', added)
+        pool_type = "🔒 Secret Stock" if is_secret else "Standard Stock"
+        current_pool_avail = c_info.get("available_sec", added) if is_secret else c_info.get("available_std", added)
 
-        await query.edit_message_text(
-            f"✅ <b>Upload Complete! ({sec_label})</b>\n"
+        text = (
+            f"✅ <b>Upload Successful!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"📂 <b>Destination:</b> <code>{pool_type}</code>\n"
             f"📄 <b>Source File:</b> <code>{filename}</code>\n"
-            f"📥 <b>Added Numbers (with +):</b> <code>{added}</code>\n"
+            f"➕ <b>Added Numbers (with +):</b> <code>{added}</code>\n"
             f"⚠️ <b>Duplicates Skipped:</b> <code>{duplicates}</code>\n"
-            f"📊 <b>Pool Stock Available:</b> <code>{pool_stock}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Test Get Numbers", callback_data=f"{'sec_c_' if is_secret_upload else 'c_'}{cid}")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
+            f"📊 <b>Current Available in Pool:</b> <code>{current_pool_avail} numbers</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Upload Another File", callback_data="admin_upload_prompt")],
+            [InlineKeyboardButton("📁 View Uploaded Pools", callback_data="admin_uploaded_files")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 13. Admin Prompt Type New Country Name
     elif data == "prompt_new_country" and user_admin:
@@ -2477,8 +2271,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-                [InlineKeyboardButton("➕ Add Standard Numbers (.txt)", callback_data="admin_upload_prompt")],
-                [InlineKeyboardButton("🔒 Add Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
+                [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
                 [InlineKeyboardButton("📁 All Uploaded Files", callback_data="admin_uploaded_files")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
@@ -2535,95 +2328,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
-
-    # 20. Admin Manage Linked OTP Groups
-    elif data == "admin_linked_groups" and user_admin:
-        groups = get_linked_groups()
-        groups_list_text = ""
-        buttons = []
-        if groups:
-            for idx, g in enumerate(groups, 1):
-                groups_list_text += f"<b>{idx}. {g['title']}</b>\n🔗 <code>{g['invite_link']}</code>\n\n"
-                buttons.append([InlineKeyboardButton(f"🗑️ Delete: {g['title'][:20]}", callback_data=f"del_group_{g['id']}")])
-        else:
-            groups_list_text = "<i>No OTP groups linked yet. Click '🔄 Set Primary OTP Link' below to set one!</i>\n\n"
-
-        text = (
-            f"💬 <b>Linked OTP Groups Management</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"These group buttons appear at the bottom of the numbers screen so users can click and join your OTP group for codes.\n\n"
-            f"{groups_list_text}"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        buttons.append([InlineKeyboardButton("🔄 Set / Replace Primary Link", callback_data="prompt_set_group")])
-        buttons.append([InlineKeyboardButton("➕ Add Additional Group", callback_data="prompt_add_group")])
-        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-
-    # 21. Prompt Add OTP Group
-    elif data == "prompt_add_group" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_group_link": True}
-        text = (
-            "➕ <b>Add Linked OTP Group:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send your group title and invite link in this chat.\n\n"
-            "<b>Format:</b>\n"
-            "<code>Group Name | https://t.me/your_otp_group</code>\n\n"
-            "<i>Or simply send just the Telegram link:</i>\n"
-            "<code>https://t.me/your_otp_group</code>"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="admin_linked_groups")]
-            ])
-        )
-
-    # 21b. Prompt Set / Replace Primary OTP Group
-    elif data == "prompt_set_group" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_set_group_link": True}
-        text = (
-            "🔄 <b>Set / Replace Primary OTP Group Link:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "This will clear old links and set your new permanent link.\n\n"
-            "<b>Format:</b>\n"
-            "<code>Group Name | https://t.me/your_permanent_group</code>"
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="admin_linked_groups")]
-            ])
-        )
-
-    # 22. Delete OTP Group
-    elif data.startswith("del_group_") and user_admin:
-        gid = int(data.split("_")[2])
-        remove_linked_group(gid)
-        if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-
-        groups = get_linked_groups()
-        groups_list_text = ""
-        buttons = []
-        if groups:
-            for idx, g in enumerate(groups, 1):
-                groups_list_text += f"<b>{idx}. {g['title']}</b>\n🔗 <code>{g['invite_link']}</code>\n\n"
-                buttons.append([InlineKeyboardButton(f"🗑️ Delete: {g['title'][:20]}", callback_data=f"del_group_{g['id']}")])
-        else:
-            groups_list_text = "<i>No OTP groups linked yet.</i>\n\n"
-
-        text = (
-            f"✅ <b>OTP Group Removed!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{groups_list_text}"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        buttons.append([InlineKeyboardButton("➕ Add OTP Group", callback_data="prompt_add_group")])
-        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
 # ==========================================
 # 13. Diagnostics & Self-Test Engine
@@ -2718,8 +2422,6 @@ def main():
     app.add_handler(CommandHandler("upload", upload_command))
     app.add_handler(CommandHandler("secretupload", secretupload_command))
     app.add_handler(CommandHandler("remove", remove_command))
-    app.add_handler(CommandHandler("addgroup", addgroup_command))
-    app.add_handler(CommandHandler("setgroup", setgroup_command))
     app.add_handler(CommandHandler("grantsecret", grantsecret_command))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
     app.add_handler(CommandHandler("user", user_lookup_command))
@@ -2751,8 +2453,6 @@ def main():
                 BotCommand("upload", "➕ Add Standard Numbers (.txt)"),
                 BotCommand("secretupload", "🔒 Add Secret Numbers (.txt)"),
                 BotCommand("remove", "🗑️ Remove Numbers (.txt)"),
-                BotCommand("setgroup", "🔄 Set / Replace Primary OTP Group link"),
-                BotCommand("addgroup", "💬 Link additional OTP Group"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
                 BotCommand("user", "👤 Lookup user details & usage"),
@@ -2785,9 +2485,9 @@ def main():
     app.add_error_handler(global_error_handler)
 
     async def auto_session_handover(application: Application, duration_seconds: int):
-        logger.info(f"⏱️ Session handover timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
+        logger.info(f"⏱️ 24-hour scheduled restart timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
         await asyncio.sleep(duration_seconds)
-        logger.info("⏱️ Scheduled session limit reached. Initiating graceful zero-downtime handover...")
+        logger.info("⏱️ 24-hour scheduled restart time reached. Initiating clean restart...")
         if gist_storage.enabled:
             try:
                 await gist_storage.export_and_sync()
@@ -2810,7 +2510,7 @@ def main():
         await send_startup_announcement(application)
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
-        session_timeout = int(os.getenv("SESSION_TIMEOUT", "16200" if is_cloud else "0"))
+        session_timeout = int(os.getenv("SESSION_TIMEOUT", "86400"))
         if session_timeout > 0:
             asyncio.create_task(auto_session_handover(application, session_timeout))
 

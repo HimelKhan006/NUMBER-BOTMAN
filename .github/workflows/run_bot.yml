@@ -5,8 +5,8 @@ on:
     branches: [ main ]          # Auto-starts on every push to main
   workflow_dispatch:             # Allows manual trigger from GitHub UI
   schedule:
-    # Overlapping 3-hour cron triggers guarantee 24/7 uptime without manual restart
-    - cron: '0 */3 * * *'
+    # 24-hour scheduled restart cycle (single time per day at 00:00 UTC)
+    - cron: '0 0 * * *'
 
 # Only ONE bot instance ever runs. New run cancels the old one instantly.
 concurrency:
@@ -124,7 +124,8 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
-          SESSION_TIMEOUT: "16200"
+          SILENT_STARTUP: "1"
+          SESSION_TIMEOUT: "18000"
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |

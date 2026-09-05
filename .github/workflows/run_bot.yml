@@ -124,7 +124,6 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
-          SILENT_STARTUP: "1"
           SESSION_TIMEOUT: "18000"
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"

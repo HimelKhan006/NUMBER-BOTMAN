@@ -888,31 +888,31 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
 # 8. Startup Announcement System
 # ==========================================
 async def send_startup_announcement(application: Application):
-    is_auto_restart = (STARTUP_TYPE == "schedule" or os.getenv("SILENT_STARTUP") == "1")
-    if is_auto_restart:
-        logger.info("ℹ️ Routine 24-hour restart cycle. Silent startup (no admin notification spam).")
-        return
-
     stats = get_system_stats()
+    group_link = get_otp_group_link()
+    group_info = f"\n• <b>OTP Group:</b> <code>{group_link}</code>" if group_link else ""
+
     admin_msg = (
-        "🚀 <b>NUMBER BOTMAN ONLINE</b>\n"
+        "🔄 <b>NUMBER BOTMAN RESTARTED</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "• <b>Status:</b> <code>Active & Serving Live Numbers ✅</code>\n"
+        "• <b>Status:</b> <code>Online & Serving Live Numbers ✅</code>\n"
+        "• <b>Cycle:</b> <code>24-Hour Scheduled Cycle Active ⏱️</code>\n"
         "• <b>Storage:</b> <code>SQLite WAL + Gist Cloud Backup ☁️</code>\n"
         f"• <b>Standard Stock:</b> <code>{stats['total_std_available']} Numbers</code>\n"
         f"• <b>Secret Stock:</b> <code>{stats['total_sec_available']} Numbers 🔒</code>\n"
         f"• <b>Total Delivered:</b> <code>{stats['total_consumed']} Numbers</code>\n"
-        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
-        "🔔 <i>Single-use exclusive delivery & secret permission engine ready.</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>"
+        f"{group_info}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👑 <i>Restart notification dispatched to Admin private DM only.</i>"
     )
     for aid in ADMIN_USER_IDS:
         if aid:
             try:
                 await send_with_retry(application.bot, aid, admin_msg)
-                logger.info(f"✅ Startup alert sent to admin private chat {aid}")
+                logger.info(f"✅ Restart alert sent to admin private chat {aid}")
             except Exception as e:
-                logger.warning(f"Startup alert failed for admin {aid}: {e}")
+                logger.warning(f"Restart alert failed for admin {aid}: {e}")
 
 # ==========================================
 # 9. Keyboards & Views

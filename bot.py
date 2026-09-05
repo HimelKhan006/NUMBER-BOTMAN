@@ -1287,52 +1287,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
 
-async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    ADMIN_STATES[user.id] = {"mode": "add"}
-    await update.message.reply_text(
-        "➕ <b>Add Standard Numbers (.txt):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Please send a <b>.txt</b> file containing phone numbers to this chat.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-    )
-
-async def secretupload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    ADMIN_STATES[user.id] = {"mode": "add_secret"}
-    await update.message.reply_text(
-        "🔒 <b>Add Secret Numbers (.txt):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Please send a <b>.txt</b> file containing secret phone numbers to this chat.\n"
-        "<i>These will only be accessible by Admin and Whitelisted users.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-    )
-
-async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    ADMIN_STATES[user.id] = {"mode": "remove"}
-    await update.message.reply_text(
-        "🗑️ <b>Remove Numbers (.txt):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Please send a <b>.txt</b> file containing phone numbers you want to delete from stock.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-    )
-
 # ── Admin User Management Commands ──
 async def grantsecret_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2543,9 +2497,6 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
-    app.add_handler(CommandHandler("upload", upload_command))
-    app.add_handler(CommandHandler("secretupload", secretupload_command))
-    app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("grantsecret", grantsecret_command))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
     app.add_handler(CommandHandler("user", user_lookup_command))
@@ -2574,9 +2525,6 @@ def main():
                 BotCommand("getnumber", "📱 Get Numbers"),
                 BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
-                BotCommand("upload", "➕ Add Standard Numbers (.txt)"),
-                BotCommand("secretupload", "🔒 Add Secret Numbers (.txt)"),
-                BotCommand("remove", "🗑️ Remove Numbers (.txt)"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
                 BotCommand("user", "👤 Lookup user details & usage"),

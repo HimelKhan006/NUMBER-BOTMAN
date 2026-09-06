@@ -2,11 +2,11 @@ name: NUMBER BOTMAN 24/7 Always-Online Bot Runner
 
 on:
   push:
-    branches: [ main ]          # Auto-starts on every push to main
-  workflow_dispatch:             # Allows manual trigger from GitHub UI
+    branches: [ main ]
+  workflow_dispatch:
   schedule:
-    # 24-hour scheduled restart cycle (single time per day at 00:00 UTC)
-    - cron: '0 0 * * *'
+    # Backup safety net — fires every 6h if self-trigger ever fails
+    - cron: '0 */6 * * *'
 
 # Only ONE bot instance ever runs. New run cancels the old one instantly.
 concurrency:
@@ -21,7 +21,8 @@ jobs:
   run-bot:
     name: Run NUMBER BOTMAN 24/7
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # GitHub hard limit is 6h (360 min). We use 358 to leave a 2-min safety buffer.
+    timeout-minutes: 358
 
     steps:
       - name: Checkout Repository
@@ -31,7 +32,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "🔍 Cancelling any other active runs of this workflow..."
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=20" \
             | python3 -c "
@@ -41,17 +41,15 @@ jobs:
               if str(r['id']) != '${{ github.run_id }}':
                   print(r['id'])
           " | while read r_id; do
-            echo "  🛑 Cancelling old run #$r_id..."
             curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id/cancel" || true
           done
-          echo "✅ Cleanup done."
+          echo "✅ Old runs cancelled."
 
       - name: Clear Old Completed Workflow History
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "🧹 Deleting old completed/cancelled workflow run history..."
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=completed&per_page=20" \
             | python3 -c "
@@ -65,7 +63,6 @@ jobs:
           done
           echo "✅ History cleaned."
 
-      # Restore database + number stocks from cache so all data persists across runs
       - name: Restore Persistent Database from Cache
         uses: actions/cache/restore@v4
         with:
@@ -81,9 +78,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-bot4-ptb22-v1
+          restore-keys: pip-bot4-
+
       - name: Install Dependencies
         run: |
-          echo "📦 Installing Python dependencies..."
           pip install --quiet --upgrade pip
           pip install --quiet \
             python-telegram-bot==22.1 \
@@ -91,30 +94,17 @@ jobs:
             httpx \
             aiohttp \
             requests
-          echo "✅ All dependencies installed."
+          echo "✅ Dependencies ready."
 
       - name: Validate Required Secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_USER_IDS }}
         run: |
-          echo "🔍 Checking required GitHub Secrets..."
-          MISSING=""
-          [ -z "$TELEGRAM_BOT_TOKEN" ] && MISSING="${MISSING}\n  - TELEGRAM_BOT_TOKEN"
-          if [ -n "$MISSING" ]; then
-            echo -e "❌ Missing required secrets:${MISSING}"
-            echo "Please configure these in Repository Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          if [ -f "bot4_database.db" ]; then
-            echo "✅ Persistent database restored from cache — all numbers and users retained."
-          else
-            echo "ℹ️ No cache found — fresh database will be created on first run."
-          fi
-          if [ -d "country_stocks" ]; then
-            echo "✅ Country stock files restored from cache."
-          fi
-          echo "✅ All required secrets present!"
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && echo "❌ Missing: TELEGRAM_BOT_TOKEN" && exit 1
+          [ -f "bot4_database.db" ] && echo "✅ DB cache restored." || echo "ℹ️ Fresh DB will be created."
+          [ -d "country_stocks" ] && echo "✅ Country stocks cache restored."
+          echo "✅ All secrets present."
 
       - name: Run NUMBER BOTMAN (Auto-Recovery & Crash Protection)
         env:
@@ -124,44 +114,53 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
-          SESSION_TIMEOUT: "18000"
+          SESSION_TIMEOUT: "19500"
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
           echo "========================================"
           echo "  NUMBER BOTMAN — Starting Up (24/7)"
-          echo "  Trigger : ${{ github.event_name }}"
-          echo "  DB Path : $DB_FILE"
+          echo "  Trigger  : ${{ github.event_name }}"
+          echo "  DB Path  : $DB_FILE"
+          echo "  Session  : 5h 25min (19500s) — GitHub limit: 6h"
           echo "========================================"
 
-          # Session limit: 4.5 hours (16200s), after which bot exits cleanly with code 0
-          END_TIME=$((SECONDS + 16200))
+          # 19500s = 5h 25min. Overhead (setup + save + trigger) ~10min.
+          # Total ~5h 35min — safely within the 5h 58min (358min) job limit.
+          END_TIME=$((SECONDS + 19500))
 
-          while [ $SECONDS -lt $END_TIME ]; do
-            echo "⚡ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Launching bot.py..."
-            python bot.py
-            EXIT_CODE=$?
+          while true; do
+            REMAINING=$((END_TIME - SECONDS))
 
-            # Exit code 0 = clean session handover (proceed to save & next run)
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "✅ Clean session handover signal received (exit 0)."
+            # Exit if less than 90 seconds remain — guarantees save & trigger steps can run
+            if [ $REMAINING -lt 90 ]; then
+              echo "⏱️ Session window ending. Exiting cleanly for save & self-trigger."
               break
             fi
 
-            # Exit code 1 = fatal missing secrets — don't retry in infinite loop
+            echo "⚡ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Launching bot.py... (${REMAINING}s remaining)"
+            python bot.py
+            EXIT_CODE=$?
+
+            # Exit 0 = clean handover signal
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ Clean session handover (exit 0)."
+              break
+            fi
+
+            # Exit 1 = fatal config error — stop immediately
             if [ $EXIT_CODE -eq 1 ]; then
-              echo "❌ Fatal config error (exit 1). Halting — check your secrets!"
+              echo "❌ Fatal config error (exit 1). Halting."
               exit 1
             fi
 
-            # Exit code 2 or any other = transient network/API error — auto-restart in 3s
-            echo "⚠️ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Bot stopped (exit: $EXIT_CODE). Auto-restarting in 3s..."
+            # Any other exit = transient crash — auto-restart after 3s
+            echo "⚠️ [$(date -u +'%Y-%m-%d %H:%M:%S UTC')] Bot stopped (exit: $EXIT_CODE). Restarting in 3s..."
             sleep 3
           done
 
-          echo "⏱️ 4.5-hour session complete. Saving database and triggering next run..."
+          echo "⏱️ Session complete. Handing off to save & next-run trigger..."
 
-      # Always save database before runner is destroyed — even if bot crashed
       - name: Save Persistent Database to Cache
         if: always()
         uses: actions/cache/save@v4
@@ -177,7 +176,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 Triggering next bot session immediately to avoid downtime..."
+          echo "🔄 Triggering next session immediately..."
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -186,7 +185,7 @@ jobs:
             -d '{"ref":"main"}')
 
           if [ "$HTTP_CODE" != "204" ] && [ -n "$GIST_TOKEN" ]; then
-            echo "ℹ️ Retrying dispatch with auxiliary token..."
+            echo "ℹ️ Retrying with auxiliary token..."
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
               -H "Authorization: Bearer $GIST_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -196,7 +195,7 @@ jobs:
           fi
 
           if [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Next run triggered! NUMBER BOTMAN continues without downtime."
+            echo "✅ Next run triggered! NUMBER BOTMAN is 24/7 with zero downtime."
           else
-            echo "ℹ️ Self-trigger dispatch response: HTTP $HTTP_CODE (continuous 3-hour cron will seamlessly keep the bot running 24/7)."
+            echo "⚠️ Self-trigger HTTP $HTTP_CODE — backup cron (every 6h) will restart if needed."
           fi

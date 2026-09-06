@@ -356,6 +356,18 @@ def set_user_secret_access(user_id: int, granted: bool) -> bool:
         logger.error(f"Error setting secret access for {user_id}: {e}")
         return False
 
+def delete_user(user_id: int) -> bool:
+    """Permanently removes a user and their delivery log entries from the main database."""
+    try:
+        with get_main_db() as conn:
+            conn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (user_id,))
+            conn.execute("DELETE FROM users WHERE user_id = ?;", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error deleting user {user_id}: {e}")
+        return False
+
 def get_all_users_detailed(limit: int = 10, offset: int = 0, search: str = "") -> Tuple[List[Dict[str, Any]], int]:
     with get_main_db() as conn:
         if search:
@@ -608,22 +620,72 @@ def get_system_stats() -> Dict[str, Any]:
 
 
 # ==========================================
-# OTP Group Link Configuration
+# OTP Group Link Configuration (Multi-Tier Persistence)
 # ==========================================
 def get_otp_group_link() -> str:
+    # Tier 1: Check SQLite database
     try:
         with get_main_db() as conn:
             row = conn.execute("SELECT value FROM bot_settings WHERE key = 'otp_group_link';").fetchone()
             if row and row["value"]:
-                return row["value"].strip()
+                val = str(row["value"]).strip()
+                if val:
+                    return val
     except Exception as e:
-        logger.warning(f"Error fetching otp_group_link: {e}")
-    return os.getenv("OTP_GROUP_LINK", "").strip()
+        logger.warning(f"Error reading otp_group_link from DB: {e}")
+
+    # Tier 2: Check persistent backup text files on disk
+    backup_files = [
+        os.path.join(STOCKS_DIR, "otp_group_link.txt"),
+        os.path.join(BASE_DIR, "otp_group_link.txt"),
+    ]
+    for b_path in backup_files:
+        if os.path.isfile(b_path):
+            try:
+                with open(b_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                if content:
+                    # Self-heal SQLite database with recovered link
+                    try:
+                        with get_main_db() as conn:
+                            conn.execute("""
+                                INSERT INTO bot_settings (key, value)
+                                VALUES ('otp_group_link', ?)
+                                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                            """, (content,))
+                            conn.commit()
+                            conn.execute("PRAGMA wal_checkpoint(FULL);")
+                    except Exception:
+                        pass
+                    return content
+            except Exception as fe:
+                logger.warning(f"Notice reading {b_path}: {fe}")
+
+    # Tier 3: Environment variable fallback
+    env_link = os.getenv("OTP_GROUP_LINK", "").strip()
+    if env_link:
+        try:
+            with get_main_db() as conn:
+                conn.execute("""
+                    INSERT INTO bot_settings (key, value)
+                    VALUES ('otp_group_link', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """, (env_link,))
+                conn.commit()
+        except Exception:
+            pass
+        return env_link
+
+    return ""
 
 def set_otp_group_link(link: str) -> bool:
     clean_link = link.strip()
     if clean_link and not clean_link.startswith("http://") and not clean_link.startswith("https://"):
         clean_link = "https://" + clean_link
+
+    success = False
+
+    # 1. Save to SQLite database
     try:
         with get_main_db() as conn:
             conn.execute("""
@@ -632,10 +694,38 @@ def set_otp_group_link(link: str) -> bool:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             """, (clean_link,))
             conn.commit()
-            return True
+            try:
+                conn.execute("PRAGMA wal_checkpoint(FULL);")
+            except Exception:
+                pass
+        success = True
     except Exception as e:
-        logger.error(f"Error setting otp_group_link: {e}")
-        return False
+        logger.error(f"Error setting otp_group_link in DB: {e}")
+
+    # 2. Save to persistent text files on disk
+    backup_files = [
+        os.path.join(STOCKS_DIR, "otp_group_link.txt"),
+        os.path.join(BASE_DIR, "otp_group_link.txt"),
+    ]
+    for b_path in backup_files:
+        try:
+            with open(b_path, "w", encoding="utf-8") as f:
+                f.write(clean_link)
+            success = True
+        except Exception as fe:
+            logger.warning(f"Notice writing link file {b_path}: {fe}")
+
+    # 3. Update memory/environment
+    os.environ["OTP_GROUP_LINK"] = clean_link
+
+    # 4. Trigger immediate cloud Gist backup if enabled
+    try:
+        if "gist_storage" in globals() and gist_storage and gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+    except Exception:
+        pass
+
+    return success
 
 # ==========================================
 # 6. Gist Persistent Storage Sync
@@ -736,6 +826,8 @@ class GistStorage:
 
 
 
+                current_group_link = get_otp_group_link()
+
             payload = {
                 "description": self.description,
                 "files": {
@@ -743,11 +835,11 @@ class GistStorage:
                         "content": json.dumps({
                             "bot": self.bot_name,
                             "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "otp_group_link": current_group_link,
                             "total_countries": len(countries_data),
                             "countries": countries_data,
                             "used_countries": used_data,
                             "users": users_data,
-                            
                         }, indent=2)
                     }
                 }
@@ -781,7 +873,8 @@ class GistStorage:
                         # 0. Restore OTP Group Link
                         saved_group = parsed.get("otp_group_link")
                         if saved_group:
-                            set_otp_group_link(saved_group)
+                            set_otp_group_link(str(saved_group).strip())
+                            logger.info(f"☁️ Restored persistent OTP Group Link from Gist: {saved_group}")
 
                         # 1. Restore Users & Permissions
                         with get_main_db() as mconn:
@@ -931,6 +1024,10 @@ def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
         InlineKeyboardButton("📊 Number Inventory", callback_data="btn_inventory"),
         InlineKeyboardButton("ℹ️ Help / Info", callback_data="btn_help")
     ])
+
+    group_link = get_otp_group_link()
+    if group_link:
+        buttons.append([InlineKeyboardButton("💬 Join OTP Group", url=group_link)])
 
     if user_id and is_admin(user_id):
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
@@ -1844,6 +1941,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 6. Admin Panel
     elif data == "admin_panel" and user_admin:
         stats = get_system_stats()
+        curr_link = get_otp_group_link()
+        link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
         admin_text = (
             f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1854,6 +1953,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
             f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
             f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
+            f"• <b>OTP Group Link:</b> {link_display}\n"
             f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
@@ -1861,7 +1961,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
             [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
-            [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
+            [InlineKeyboardButton(f"🔗 Set OTP Group {'✅' if curr_link else '➕'}", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -2139,6 +2239,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
@@ -2178,10 +2279,71 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 9d. Confirm User Removal
+    elif data.startswith("u_del_confirm_") and user_admin:
+        target_id = int(data.split("_")[3])
+        u = get_user_details(target_id)
+        if not u:
+            await query.answer("⚠️ User not found.", show_alert=True)
+            return
+        uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
+        confirm_text = (
+            f"⚠️ <b>Confirm User Removal</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
+            f"📛 <b>Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
+            f"🔗 <b>Username:</b> {uname}\n"
+            f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗑️ <b>This will permanently delete this user and their delivery log from the database.</b>\n"
+            f"<i>This action cannot be undone!</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Remove User", callback_data=f"u_del_do_{target_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_id}")]
+        ])
+        await query.edit_message_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 9e. Execute User Removal
+    elif data.startswith("u_del_do_") and user_admin:
+        target_id = int(data.split("_")[3])
+        u = get_user_details(target_id)
+        uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
+        consumed = u.get("numbers_consumed", 0) if u else 0
+
+        ok = delete_user(target_id)
+        if ok and gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        if ok:
+            await query.answer("🗑️ User removed successfully!", show_alert=True)
+            result_text = (
+                f"✅ <b>User Removed Successfully</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 <b>Removed User ID:</b> <code>{target_id}</code>\n"
+                f"📛 <b>Name:</b> <code>{uname}</code>\n"
+                f"🔢 <b>Numbers They Consumed:</b> <code>{consumed}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🗑️ <i>User and their delivery log have been permanently deleted from the database.</i>"
+            )
+        else:
+            await query.answer("❌ Failed to remove user.", show_alert=True)
+            result_text = (
+                f"❌ <b>Failed to Remove User</b>\n"
+                f"<i>An error occurred while removing user <code>{target_id}</code>. Check logs.</i>"
+            )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 12. Admin Select Existing Country for Upload / Removal
     elif data.startswith("sel_upload_c_") and user_admin:

@@ -2582,11 +2582,39 @@ def main():
         await send_startup_announcement(application)
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
-        session_timeout = int(os.getenv("SESSION_TIMEOUT", "86400"))
+        session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
         if session_timeout > 0:
             asyncio.create_task(auto_session_handover(application, session_timeout))
 
     app.post_init = post_init
+
+    def start_health_server():
+        port_str = os.getenv("PORT")
+        if not port_str:
+            return
+        try:
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            import threading
+
+            class HealthHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+
+                def log_message(self, format, *args):
+                    return
+
+            port = int(port_str)
+            server = HTTPServer(("0.0.0.0", port), HealthHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            logger.info(f"🌐 Cloud health check server active on port {port}")
+        except Exception as e:
+            logger.warning(f"Cloud health server notice: {e}")
+
+    start_health_server()
 
     logger.info("🚀 NUMBER BOTMAN is running live in multi-user exclusive mode!")
     app.run_polling(drop_pending_updates=False)

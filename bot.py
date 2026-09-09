@@ -144,14 +144,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NUMBER_BOTMAN")
 
-def is_admin(user_id: int) -> bool:
-    """Strict admin check — always requires explicit ADMIN_USER_IDS."""
-    if not ADMIN_USER_IDS:
-        return False
-    return user_id in ADMIN_USER_IDS
-
-def is_user_authorized(user_id: int) -> bool:
-    return is_admin(user_id)
 
 COUNTRY_FLAGS = {
     "usa": "🇺🇸", "united states": "🇺🇸", "us": "🇺🇸",
@@ -283,6 +275,23 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN has_secret_access INTEGER DEFAULT 0;")
         except Exception:
             pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN prefer_plus INTEGER DEFAULT 1;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER DEFAULT 0,
+                username TEXT,
+                first_name TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS delivery_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -306,8 +315,8 @@ def register_user(user_id: int, username: str = "", first_name: str = ""):
     try:
         with get_main_db() as conn:
             conn.execute("""
-                INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen)
-                VALUES (?, ?, ?, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, joined_at, last_seen)
+                VALUES (?, ?, ?, 0, 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
                     first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
@@ -325,10 +334,140 @@ def get_all_user_ids() -> List[int]:
 def get_user_details(user_id: int) -> Optional[Dict[str, Any]]:
     with get_main_db() as conn:
         row = conn.execute("""
-            SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen
+            SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen
             FROM users WHERE user_id = ?;
         """, (user_id,)).fetchone()
         return dict(row) if row else None
+
+# ==========================================
+# Multi-Admin Engine & Number Format Preferences
+# ==========================================
+def is_admin(user_id: int) -> bool:
+    """Strict admin check: checks environment ADMIN_USER_IDS, database bot_admins, and users.is_admin."""
+    if not user_id:
+        return False
+    if ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
+        return True
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT user_id FROM bot_admins WHERE user_id = ?;", (user_id,)).fetchone()
+            if row:
+                return True
+            urow = conn.execute("SELECT is_admin FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+            if urow and urow["is_admin"]:
+                return True
+    except Exception:
+        pass
+    return False
+
+def is_user_authorized(user_id: int) -> bool:
+    return is_admin(user_id)
+
+def get_all_admin_ids() -> List[int]:
+    """Returns all unique admin user IDs from environment and database."""
+    admins = set(ADMIN_USER_IDS)
+    try:
+        with get_main_db() as conn:
+            for r in conn.execute("SELECT user_id FROM bot_admins;").fetchall():
+                admins.add(r["user_id"])
+            for r in conn.execute("SELECT user_id FROM users WHERE is_admin = 1;").fetchall():
+                admins.add(r["user_id"])
+    except Exception:
+        pass
+    return list(admins)
+
+def get_all_admin_details() -> List[Dict[str, Any]]:
+    """Returns detailed information for all administrators."""
+    results = []
+    seen = set()
+    # 1. Environment Super Admins
+    for aid in ADMIN_USER_IDS:
+        seen.add(aid)
+        u = get_user_details(aid)
+        results.append({
+            "user_id": aid,
+            "username": u.get("username", "") if u else "",
+            "first_name": u.get("first_name", "") if u else "Super Admin",
+            "is_super": True,
+            "added_by": 0,
+        })
+    # 2. Database Admins
+    try:
+        with get_main_db() as conn:
+            rows = conn.execute("SELECT user_id, added_by, username, first_name FROM bot_admins;").fetchall()
+            for r in rows:
+                uid = r["user_id"]
+                if uid not in seen:
+                    seen.add(uid)
+                    results.append({
+                        "user_id": uid,
+                        "username": r["username"] or "",
+                        "first_name": r["first_name"] or "Admin",
+                        "is_super": False,
+                        "added_by": r["added_by"] or 0,
+                    })
+    except Exception:
+        pass
+    return results
+
+def add_admin(user_id: int, added_by: int = 0, username: str = "", first_name: str = "") -> bool:
+    """Adds a new admin to the database."""
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO bot_admins (user_id, added_by, username, first_name)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_admins.username END,
+                    first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE bot_admins.first_name END;
+            """, (user_id, added_by, username or "", first_name or ""))
+            conn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (user_id,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error adding admin {user_id}: {e}")
+        return False
+
+def remove_admin(user_id: int) -> bool:
+    """Removes an admin from database (cannot remove env super admins)."""
+    if ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
+        return False
+    try:
+        with get_main_db() as conn:
+            conn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (user_id,))
+            conn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (user_id,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error removing admin {user_id}: {e}")
+        return False
+
+def get_user_plus_preference(user_id: int) -> bool:
+    """Returns True if user prefers with '+', False if without '+' (default: True)."""
+    if not user_id:
+        return True
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT prefer_plus FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+            if row and row["prefer_plus"] is not None:
+                return bool(row["prefer_plus"])
+    except Exception:
+        pass
+    return True
+
+def set_user_plus_preference(user_id: int, prefer_plus: bool) -> bool:
+    """Saves user's preferred number format (with/without '+')."""
+    if not user_id:
+        return False
+    val = 1 if prefer_plus else 0
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE users SET prefer_plus = ? WHERE user_id = ?;", (val, user_id))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"Error setting plus preference for {user_id}: {e}")
+        return False
 
 def user_has_secret_access(user_id: int) -> bool:
     """Admins always have full secret access. Regular users need granted access."""
@@ -825,8 +964,12 @@ class GistStorage:
                             used_data[cname] = u_list
 
                 # Export users
-                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at FROM users;")
+                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at FROM users;")
                 users_data = [dict(r) for r in users_cur.fetchall()]
+
+                # Export dynamic database administrators
+                admins_cur = conn.execute("SELECT user_id, added_by, username, first_name FROM bot_admins;")
+                admins_data = [dict(r) for r in admins_cur.fetchall()]
 
                 current_group_link = get_otp_group_link()
 
@@ -842,6 +985,7 @@ class GistStorage:
                             "countries": countries_data,
                             "used_countries": used_data,
                             "users": users_data,
+                            "admins": admins_data,
                             "handover": is_handover,
                             "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
                         }, indent=2)
@@ -851,7 +995,7 @@ class GistStorage:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
                 if res.is_success:
-                    logger.info(f"☁️ Database, Users & Numbers backed up to GitHub Gist (handover={is_handover}).")
+                    logger.info(f"☁️ Database, Users, Admins & Numbers backed up to GitHub Gist (handover={is_handover}).")
                     return True
         except Exception as e:
             logger.warning(f"Gist export error: {e}")
@@ -872,6 +1016,7 @@ class GistStorage:
                         countries_data = parsed.get("countries", {})
                         used_data = parsed.get("used_countries", {})
                         users_data = parsed.get("users", [])
+                        admins_data = parsed.get("admins", [])
 
                         if parsed.get("handover"):
                             global _is_handover, _handover_epoch
@@ -893,21 +1038,38 @@ class GistStorage:
                                 if not uid:
                                     continue
                                 mconn.execute("""
-                                    INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, joined_at, last_seen)
-                                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                                     ON CONFLICT(user_id) DO UPDATE SET
                                         username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
                                         first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
                                         numbers_consumed = max(users.numbers_consumed, excluded.numbers_consumed),
-                                        has_secret_access = excluded.has_secret_access;
+                                        has_secret_access = excluded.has_secret_access,
+                                        prefer_plus = excluded.prefer_plus,
+                                        is_admin = max(users.is_admin, excluded.is_admin);
                                 """, (
                                     uid,
                                     u.get("username", ""),
                                     u.get("first_name", ""),
                                     u.get("numbers_consumed", 0),
                                     u.get("has_secret_access", 0),
+                                    u.get("prefer_plus", 1),
+                                    u.get("is_admin", 0),
                                     u.get("joined_at", datetime.now(timezone.utc).isoformat())
                                 ))
+
+                            # Restore Dynamic Administrators
+                            for a in admins_data:
+                                aid = a.get("user_id")
+                                if aid:
+                                    mconn.execute("""
+                                        INSERT INTO bot_admins (user_id, added_by, username, first_name)
+                                        VALUES (?, ?, ?, ?)
+                                        ON CONFLICT(user_id) DO UPDATE SET
+                                            username = CASE WHEN excluded.username != '' THEN excluded.username ELSE bot_admins.username END,
+                                            first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE bot_admins.first_name END;
+                                    """, (aid, a.get("added_by", 0), a.get("username", ""), a.get("first_name", "")))
+                                    mconn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (aid,))
                             mconn.commit()
 
 
@@ -1021,7 +1183,7 @@ async def send_startup_announcement(application: Application):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "👑 <i>Send /admin or /stats anytime to view live dashboard.</i>"
     )
-    for aid in ADMIN_USER_IDS:
+    for aid in get_all_admin_ids():
         if aid:
             try:
                 await send_with_retry(application.bot, aid, admin_msg)
@@ -1041,6 +1203,12 @@ def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
     # Display Secret Numbers button if admin or user has whitelisted secret access
     if user_id and user_has_secret_access(user_id):
         buttons.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
+
+    # Quick toggle / status of user's preferred number format (with + or without +)
+    if user_id:
+        pref_plus = get_user_plus_preference(user_id)
+        fmt_label = "⚙️ Format: With '+' (+123) (Tap to switch)" if pref_plus else "⚙️ Format: Without '+' (123) (Tap to switch)"
+        buttons.append([InlineKeyboardButton(fmt_label, callback_data="btn_toggle_plus_pref")])
 
     buttons.append([
         InlineKeyboardButton("📊 Number Inventory", callback_data="btn_inventory"),
@@ -1107,12 +1275,19 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
     return InlineKeyboardMarkup(buttons)
 
-def get_numbers_view_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:
-    """Builds number result keyboard with optional Join OTP Group button."""
+def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plus: bool = True) -> InlineKeyboardMarkup:
+    """Builds number result keyboard with dynamic '+' toggle button and OTP Group."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
+    sec_tag = "sec" if is_secret else "std"
+
+    if with_plus:
+        toggle_btn = InlineKeyboardButton("➖ Remove '+' Prefix", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
+    else:
+        toggle_btn = InlineKeyboardButton("➕ Add '+' Prefix", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
 
     buttons = [
+        [toggle_btn],
         [
             InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=change_cb),
             InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
@@ -1166,7 +1341,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cid = int(arg.split("_")[1])
                 numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=10, is_secret=False)
                 if numbers:
-                    num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
+                    pref_plus = get_user_plus_preference(user.id)
+                    num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
                     msg = (
                         f"📱 <b>Your Exclusive Numbers — {cname}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1176,7 +1352,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📊 <b>Remaining in Stock:</b> <code>{remaining} numbers</code>\n"
                         f"🔒 <i>All {len(numbers)} numbers are reserved for you and removed from stock.</i>"
                     )
-                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False))
+                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus))
                     if gist_storage.enabled:
                         asyncio.create_task(gist_storage.export_and_sync())
                     return
@@ -1275,6 +1451,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
         [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
+        [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
         [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
         [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
     ])
@@ -1536,6 +1713,162 @@ async def user_lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     ])
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    args = update.message.text.replace("/addadmin", "", 1).strip()
+    if not args or not args.isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/addadmin &lt;user_id&gt;</code>\n"
+            "Example: <code>/addadmin 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = int(args)
+    target_user = get_user_details(target_id)
+    uname = target_user.get("username", "") if target_user else ""
+    fname = target_user.get("first_name", "") if target_user else ""
+
+    ok = add_admin(target_id, added_by=user.id, username=uname, first_name=fname)
+    if ok:
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        u_disp = f"@{uname}" if uname else (fname or str(target_id))
+        await update.message.reply_text(
+            f"✅ <b>Administrator Promoted!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>User:</b> <code>{u_disp}</code> (<code>{target_id}</code>)\n"
+            f"👑 <b>Role:</b> <code>Full Administrator</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await update.message.reply_text("❌ Failed to promote user to Administrator.", parse_mode=ParseMode.HTML)
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    args = update.message.text.replace("/removeadmin", "", 1).strip()
+    if not args or not args.isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/removeadmin &lt;user_id&gt;</code>\n"
+            "Example: <code>/removeadmin 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = int(args)
+    ok = remove_admin(target_id)
+    if ok:
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>Administrator Removed!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>User ID:</b> <code>{target_id}</code>\n"
+            f"❌ <b>Status:</b> <code>Admin privileges revoked</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Could not remove {target_id}. Super Admins in .env cannot be removed via Telegram.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    admins = get_all_admin_details()
+    admin_lines = []
+    for a in admins:
+        role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Added via Bot)"
+        u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
+        admin_lines.append(f"• <code>{a['user_id']}</code> — {u_tag} [{role}]")
+
+    admins_formatted = "\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
+    text = (
+        f"👑 <b>Active Administrators List</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{admins_formatted}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>Use /addadmin &lt;id&gt; to add or /removeadmin &lt;id&gt; to remove.</i>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Admin", callback_data="admin_add_admin_prompt")],
+        [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /grantsecret — grants access to secret numbers pool."""
+    await grantsecret_command(update, context)
+
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /revokesecret — revokes access from secret numbers pool."""
+    await revokesecret_command(update, context)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    stats = get_system_stats()
+    uptime_secs = int(time.time() - bot_process_start_time)
+    hours, remainder = divmod(uptime_secs, 3600)
+    mins, secs = divmod(remainder, 60)
+    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+
+    session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
+    if session_timeout > 0:
+        handover_secs = max(0, session_timeout - uptime_secs)
+        h_hours, h_rem = divmod(handover_secs, 3600)
+        h_mins, _ = divmod(h_rem, 60)
+        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Zero-Restart 🔄)"
+    else:
+        handover_info = "<code>Always-Online (Continuous)</code>"
+
+    admins = get_all_admin_ids()
+    text = (
+        f"⚡ <b>NUMBER BOTMAN — Live Engine Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
+        f"• <b>Session Limit:</b> <code>5h 25min (19,500s)</code>\n"
+        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Next Handover:</b> {handover_info}\n"
+        f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Inventory & Operations:</b>\n"
+        f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
+        f"• <b>Secret Numbers:</b> <code>{stats['total_sec_available']} in stock 🔒</code>\n"
+        f"• <b>Delivered Numbers:</b> <code>{stats['total_consumed']} total</code>\n"
+        f"• <b>Active Pools:</b> <code>{stats['active_countries']} countries</code>\n"
+        f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
+        f"• <b>Administrators:</b> <code>{len(admins)} active</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
 # ==========================================
 # 11. Admin File (.txt) & Text Upload Handlers
 # ==========================================
@@ -1666,6 +1999,49 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         else:
             await update.message.reply_text("❌ Failed to save group link.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ]))
+        return
+
+    if admin_state.get("awaiting_add_admin"):
+        del ADMIN_STATES[user.id]
+        clean_id = re.sub(r"\D", "", text)
+        if not clean_id:
+            await update.message.reply_text(
+                "❌ <b>Invalid User ID.</b> Please send numeric digits only (e.g. <code>6798979733</code>).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="admin_add_admin_prompt")],
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+
+        target_id = int(clean_id)
+        target_user = get_user_details(target_id)
+        uname = target_user.get("username", "") if target_user else ""
+        fname = target_user.get("first_name", "") if target_user else ""
+
+        ok = add_admin(target_id, added_by=user.id, username=uname, first_name=fname)
+        if ok:
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            u_disp = f"@{uname}" if uname else (fname or str(target_id))
+            await update.message.reply_text(
+                f"✅ <b>Administrator Promoted Successfully!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>User:</b> <code>{u_disp}</code> (<code>{target_id}</code>)\n"
+                f"👑 <b>Role:</b> <code>Full Administrator</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>This user now has access to the Admin Dashboard and all admin controls.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins")],
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+        else:
+            await update.message.reply_text("❌ Failed to add administrator.", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ]))
         return
@@ -1826,7 +2202,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
+        pref_plus = get_user_plus_preference(user.id)
+        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
@@ -1845,7 +2222,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus)
         )
 
     # 3b. Deliver Secret Numbers
@@ -1878,7 +2255,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        num_lines = [f"  {idx}. <code>{n}</code>" for idx, n in enumerate(numbers, 1)]
+        pref_plus = get_user_plus_preference(user.id)
+        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
@@ -1897,8 +2275,64 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus)
         )
+
+    # 3c. Interactive Instant '+' Toggle for Delivered Numbers
+    elif data.startswith("toggle_plus_"):
+        # data format: toggle_plus_<target_fmt: 0 or 1>_<country_id>_<sec or std>
+        parts = data.split("_")
+        target_plus = (parts[2] == "1")
+        country_id = int(parts[3])
+        is_secret = (parts[4] == "sec")
+
+        # Update user's persistent preference
+        set_user_plus_preference(user.id, target_plus)
+
+        current_text = query.message.text_html or query.message.text or ""
+
+        if target_plus:
+            # Restore '+' prefix to all numbers
+            def _add_plus(m):
+                content = m.group(1).strip()
+                digits = re.sub(r"\D", "", content)
+                if len(digits) >= 5 and not content.startswith("+"):
+                    return f"<code>+{content}</code>"
+                return m.group(0)
+            new_text = re.sub(r"<code>([^<]+)</code>", _add_plus, current_text)
+            alert_msg = "➕ Added '+' prefix to all numbers!"
+        else:
+            # Remove '+' prefix from all numbers
+            def _remove_plus(m):
+                content = m.group(1).strip()
+                if content.startswith("+"):
+                    return f"<code>{content[1:]}</code>"
+                return m.group(0)
+            new_text = re.sub(r"<code>([^<]+)</code>", _remove_plus, current_text)
+            alert_msg = "➖ Removed '+' prefix from all numbers!"
+
+        await query.answer(alert_msg)
+        try:
+            await query.edit_message_text(
+                new_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus)
+            )
+        except Exception as e:
+            logger.debug(f"Toggle plus message update notice: {e}")
+
+    # 3d. Main Menu Preference Switcher
+    elif data == "btn_toggle_plus_pref":
+        curr = get_user_plus_preference(user.id)
+        new_val = not curr
+        set_user_plus_preference(user.id, new_val)
+        status_str = "WITH '+' prefix (e.g. +1234567890)" if new_val else "WITHOUT '+' prefix (e.g. 1234567890)"
+        await query.answer(f"✅ Number format set to: {status_str}", show_alert=True)
+        keyboard = get_main_menu_keyboard(user.id)
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception:
+            pass
 
     # 4. Inventory Overview
     elif data == "btn_inventory":
@@ -2002,10 +2436,144 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
             [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
+            [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
             [InlineKeyboardButton(f"🔗 Set OTP Group {'✅' if curr_link else '➕'}", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
             [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 6a. Admin Management Submenu
+    elif data == "admin_manage_admins" and user_admin:
+        admins = get_all_admin_details()
+        admin_lines = []
+        for a in admins:
+            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Added via Bot)"
+            u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
+            admin_lines.append(f"• <code>{a['user_id']}</code> — {u_tag} [{role}]")
+
+        admins_formatted = "\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
+        text = (
+            f"👑 <b>Administrator Management</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Active Administrators:</b>\n"
+            f"{admins_formatted}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>All administrators have full access to /admin, stock uploads, and bot management.</i>\n"
+            f"<i>Super Admins are defined in GitHub Secrets / .env and cannot be removed via Telegram.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
+            [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
+            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "admin_add_admin_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_add_admin": True}
+        text = (
+            "➕ <b>Add New Administrator</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Send the **Telegram User ID** (numbers only) of the user you wish to promote to Admin.\n\n"
+            "💡 <i>Tip: The user can check their ID via @userinfobot or you can look them up via /users.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_admins")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "admin_remove_admin_menu" and user_admin:
+        admins = get_all_admin_details()
+        removable = [a for a in admins if not a["is_super"]]
+        if not removable:
+            await query.answer("ℹ️ No removable database admins found. Super Admins (from .env) cannot be removed via Telegram.", show_alert=True)
+            return
+
+        buttons = []
+        for a in removable:
+            u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
+            buttons.append([InlineKeyboardButton(f"🗑️ Remove {u_tag} ({a['user_id']})", callback_data=f"admin_rm_admin_{a['user_id']}")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_admins")])
+        text = (
+            "🗑️ <b>Remove Administrator</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Tap an admin below to revoke their administrative privileges:"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("admin_rm_admin_") and user_admin:
+        target_id = int(data.split("_")[3])
+        ok = remove_admin(target_id)
+        if ok:
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await query.answer(f"✅ Admin privileges revoked for {target_id}!", show_alert=True)
+        else:
+            await query.answer(f"❌ Could not remove {target_id}.", show_alert=True)
+
+        admins = get_all_admin_details()
+        admin_lines = []
+        for a in admins:
+            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Added via Bot)"
+            u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
+            admin_lines.append(f"• <code>{a['user_id']}</code> — {u_tag} [{role}]")
+
+        admins_formatted = "\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
+        text = (
+            f"👑 <b>Administrator Management</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Active Administrators:</b>\n"
+            f"{admins_formatted}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>All administrators have full access to /admin, stock uploads, and bot management.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
+            [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
+            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "admin_live_status" and user_admin:
+        stats = get_system_stats()
+        uptime_secs = int(time.time() - bot_process_start_time)
+        hours, remainder = divmod(uptime_secs, 3600)
+        mins, secs = divmod(remainder, 60)
+        uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+
+        session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
+        if session_timeout > 0:
+            handover_secs = max(0, session_timeout - uptime_secs)
+            h_hours, h_rem = divmod(handover_secs, 3600)
+            h_mins, _ = divmod(h_rem, 60)
+            handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Zero-Restart 🔄)"
+        else:
+            handover_info = "<code>Always-Online (Continuous)</code>"
+
+        admins = get_all_admin_ids()
+        text = (
+            f"⚡ <b>NUMBER BOTMAN — Live Engine Status</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
+            f"• <b>Session Limit:</b> <code>5h 25min (19,500s)</code>\n"
+            f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+            f"• <b>Next Handover:</b> {handover_info}\n"
+            f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Inventory & Operations:</b>\n"
+            f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
+            f"• <b>Secret Numbers:</b> <code>{stats['total_sec_available']} in stock 🔒</code>\n"
+            f"• <b>Delivered Numbers:</b> <code>{stats['total_consumed']} total</code>\n"
+            f"• <b>Active Pools:</b> <code>{stats['active_countries']} countries</code>\n"
+            f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
+            f"• <b>Administrators:</b> <code>{len(admins)} active</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_live_status")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 6b. Admin View Uploaded Number Files & Stock Pools
     elif (data == "admin_uploaded_files" or data.startswith("page_upfiles_")) and user_admin:
@@ -2698,7 +3266,13 @@ def main():
     app.add_handler(CommandHandler("inventory", inventory_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("admins", admins_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("removeadmin", removeadmin_command))
+    app.add_handler(CommandHandler("adduser", adduser_command))
+    app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
     app.add_handler(CommandHandler("grantsecret", grantsecret_command))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
@@ -2727,14 +3301,18 @@ def main():
                 BotCommand("start", "🚀 Main Menu"),
                 BotCommand("getnumber", "📱 Get Numbers"),
                 BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
+                BotCommand("status", "⚡ Live Zero-Restart Status"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
+                BotCommand("admins", "👥 View Active Administrators"),
+                BotCommand("addadmin", "➕ Promote user to Admin"),
+                BotCommand("removeadmin", "🗑️ Demote Admin to user"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
                 BotCommand("user", "👤 Lookup user details & usage"),
                 BotCommand("stats", "📊 View live system statistics"),
                 BotCommand("help", "ℹ️ How to use the bot"),
             ]
-            for aid in ADMIN_USER_IDS:
+            for aid in get_all_admin_ids():
                 if aid:
                     try:
                         await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(aid))

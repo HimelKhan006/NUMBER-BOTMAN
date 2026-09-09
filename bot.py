@@ -56,6 +56,7 @@ import html
 import sqlite3
 import logging
 import asyncio
+import time
 import argparse
 from typing import Set, Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone
@@ -125,6 +126,9 @@ ADMIN_USER_IDS: List[int] = [int(u.strip()) for u in _admin_raw.split(",") if u.
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
+_is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
+_handover_epoch: float = 0.0
+bot_process_start_time: float = time.time()
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MAIN_DB_FILE    = os.getenv("DB_FILE", os.path.join(BASE_DIR, "bot4_database.db"))
@@ -797,7 +801,7 @@ class GistStorage:
             logger.warning(f"Gist auto-discovery error: {e}")
         return False
 
-    async def export_and_sync(self) -> bool:
+    async def export_and_sync(self, is_handover: bool = False) -> bool:
         if not self.enabled or not self.api_url:
             return False
         try:
@@ -824,8 +828,6 @@ class GistStorage:
                 users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, joined_at FROM users;")
                 users_data = [dict(r) for r in users_cur.fetchall()]
 
-
-
                 current_group_link = get_otp_group_link()
 
             payload = {
@@ -840,6 +842,8 @@ class GistStorage:
                             "countries": countries_data,
                             "used_countries": used_data,
                             "users": users_data,
+                            "handover": is_handover,
+                            "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
                         }, indent=2)
                     }
                 }
@@ -847,7 +851,7 @@ class GistStorage:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
                 if res.is_success:
-                    logger.info("☁️ Database, Users & Numbers backed up to GitHub Gist.")
+                    logger.info(f"☁️ Database, Users & Numbers backed up to GitHub Gist (handover={is_handover}).")
                     return True
         except Exception as e:
             logger.warning(f"Gist export error: {e}")
@@ -868,6 +872,12 @@ class GistStorage:
                         countries_data = parsed.get("countries", {})
                         used_data = parsed.get("used_countries", {})
                         users_data = parsed.get("users", [])
+
+                        if parsed.get("handover"):
+                            global _is_handover, _handover_epoch
+                            _is_handover = True
+                            _handover_epoch = float(parsed.get("handover_epoch") or 0.0)
+                            logger.info(f"🔄 Zero-Restart Handover Detected from Gist (handover epoch {_handover_epoch:.0f}).")
                         
 
                         # 0. Restore OTP Group Link
@@ -981,15 +991,27 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
 # 8. Startup Announcement System
 # ==========================================
 async def send_startup_announcement(application: Application):
+    global _is_handover
+    # Completely suppress restart notification on handover sessions or silent mode
+    silent_env = os.getenv("SILENT_STARTUP", "").strip().lower() in ("true", "1", "yes")
+    if _is_handover or silent_env:
+        logger.info("🤫 Automated session handover continuation: restart notification suppressed (zero-restart mode).")
+        return
+
+    admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
+    if not admin_alert_enabled and STARTUP_TYPE != "push":
+        logger.info("ℹ️ NUMBER BOTMAN started in silent 24/7 background mode (no admin spam).")
+        return
+
     stats = get_system_stats()
     group_link = get_otp_group_link()
     group_info = f"\n• <b>OTP Group:</b> <code>{group_link}</code>" if group_link else ""
 
     admin_msg = (
-        "🔄 <b>NUMBER BOTMAN RESTARTED</b>\n"
+        "⚡ <b>NUMBER BOTMAN 24/7 ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• <b>Status:</b> <code>Online & Serving Live Numbers ✅</code>\n"
-        "• <b>Cycle:</b> <code>24-Hour Scheduled Cycle Active ⏱️</code>\n"
+        "• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
         "• <b>Storage:</b> <code>SQLite WAL + Gist Cloud Backup ☁️</code>\n"
         f"• <b>Standard Stock:</b> <code>{stats['total_std_available']} Numbers</code>\n"
         f"• <b>Secret Stock:</b> <code>{stats['total_sec_available']} Numbers 🔒</code>\n"
@@ -997,15 +1019,15 @@ async def send_startup_announcement(application: Application):
         f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>"
         f"{group_info}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 <i>Restart notification dispatched to Admin private DM only.</i>"
+        "👑 <i>Send /admin or /stats anytime to view live dashboard.</i>"
     )
     for aid in ADMIN_USER_IDS:
         if aid:
             try:
                 await send_with_retry(application.bot, aid, admin_msg)
-                logger.info(f"✅ Restart alert sent to admin private chat {aid}")
+                logger.info(f"✅ Initial alert sent to admin {aid}")
             except Exception as e:
-                logger.warning(f"Restart alert failed for admin {aid}: {e}")
+                logger.warning(f"Initial alert failed for admin {aid}: {e}")
 
 # ==========================================
 # 9. Keyboards & Views
@@ -1217,8 +1239,28 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stats = get_system_stats()
 
+    uptime_secs = int(time.time() - bot_process_start_time)
+    hours, rem = divmod(uptime_secs, 3600)
+    mins, secs = divmod(rem, 60)
+    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+
+    session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
+    if session_timeout > 0:
+        handover_secs = max(0, session_timeout - uptime_secs)
+        h_hours, h_rem = divmod(handover_secs, 3600)
+        h_mins, _ = divmod(h_rem, 60)
+        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+    else:
+        handover_info = "<code>Always-Online (Continuous)</code>"
+
     admin_text = (
-        f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
+        f"👑 <b>NUMBER BOTMAN — Admin Dashboard</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Engine Status:</b> <code>100% Online & Delivering ✅</code>\n"
+        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
+        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Next Handover:</b> {handover_info}\n"
+        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Real-time Live Inventory:</b>\n"
         f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
@@ -1227,7 +1269,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
         f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
     )
@@ -2719,15 +2760,31 @@ def main():
     app.add_error_handler(global_error_handler)
 
     async def auto_session_handover(application: Application, duration_seconds: int):
-        logger.info(f"⏱️ 24-hour scheduled restart timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
-        await asyncio.sleep(duration_seconds)
-        logger.info("⏱️ 24-hour scheduled restart time reached. Initiating clean restart...")
+        logger.info(f"⏱️ Zero-restart handover timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
+        sleep_before = max(0, duration_seconds - 60)
+        await asyncio.sleep(sleep_before)
+        logger.info("⏱️ Approaching handover window (60s remaining). Performing pre-handover state freeze...")
+        try:
+            with get_main_db() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            if os.path.exists(STOCKS_DIR):
+                for f in os.listdir(STOCKS_DIR):
+                    if f.endswith(".db"):
+                        try:
+                            with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                                cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"DB checkpoint notice: {e}")
+
         if gist_storage.enabled:
             try:
-                await gist_storage.export_and_sync()
+                await gist_storage.export_and_sync(is_handover=True)
                 logger.info("☁️ Pre-handover Gist backup completed successfully.")
             except Exception as e:
                 logger.warning(f"Pre-handover Gist backup warning: {e}")
+        logger.info("✅ Pre-handover state snapshot saved. Exiting cleanly for next runner switch (exit 0)...")
         try:
             application.stop_running()
         except Exception as e:

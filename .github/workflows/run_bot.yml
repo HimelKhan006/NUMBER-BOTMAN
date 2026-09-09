@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      is_handover:
+        description: 'Internal zero-restart handover flag (true/false)'
+        required: false
+        default: 'false'
   schedule:
     # Backup safety net — fires every 6h if self-trigger ever fails
     - cron: '0 */6 * * *'
@@ -68,9 +73,13 @@ jobs:
         with:
           path: |
             bot4_database.db
+            bot4_database.db-wal
+            bot4_database.db-shm
             country_stocks/
-          key: bot4-database-persistent
+            otp_group_link.txt
+          key: bot4-database-persistent-${{ github.run_id }}
           restore-keys: |
+            bot4-database-persistent-
             bot4-database-
 
       - name: Set up Python 3.11
@@ -114,6 +123,7 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
+          IS_HANDOVER: ${{ github.event.inputs.is_handover || 'false' }}
           SESSION_TIMEOUT: "19500"
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
@@ -167,8 +177,11 @@ jobs:
         with:
           path: |
             bot4_database.db
+            bot4_database.db-wal
+            bot4_database.db-shm
             country_stocks/
-          key: bot4-database-persistent
+            otp_group_link.txt
+          key: bot4-database-persistent-${{ github.run_id }}
 
       - name: Self-Trigger Next Run (Zero Downtime Restart)
         if: always()
@@ -182,7 +195,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
-            -d '{"ref":"main"}')
+            -d '{"ref":"main","inputs":{"is_handover":"true"}}')
 
           if [ "$HTTP_CODE" != "204" ] && [ -n "$GIST_TOKEN" ]; then
             echo "ℹ️ Retrying with auxiliary token..."
@@ -191,7 +204,7 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
-              -d '{"ref":"main"}')
+              -d '{"ref":"main","inputs":{"is_handover":"true"}}')
           fi
 
           if [ "$HTTP_CODE" = "204" ]; then

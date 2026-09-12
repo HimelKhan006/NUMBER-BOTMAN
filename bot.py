@@ -870,6 +870,88 @@ def set_otp_group_link(link: str) -> bool:
 
     return success
 
+DEFAULT_OTP_GROUP_NAME = "💬 Join OTP Group"
+
+def get_otp_group_name() -> str:
+    # Tier 1: Check SQLite database
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT value FROM bot_settings WHERE key = 'otp_group_name';").fetchone()
+            if row and row["value"]:
+                val = str(row["value"]).strip()
+                if val:
+                    return val
+    except Exception as e:
+        logger.warning(f"Error reading otp_group_name from DB: {e}")
+
+    # Tier 2: Check persistent backup text files on disk
+    backup_files = [
+        os.path.join(STOCKS_DIR, "otp_group_name.txt"),
+        os.path.join(BASE_DIR, "otp_group_name.txt"),
+    ]
+    for b_path in backup_files:
+        if os.path.isfile(b_path):
+            try:
+                with open(b_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                if content:
+                    return content
+            except Exception:
+                pass
+
+    # Tier 3: Environment variable fallback
+    env_name = os.getenv("OTP_GROUP_NAME", "").strip()
+    if env_name:
+        return env_name
+
+    return DEFAULT_OTP_GROUP_NAME
+
+def set_otp_group_name(name: str) -> bool:
+    clean_name = name.strip() or DEFAULT_OTP_GROUP_NAME
+    success = False
+
+    # 1. Save to SQLite database
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO bot_settings (key, value)
+                VALUES ('otp_group_name', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """, (clean_name,))
+            conn.commit()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(FULL);")
+            except Exception:
+                pass
+        success = True
+    except Exception as e:
+        logger.error(f"Error setting otp_group_name in DB: {e}")
+
+    # 2. Save to persistent text files on disk
+    backup_files = [
+        os.path.join(STOCKS_DIR, "otp_group_name.txt"),
+        os.path.join(BASE_DIR, "otp_group_name.txt"),
+    ]
+    for b_path in backup_files:
+        try:
+            with open(b_path, "w", encoding="utf-8") as f:
+                f.write(clean_name)
+            success = True
+        except Exception as fe:
+            logger.warning(f"Notice writing name file {b_path}: {fe}")
+
+    # 3. Update memory/environment
+    os.environ["OTP_GROUP_NAME"] = clean_name
+
+    # 4. Trigger immediate cloud Gist backup if enabled
+    try:
+        if "gist_storage" in globals() and gist_storage and gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+    except Exception:
+        pass
+
+    return success
+
 # ==========================================
 # 6. Gist Persistent Storage Sync
 # ==========================================
@@ -972,6 +1054,7 @@ class GistStorage:
                 admins_data = [dict(r) for r in admins_cur.fetchall()]
 
                 current_group_link = get_otp_group_link()
+                current_group_name = get_otp_group_name()
 
             payload = {
                 "description": self.description,
@@ -981,6 +1064,7 @@ class GistStorage:
                             "bot": self.bot_name,
                             "updated_at": datetime.now(timezone.utc).isoformat(),
                             "otp_group_link": current_group_link,
+                            "otp_group_name": current_group_name,
                             "total_countries": len(countries_data),
                             "countries": countries_data,
                             "used_countries": used_data,
@@ -1025,11 +1109,16 @@ class GistStorage:
                             logger.info(f"🔄 Zero-Restart Handover Detected from Gist (handover epoch {_handover_epoch:.0f}).")
                         
 
-                        # 0. Restore OTP Group Link
+                        # 0. Restore OTP Group Link & Button Name
                         saved_group = parsed.get("otp_group_link")
                         if saved_group:
                             set_otp_group_link(str(saved_group).strip())
                             logger.info(f"☁️ Restored persistent OTP Group Link from Gist: {saved_group}")
+
+                        saved_name = parsed.get("otp_group_name")
+                        if saved_name:
+                            set_otp_group_name(str(saved_name).strip())
+                            logger.info(f"☁️ Restored persistent OTP Group Name from Gist: {saved_name}")
 
                         # 1. Restore Users & Permissions
                         with get_main_db() as mconn:
@@ -1217,7 +1306,7 @@ def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
 
     group_link = get_otp_group_link()
     if group_link:
-        buttons.append([InlineKeyboardButton("💬 Join OTP Group", url=group_link)])
+        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
 
     if user_id and is_admin(user_id):
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
@@ -1296,7 +1385,7 @@ def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plu
 
     group_link = get_otp_group_link()
     if group_link:
-        buttons.append([InlineKeyboardButton("💬 Join OTP Group", url=group_link)])
+        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
 
     buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -1375,14 +1464,17 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         ADMIN_STATES[user.id] = {"awaiting_otp_group_link": True}
         curr = get_otp_group_link()
-        curr_msg = f"<b>Current Link:</b> <code>{curr}</code>\n\n" if curr else ""
+        curr_name = get_otp_group_name()
+        curr_msg = f"• <b>Current Link:</b> <code>{curr}</code>\n• <b>Button Name:</b> <code>{curr_name}</code>\n\n" if curr else ""
         await update.message.reply_text(
-            f"🔗 <b>Set OTP Group / Channel Link:</b>\n"
+            f"🔗 <b>Set OTP Group Link & Button Name:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{curr_msg}"
-            f"Please send your Telegram group link or username in chat:\n"
-            f"<code>https://t.me/your_otp_group</code>\n\n"
-            f"<i>(Users will see a direct '💬 Join OTP Group' button when receiving numbers).</i>",
+            f"Please send your link OR <code>Button Name | Link</code> in chat:\n"
+            f"• Example 1: <code>https://t.me/your_otp_group</code>\n"
+            f"• Example 2: <code>💬 Join VIP Channel | https://t.me/your_otp_group</code>\n\n"
+            f"<i>(Users will see a '{curr_name}' button on their number delivery screen).</i>\n"
+            f"<i>(Use /setgroupname &lt;name&gt; to change only the button name).</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
@@ -1390,14 +1482,23 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if "|" in text:
+        parts = text.split("|", 1)
+        name_part = parts[0].strip()
+        link_part = parts[1].strip()
+        if name_part:
+            set_otp_group_name(name_part)
+        text = link_part
+
     ok = set_otp_group_link(text)
     if ok:
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(
-            f"✅ <b>OTP Group Link Updated!</b>\n"
+            f"✅ <b>OTP Group Link & Button Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔗 <b>Link:</b> <code>{get_otp_group_link()}</code>\n"
+            f"🏷️ <b>Button Name:</b> <code>{get_otp_group_name()}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -1406,6 +1507,50 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("❌ <b>Failed to update group link.</b>", parse_mode=ParseMode.HTML)
+
+async def setgroupname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    raw_text = update.message.text
+    text = re.sub(r"^/(setgroupname|setbtnname)", "", raw_text, flags=re.IGNORECASE).strip()
+    if not text:
+        ADMIN_STATES[user.id] = {"awaiting_otp_group_name": True}
+        curr_name = get_otp_group_name()
+        await update.message.reply_text(
+            f"🏷️ <b>Set OTP Group Button Name:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Name:</b> <code>{curr_name}</code>\n\n"
+            f"Please send the desired button label in chat:\n"
+            f"e.g. <code>💬 Join VIP Channel</code> or <code>📢 Official OTP Group</code>\n\n"
+            f"<i>(Send <code>default</code> to reset to '{DEFAULT_OTP_GROUP_NAME}')</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            ])
+        )
+        return
+
+    if text.lower() == "default":
+        text = DEFAULT_OTP_GROUP_NAME
+
+    ok = set_otp_group_name(text)
+    if ok:
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>OTP Group Button Name Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ <b>Button Name:</b> <code>{get_otp_group_name()}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await update.message.reply_text("❌ <b>Failed to update button name.</b>", parse_mode=ParseMode.HTML)
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1981,16 +2126,47 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not admin_state:
         return
 
+    if admin_state.get("awaiting_otp_group_name"):
+        del ADMIN_STATES[user.id]
+        new_name = text if text.lower() != "default" else DEFAULT_OTP_GROUP_NAME
+        ok = set_otp_group_name(new_name)
+        if ok:
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await update.message.reply_text(
+                f"✅ <b>OTP Group Button Name Saved!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>Button Name:</b> <code>{get_otp_group_name()}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+        else:
+            await update.message.reply_text("❌ Failed to save button name.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ]))
+        return
+
     if admin_state.get("awaiting_otp_group_link"):
         del ADMIN_STATES[user.id]
+        if "|" in text:
+            parts = text.split("|", 1)
+            name_part = parts[0].strip()
+            link_part = parts[1].strip()
+            if name_part:
+                set_otp_group_name(name_part)
+            text = link_part
         ok = set_otp_group_link(text)
         if ok:
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
             await update.message.reply_text(
-                f"✅ <b>OTP Group Link Saved Successfully!</b>\n"
+                f"✅ <b>OTP Group Link & Button Saved!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 <b>Link:</b> <code>{get_otp_group_link()}</code>\n"
+                f"🏷️ <b>Button Name:</b> <code>{get_otp_group_name()}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
@@ -2207,7 +2383,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
-        group_notice = "\n\n💬 <b>Need OTP codes? Click 'Join OTP Group' below!</b>" if group_link else ""
+        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
 
         response_text = (
             f"📱 <b>Your Exclusive Numbers — {country_name}</b>\n"
@@ -2260,7 +2436,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
-        group_notice = "\n\n💬 <b>Need OTP codes? Click 'Join OTP Group' below!</b>" if group_link else ""
+        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
 
         response_text = (
             f"🔒 <b>Your SECRET Numbers — {country_name}</b>\n"
@@ -2399,14 +2575,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "admin_set_group_prompt" and user_admin:
         ADMIN_STATES[user.id] = {"awaiting_otp_group_link": True}
         curr = get_otp_group_link()
-        curr_msg = f"<b>Current Link:</b> <code>{curr}</code>\n\n" if curr else ""
+        curr_name = get_otp_group_name()
+        curr_msg = f"• <b>Current Link:</b> <code>{curr}</code>\n• <b>Button Name:</b> <code>{curr_name}</code>\n\n" if curr else ""
         await query.edit_message_text(
-            f"🔗 <b>Set / Update OTP Group Link:</b>\n"
+            f"🔗 <b>Set / Update OTP Group Link & Name:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{curr_msg}"
-            f"Please send your Telegram group link or username into this chat:\n"
-            f"<code>https://t.me/your_otp_group</code>\n\n"
-            f"<i>(Users will see a direct '💬 Join OTP Group' button when receiving numbers).</i>",
+            f"Please send your link OR <code>Button Name | Link</code> in chat:\n"
+            f"• Example 1: <code>https://t.me/your_otp_group</code>\n"
+            f"• Example 2: <code>💬 Join VIP Channel | https://t.me/your_otp_group</code>\n\n"
+            f"<i>(Users will see a '{curr_name}' button on their number delivery screen).</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏷️ Set Button Name Only", callback_data="admin_set_group_name_prompt")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            ])
+        )
+
+    # Admin Set OTP Group Name Prompt
+    elif data == "admin_set_group_name_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_otp_group_name": True}
+        curr_name = get_otp_group_name()
+        await query.edit_message_text(
+            f"🏷️ <b>Set OTP Group Button Name:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Button Name:</b> <code>{curr_name}</code>\n\n"
+            f"Please send the desired button label in chat:\n"
+            f"e.g. <code>💬 Join VIP Channel</code> or <code>📢 Official OTP Group</code>\n\n"
+            f"<i>(Send <code>default</code> to reset to '{DEFAULT_OTP_GROUP_NAME}')</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
@@ -2417,6 +2613,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "admin_panel" and user_admin:
         stats = get_system_stats()
         curr_link = get_otp_group_link()
+        curr_name = get_otp_group_name()
         link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
         admin_text = (
             f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
@@ -2429,6 +2626,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
             f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
             f"• <b>OTP Group Link:</b> {link_display}\n"
+            f"• <b>Group Button Name:</b> <code>{curr_name}</code>\n"
             f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
@@ -2437,8 +2635,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
             [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
             [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
-            [InlineKeyboardButton(f"🔗 Set OTP Group {'✅' if curr_link else '➕'}", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
-            [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
+            [InlineKeyboardButton(f"🔗 Set Group Link {'✅' if curr_link else '➕'}", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
+            [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist"), InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -3274,6 +3472,8 @@ def main():
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
+    app.add_handler(CommandHandler("setgroupname", setgroupname_command))
+    app.add_handler(CommandHandler("setbtnname", setgroupname_command))
     app.add_handler(CommandHandler("grantsecret", grantsecret_command))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
     app.add_handler(CommandHandler("user", user_lookup_command))
@@ -3308,6 +3508,8 @@ def main():
                 BotCommand("removeadmin", "🗑️ Demote Admin to user"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
+                BotCommand("setgroup", "🔗 Set OTP Group link & name"),
+                BotCommand("setgroupname", "🏷️ Set OTP Group button label"),
                 BotCommand("user", "👤 Lookup user details & usage"),
                 BotCommand("stats", "📊 View live system statistics"),
                 BotCommand("help", "ℹ️ How to use the bot"),

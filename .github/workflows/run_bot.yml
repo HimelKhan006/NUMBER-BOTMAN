@@ -119,6 +119,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ADMIN_USER_IDS: ${{ secrets.ADMIN_USER_IDS }}
+          THIRDWAVE_API_KEY: ${{ secrets.THIRDWAVE_API_KEY }}
+          THIRDWAVE_BASE_URL: ${{ secrets.THIRDWAVE_BASE_URL }}
+          OTPMAN_API_KEY: ${{ secrets.OTPMAN_API_KEY }}
+          OTPMAN_BASE_URL: ${{ secrets.OTPMAN_BASE_URL }}
+          OTPMAN2_API_KEY: ${{ secrets.OTPMAN2_API_KEY }}
+          OTPMAN2_BASE_URL: ${{ secrets.OTPMAN2_BASE_URL }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db

@@ -1932,23 +1932,36 @@ GIST_HEADERS = {
 
 class GistStorage:
     def __init__(self, gist_id: str, token: str, filename: str = "number_botman_data.json",
-                 description: str = "Number Botman — Persistent Cloud Backup"):
-        self.gist_id = gist_id
+                 description: str = "Number Botman — Persistent Cloud Backup (Auto-Managed)"):
+        self.gist_id = gist_id or get_bot_setting("gist_id", "")
         self.token = token
         self.filename = filename
         self.description = description
         self.bot_name = "NUMBER_BOTMAN"
         self.enabled = bool(token)
-        self.api_url = f"https://api.github.com/gists/{gist_id}" if gist_id else ""
+        self.api_url = f"https://api.github.com/gists/{self.gist_id}" if self.gist_id else ""
 
     def _auth_headers(self) -> Dict[str, str]:
         return {**GIST_HEADERS, "Authorization": f"Bearer {self.token}"}
 
     async def ensure_gist(self) -> bool:
+        """Finds existing Gist matching filename, deletes any duplicate Gists, or creates a new one automatically."""
         if not self.token:
             return False
         try:
             async with httpx.AsyncClient(timeout=15.0) as http:
+                # 0. If gist_id is already set, verify it exists and is accessible
+                if self.gist_id:
+                    check_res = await http.get(f"https://api.github.com/gists/{self.gist_id}", headers=self._auth_headers())
+                    if check_res.is_success:
+                        self.api_url = f"https://api.github.com/gists/{self.gist_id}"
+                        return True
+                    elif check_res.status_code == 404:
+                        logger.warning(f"Configured Gist ID {self.gist_id} not found on GitHub (404). Searching/creating new Gist...")
+                        self.gist_id = ""
+                        self.api_url = ""
+
+                # 1. Search existing Gists matching filename to reuse and delete duplicate leftovers
                 res = await http.get("https://api.github.com/gists?per_page=100", headers=self._auth_headers())
                 if res.is_success:
                     gists = res.json()
@@ -1957,8 +1970,10 @@ class GistStorage:
                         primary = matching[0]
                         self.gist_id = primary.get("id", "")
                         self.api_url = f"https://api.github.com/gists/{self.gist_id}"
+                        set_bot_setting("gist_id", self.gist_id)
                         logger.info(f"☁️ Reusing existing GitHub Gist: {self.gist_id}")
 
+                        # Automatically delete duplicate leftover Gists
                         for dup in matching[1:]:
                             dup_id = dup.get("id")
                             if dup_id and dup_id != self.gist_id:
@@ -1970,6 +1985,7 @@ class GistStorage:
                                     pass
                         return True
 
+                # 2. No matching Gist exists -> create a brand new private Gist
                 res = await http.post(
                     "https://api.github.com/gists",
                     headers=self._auth_headers(),
@@ -1978,7 +1994,15 @@ class GistStorage:
                         "public": False,
                         "files": {
                             self.filename: {
-                                "content": json.dumps({"bot": self.bot_name, "countries": {}, "users": [], "updated_at": datetime.now(timezone.utc).isoformat()}, indent=2)
+                                "content": json.dumps({
+                                    "bot": self.bot_name,
+                                    "countries": {},
+                                    "users": [],
+                                    "admins": [],
+                                    "active_numbers": [],
+                                    "seen_sms": {},
+                                    "updated_at": datetime.now(timezone.utc).isoformat()
+                                }, indent=2)
                             }
                         }
                     }
@@ -1986,14 +2010,22 @@ class GistStorage:
                 if res.is_success:
                     self.gist_id = res.json().get("id", "")
                     self.api_url = f"https://api.github.com/gists/{self.gist_id}"
-                    logger.info(f"☁️ Created new GitHub Gist: {self.gist_id}")
+                    set_bot_setting("gist_id", self.gist_id)
+                    logger.info(f"☁️ Created new GitHub Gist automatically: {self.gist_id}")
                     return True
+                else:
+                    logger.warning(f"Gist auto-create failed (HTTP {res.status_code}): {res.text[:120]}")
         except Exception as e:
             logger.warning(f"Gist auto-discovery error: {e}")
         return False
 
     async def export_and_sync(self, is_handover: bool = False) -> bool:
-        if not self.enabled or not self.api_url:
+        """Prunes 28h history and syncs full database, numbers, settings, and active users to GitHub Gist."""
+        if not self.enabled:
+            return False
+        if not self.api_url:
+            await self.ensure_gist()
+        if not self.api_url:
             return False
         try:
             countries_data = {}
@@ -2027,8 +2059,16 @@ class GistStorage:
                 settings_cur = conn.execute("SELECT key, value FROM bot_settings;")
                 settings_data = {r["key"]: r["value"] for r in settings_cur.fetchall()}
 
+                # Export active numbers mapped to users
+                active_cur = conn.execute("SELECT number, user_id, country_name, assigned_at FROM active_user_numbers;")
+                active_data = [dict(r) for r in active_cur.fetchall()]
+
                 current_group_link = get_otp_group_link()
                 current_group_name = get_otp_group_name()
+
+            # Prune seen SMS to 28 hours
+            cutoff_28h = time.time() - (28 * 3600)
+            cleaned_seen = {k: v for k, v in SEEN_SMS_TIMESTAMPS.items() if v >= cutoff_28h}
 
             payload = {
                 "description": self.description,
@@ -2045,6 +2085,8 @@ class GistStorage:
                             "used_countries": used_data,
                             "users": users_data,
                             "admins": admins_data,
+                            "active_numbers": active_data,
+                            "seen_sms": cleaned_seen,
                             "handover": is_handover,
                             "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
                         }, indent=2)
@@ -2053,19 +2095,40 @@ class GistStorage:
             }
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
+                if res.status_code == 404:
+                    logger.warning(f"Gist {self.gist_id} returned 404. Re-creating automatically...")
+                    self.gist_id = ""
+                    self.api_url = ""
+                    if await self.ensure_gist() and self.api_url:
+                        res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
+
                 if res.is_success:
                     logger.info(f"☁️ Database, Users, Admins & Numbers backed up to GitHub Gist (handover={is_handover}).")
                     return True
+                else:
+                    logger.warning(f"Gist patch status {res.status_code}: {res.text[:120]}")
         except Exception as e:
             logger.warning(f"Gist export error: {e}")
         return False
 
     async def restore_from_gist(self) -> bool:
-        if not self.enabled or not self.api_url:
+        """Restores complete state, database tables, and settings from GitHub Gist."""
+        if not self.enabled:
+            return False
+        if not self.api_url:
+            await self.ensure_gist()
+        if not self.api_url:
             return False
         try:
             async with httpx.AsyncClient(timeout=15.0) as http:
                 res = await http.get(self.api_url, headers=self._auth_headers())
+                if res.status_code == 404:
+                    logger.warning(f"Gist {self.gist_id} returned 404 on restore. Searching matching Gist...")
+                    self.gist_id = ""
+                    self.api_url = ""
+                    if await self.ensure_gist() and self.api_url:
+                        res = await http.get(self.api_url, headers=self._auth_headers())
+
                 if res.is_success:
                     data = res.json()
                     files = data.get("files", {})
@@ -2076,6 +2139,8 @@ class GistStorage:
                         used_data = parsed.get("used_countries", {})
                         users_data = parsed.get("users", [])
                         admins_data = parsed.get("admins", [])
+                        active_data = parsed.get("active_numbers", [])
+                        seen_data = parsed.get("seen_sms", {})
 
                         if parsed.get("handover"):
                             global _is_handover, _handover_epoch
@@ -2142,9 +2207,30 @@ class GistStorage:
                                             first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE bot_admins.first_name END;
                                     """, (aid, a.get("added_by", 0), a.get("username", ""), a.get("first_name", "")))
                                     mconn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (aid,))
+
+                            # Restore Active User Numbers
+                            if active_data:
+                                for an in active_data:
+                                    anum = an.get("number")
+                                    auid = an.get("user_id")
+                                    if anum and auid:
+                                        mconn.execute("""
+                                            INSERT OR IGNORE INTO active_user_numbers (number, user_id, country_name, assigned_at)
+                                            VALUES (?, ?, ?, ?);
+                                        """, (anum, auid, an.get("country_name", ""), an.get("assigned_at", datetime.now(timezone.utc).isoformat())))
+
                             mconn.commit()
 
-
+                        # 2. Restore 28h Seen SMS Cache
+                        if isinstance(seen_data, dict):
+                            cutoff_28h = time.time() - (28 * 3600)
+                            for sid, ts in seen_data.items():
+                                try:
+                                    if float(ts) >= cutoff_28h:
+                                        SEEN_SMS_CACHE.add(str(sid))
+                                        SEEN_SMS_TIMESTAMPS[str(sid)] = float(ts)
+                                except Exception:
+                                    pass
 
                         # 3. Restore used numbers archive
                         total_used_restored = 0
@@ -2181,8 +2267,8 @@ class GistStorage:
                                 total_std_restored += added
 
                         logger.info(
-                            f"☁️ Restored {len(users_data)} users, {total_std_restored} standard numbers, "
-                            f"{total_sec_restored} secret numbers & {total_used_restored} archived used numbers from GitHub Gist."
+                            f"☁️ Restored {len(users_data)} users, {len(active_data)} active numbers, "
+                            f"{total_std_restored} standard numbers, {total_sec_restored} secret numbers & {total_used_restored} archived used numbers from GitHub Gist."
                         )
                         return True
         except Exception as e:

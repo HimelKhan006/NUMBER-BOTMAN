@@ -2111,6 +2111,12 @@ def build_languages_menu(page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"lang_mgr_p_{page + 1}"))
     buttons.append(nav_row)
 
+    lang_on = (get_bot_setting("show_sms_language", "1") == "1")
+    lang_btn_text = "🔔 Language on SMS: ON ✅" if lang_on else "🔕 Language on SMS: OFF ❌"
+
+    buttons.append([
+        InlineKeyboardButton(lang_btn_text, callback_data=f"lang_toggle_sms_{page}")
+    ])
     buttons.append([
         InlineKeyboardButton("➕ Add New Language", callback_data="lang_add_new"),
         InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_sms_menu")
@@ -2358,7 +2364,8 @@ def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", f
 
     if final_num:
         lines.append(f"• <b>Country:</b> <code>{html.escape(country_name)} ({iso})</code>")
-    lines.append(f"• <b>Language:</b> <code>{lang_name}</code>")
+    if get_bot_setting("show_sms_language", "1") == "1":
+        lines.append(f"• <b>Language:</b> <code>{lang_name}</code>")
 
     sms_view_mode = get_bot_setting("sms_view_mode", "default")
     should_show_full = (force_full is True) or (force_full is None and sms_view_mode == "full")
@@ -3420,9 +3427,12 @@ def get_admin_sms_keyboard() -> InlineKeyboardMarkup:
     else:
         fmt_label = "📦 View Mode: Fixed Short Only"
 
+    lang_on = (get_bot_setting("show_sms_language", "1") == "1")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔔 Master Forwarding: {'✅ ON' if sms_on else '❌ OFF'}", callback_data="admin_toggle_sms_master")],
         [InlineKeyboardButton(fmt_label, callback_data="admin_cycle_sms_mode")],
+        [InlineKeyboardButton(f"🌐 SMS Language Display: {'✅ ON' if lang_on else '❌ OFF'}", callback_data="admin_toggle_sms_language"),
+         InlineKeyboardButton("🌐 Languages DB", callback_data="lang_mgr_p_0")],
         [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
         [InlineKeyboardButton("📡 Check Connected Services Status", callback_data="admin_api_status")],
         [InlineKeyboardButton(f"🌐 Thirdwave API: {'✅ Active' if tw_on else '❌ OFF'}", callback_data="admin_toggle_api_thirdwave")],
@@ -3611,6 +3621,30 @@ async def setgroupname_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text("❌ <b>Failed to update button name.</b>", parse_mode=ParseMode.HTML)
 
+
+async def togglelanguage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not msg_obj:
+        return
+    if not is_user_super_admin(user.id) and not is_user_admin(user.id):
+        await msg_obj.reply_text("⛔ <b>Access Restricted</b>: Admins only.", parse_mode=ParseMode.HTML)
+        return
+    curr = (get_bot_setting("show_sms_language", "1") == "1")
+    new_val = "0" if curr else "1"
+    set_bot_setting("show_sms_language", new_val)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+    status_str = "🟢 <b>ON</b> (Language will be displayed on SMS)" if new_val == "1" else "🔴 <b>OFF</b> (Language hidden from SMS)"
+    await msg_obj.reply_text(
+        f"🌐 <b>SMS Language Display Setting</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Status:</b> {status_str}\n"
+        f"• <b>SMS Card:</b> {'• Language: &lt;Detected Language&gt;' if new_val == '1' else '(Hidden)'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>Tap /togglelang again to switch anytime, or toggle in /admin.</i>",
+        parse_mode=ParseMode.HTML
+    )
 
 async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -5144,6 +5178,132 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     user_admin = is_admin(user.id)
     register_user(user.id, user.username, user.first_name)
+
+    # Language Manager & SMS Language Callbacks
+    if data.startswith("lang_"):
+        if not user_admin:
+            await query.answer("⛔ Access Restricted: Admins only.", show_alert=True)
+            return
+        if data.startswith("lang_mgr_p_"):
+            page = int(data.split("_")[-1])
+            text, markup = build_languages_menu(page)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data.startswith("lang_toggle_sms_"):
+            page_str = data.replace("lang_toggle_sms_", "")
+            page = int(page_str) if page_str.isdigit() else 0
+            curr = (get_bot_setting("show_sms_language", "1") == "1")
+            new_val = "0" if curr else "1"
+            set_bot_setting("show_sms_language", new_val)
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            status_txt = "ON ✅ (Language will show on SMS)" if new_val == "1" else "OFF ❌ (Language hidden from SMS)"
+            await query.answer(f"SMS Language: {status_txt}")
+            text, markup = build_languages_menu(page)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data.startswith("lang_v_"):
+            lid = data[7:]
+            text, markup = build_language_detail_menu(lid)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data.startswith("lang_edname_"):
+            lid = data[12:]
+            ADMIN_LANG_STATES[user.id] = {"action": "awaiting_edit_display_name", "lang_id": lid}
+            cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"lang_v_{lid}")]])
+            await query.message.reply_text(
+                f"✏️ <b>Enter the new SMS Display Label for <code>{lid.title()}</code>:</b>\n\n"
+                f"<i>Example:</i> <code>🇧🇬 Bulgarian [BG]</code> or <code>Bulgarian</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_markup
+            )
+            return
+        elif data.startswith("lang_addphr_"):
+            lid = data[12:]
+            ADMIN_LANG_STATES[user.id] = {"action": "awaiting_add_phrase", "lang_id": lid}
+            cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"lang_v_{lid}")]])
+            await query.message.reply_text(
+                f"➕ <b>Add SMS Content / Phrase for <code>{lid.title()}</code>:</b>\n\n"
+                f"Paste the exact SMS text or unique keyword phrase in that language directly into this chat.\n"
+                f"Multiple lines = multiple phrases.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_markup
+            )
+            return
+        elif data.startswith("lang_clrphr_"):
+            lid = data[12:]
+            db_clear_phrases(lid)
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await query.answer(f"Phrases cleared for {lid} ✅")
+            text, markup = build_language_detail_menu(lid)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data.startswith("lang_tog_"):
+            lid = data[9:]
+            new_st = db_toggle_language(lid)
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            status_txt = "Enabled 🟢" if new_st else "Disabled ⏸️"
+            await query.answer(f"Language {status_txt}")
+            text, markup = build_language_detail_menu(lid)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data.startswith("lang_del_"):
+            lid = data[9:]
+            db_delete_language(lid)
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await query.answer(f"Language '{lid}' deleted 🗑️")
+            text, markup = build_languages_menu(0)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
+            return
+        elif data == "lang_add_new":
+            ADMIN_LANG_STATES[user.id] = {"action": "awaiting_new_lang"}
+            cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="lang_mgr_p_0")]])
+            await query.message.reply_text(
+                "➕ <b>Add New Language:</b>\n\n"
+                "Send the <b>Language Name | ISO Code</b> in chat.\n\n"
+                "<b>Example:</b>\n"
+                "<code>Somali | SO</code>\n"
+                "or\n"
+                "<code>Kurdish | KU</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_markup
+            )
+            return
+
+    elif data == "admin_toggle_sms_language" and user_admin:
+        curr = (get_bot_setting("show_sms_language", "1") == "1")
+        new_val = "0" if curr else "1"
+        set_bot_setting("show_sms_language", new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        status_txt = "ON ✅ (Language will show on SMS)" if new_val == "1" else "OFF ❌ (Language hidden from SMS)"
+        await query.answer(f"SMS Language Display: {status_txt}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+        return
 
     # 1. Main Menu
     if data == "btn_main_menu":
@@ -6715,6 +6875,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("togglelang", togglelanguage_command))
+    app.add_handler(CommandHandler("togglelanguage", togglelanguage_command))
     app.add_handler(CommandHandler("languages", languages_command))
     app.add_handler(CommandHandler("lang", languages_command))
     app.add_handler(CommandHandler("admins", admins_command))

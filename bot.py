@@ -59,7 +59,7 @@ import asyncio
 import time
 import argparse
 from typing import Set, Dict, Any, List, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from telegram import (
@@ -72,6 +72,11 @@ from telegram import (
     BotCommandScopeChat,
     MenuButtonCommands,
 )
+try:
+    from telegram import CopyTextButton
+except ImportError:
+    CopyTextButton = None
+
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.request import HTTPXRequest
@@ -100,21 +105,31 @@ def load_environment():
         load_dotenv()
     except Exception:
         pass
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, val = line.split("=", 1)
-                    key = key.strip()
-                    val = val.strip().strip("\"'").strip()
-                    if key and key not in os.environ:
-                        os.environ[key] = val
-        except Exception:
-            pass
+
+    def _read_env_file(path: str):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip().strip("\"'").strip()
+                        if key and key not in os.environ:
+                            os.environ[key] = val
+            except Exception:
+                pass
+
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    _read_env_file(os.path.join(cur_dir, ".env"))
+
+    # Also check sibling bot folders for linked OTP provider APIs
+    parent_dir = os.path.dirname(cur_dir)
+    _read_env_file(os.path.join(parent_dir, "1_THIRDWAVE_BOT", ".env"))
+    _read_env_file(os.path.join(parent_dir, "2_OTPMAN_BOT", ".env"))
+    _read_env_file(os.path.join(parent_dir, "3_OTPMAN2_BOT", ".env"))
 
 load_environment()
 
@@ -129,6 +144,18 @@ GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOK
 _is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
 _handover_epoch: float = 0.0
 bot_process_start_time: float = time.time()
+
+# Linked OTP APIs for SMS Receiving
+THIRDWAVE_API_KEY  = os.getenv("THIRDWAVE_API_KEY", "").strip()
+THIRDWAVE_BASE_URL = os.getenv("THIRDWAVE_BASE_URL", "https://thirdwave.cc").rstrip("/")
+
+OTPMAN_API_KEY     = os.getenv("OTPMAN_API_KEY", os.getenv("AUGESTEL_API_KEY", os.getenv("PANEL_API_KEY", ""))).strip()
+OTPMAN_BASE_URL    = os.getenv("OTPMAN_BASE_URL", os.getenv("AUGESTEL_BASE_URL", "https://augestel.com")).rstrip("/")
+
+OTPMAN2_API_KEY    = os.getenv("OTPMAN2_API_KEY", os.getenv("KSI_API_KEY", "")).strip()
+OTPMAN2_BASE_URL   = os.getenv("OTPMAN2_BASE_URL", os.getenv("KSI_BASE_URL", "https://augestel.com")).rstrip("/")
+
+USER_STATES: Dict[int, Dict[str, Any]] = {}
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MAIN_DB_FILE    = os.getenv("DB_FILE", os.path.join(BASE_DIR, "bot4_database.db"))
@@ -302,8 +329,42 @@ def init_db():
                 delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_user_numbers (
+                number TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                country_name TEXT,
+                assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_active_user_numbers_uid ON active_user_numbers(user_id);")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS seen_sms_deliveries (
+                id TEXT PRIMARY KEY,
+                number TEXT,
+                user_id INTEGER,
+                full_text TEXT,
+                raw_json TEXT,
+                delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_sms_deliv ON seen_sms_deliveries(delivered_at);")
+
+        try:
+            conn.execute("ALTER TABLE seen_sms_deliveries ADD COLUMN full_text TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE seen_sms_deliveries ADD COLUMN raw_json TEXT;")
+        except Exception:
+            pass
         try:
             conn.execute("ALTER TABLE delivery_log ADD COLUMN is_secret INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN user_quantity INTEGER DEFAULT 10;")
         except Exception:
             pass
 
@@ -700,6 +761,8 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
 
         remaining = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = ?;", (secret_val,)).fetchone()[0]
 
+    register_active_assigned_numbers(numbers, user_id, country_name)
+
     try:
         with get_main_db() as mconn:
             mconn.execute("""
@@ -953,6 +1016,670 @@ def set_otp_group_name(name: str) -> bool:
     return success
 
 # ==========================================
+# 5b. Dynamic Settings, Bot Name & Quantity Controls
+# ==========================================
+def get_bot_setting(key: str, default: str = "") -> str:
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT value FROM bot_settings WHERE key = ?;", (key,)).fetchone()
+            if row and row["value"] is not None:
+                return str(row["value"]).strip()
+    except Exception as e:
+        logger.debug(f"Error reading setting {key}: {e}")
+    return default
+
+def set_bot_setting(key: str, value: str) -> bool:
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO bot_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """, (key, str(value).strip()))
+            conn.commit()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(FULL);")
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving setting {key}: {e}")
+        return False
+
+DEFAULT_BOT_NAME = "NUMBER BOTMAN"
+
+def get_bot_name() -> str:
+    val = get_bot_setting("bot_name", DEFAULT_BOT_NAME)
+    return val if val else DEFAULT_BOT_NAME
+
+def set_bot_name(name: str) -> bool:
+    clean = name.strip()[:64]
+    if not clean or clean.lower() in ("default", "reset"):
+        clean = DEFAULT_BOT_NAME
+    return set_bot_setting("bot_name", clean)
+
+def get_admin_fixed_quantity() -> Optional[int]:
+    """Returns fixed quantity if set by admin (1-1000), else None (default mode where users pick 1-10)."""
+    val = get_bot_setting("admin_fixed_quantity", "default").strip().lower()
+    if val != "default" and val.isdigit():
+        q = int(val)
+        if 1 <= q <= 1000:
+            return q
+    return None
+
+def set_admin_fixed_quantity(quantity_val: str) -> bool:
+    """Sets admin fixed quantity ('default' or integer string '1'-'1000')."""
+    clean = str(quantity_val).strip().lower()
+    if clean == "default":
+        return set_bot_setting("admin_fixed_quantity", "default")
+    if clean.isdigit() and 1 <= int(clean) <= 1000:
+        return set_bot_setting("admin_fixed_quantity", str(int(clean)))
+    return False
+
+def get_user_quantity_preference(user_id: int) -> int:
+    """Returns user's preferred number quantity (1-10, default 10)."""
+    if not user_id:
+        return 10
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT user_quantity FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+            if row and row["user_quantity"] is not None:
+                q = int(row["user_quantity"])
+                if 1 <= q <= 10:
+                    return q
+    except Exception:
+        pass
+    return 10
+
+def set_user_quantity_preference(user_id: int, qty: int) -> bool:
+    """Saves user's preferred number quantity (clamped between 1 and 10)."""
+    if not user_id:
+        return False
+    clamped = max(1, min(10, int(qty)))
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE users SET user_quantity = ? WHERE user_id = ?;", (clamped, user_id))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"Error saving user quantity for {user_id}: {e}")
+        return False
+
+def get_effective_quantity_for_user(user_id: int) -> Tuple[int, bool]:
+    """
+    Returns (effective_limit, is_admin_fixed).
+    If admin fixed quantity is active (1-1000), returns (fixed_qty, True).
+    Otherwise returns (user_qty, False) where user_qty is 1-10.
+    """
+    fixed = get_admin_fixed_quantity()
+    if fixed is not None:
+        return fixed, True
+    user_pref = get_user_quantity_preference(user_id)
+    return user_pref, False
+
+# ==========================================
+# 5c. Active Number Tracking & Direct SMS Delivery
+# ==========================================
+def normalize_phone_number(raw_num: str) -> str:
+    """Normalizes phone number to digits only for uniform indexing."""
+    if not raw_num:
+        return ""
+    return re.sub(r"\D", "", str(raw_num))
+
+def register_active_assigned_numbers(numbers: List[str], user_id: int, country_name: str):
+    """Indexes numbers delivered to a user in active_user_numbers table for O(1) SMS routing."""
+    if not numbers or not user_id:
+        return
+    try:
+        with get_main_db() as conn:
+            for num in numbers:
+                digits = normalize_phone_number(num)
+                if digits:
+                    conn.execute("""
+                        INSERT INTO active_user_numbers (number, user_id, country_name, assigned_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(number) DO UPDATE SET user_id = excluded.user_id, country_name = excluded.country_name, assigned_at = CURRENT_TIMESTAMP;
+                    """, (digits, user_id, country_name))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Error indexing active numbers for SMS: {e}")
+
+def find_user_for_phone_number(raw_num: str) -> Optional[Dict[str, Any]]:
+    """Checks if incoming SMS recipient number was issued to an active user."""
+    digits = normalize_phone_number(raw_num)
+    if not digits:
+        return None
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("""
+                SELECT user_id, country_name, assigned_at FROM active_user_numbers
+                WHERE number = ? OR number = ?
+                ORDER BY assigned_at DESC LIMIT 1;
+            """, (digits, digits.lstrip("0"))).fetchone()
+            if row:
+                return {
+                    "user_id": int(row["user_id"]),
+                    "country_name": str(row["country_name"] or ""),
+                    "assigned_at": str(row["assigned_at"] or "")
+                }
+    except Exception as e:
+        logger.warning(f"Error looking up phone number {raw_num}: {e}")
+    return None
+
+# ==========================================
+# 5d. Country ISO, Language & OTP Formatting
+# ==========================================
+COUNTRY_ISO_DATA: Dict[str, Tuple[str, str]] = {
+    # Asia & Middle East
+    "sri lanka": ("🇱🇰", "LK"), "lk": ("🇱🇰", "LK"),
+    "indonesia": ("🇮🇩", "ID"), "id": ("🇮🇩", "ID"),
+    "india":     ("🇮🇳", "IN"), "in": ("🇮🇳", "IN"),
+    "bangladesh":("🇧🇩", "BD"), "bd": ("🇧🇩", "BD"),
+    "pakistan":  ("🇵🇰", "PK"), "pk": ("🇵🇰", "PK"),
+    "vietnam":   ("🇻🇳", "VN"), "vn": ("🇻🇳", "VN"),
+    "philippines":("🇵🇭","PH"), "ph": ("🇵🇭", "PH"),
+    "thailand":  ("🇹🇭", "TH"), "th": ("🇹🇭", "TH"),
+    "malaysia":  ("🇲🇾", "MY"), "my": ("🇲🇾", "MY"),
+    "cambodia":  ("🇰🇭", "KH"), "kh": ("🇰🇭", "KH"),
+    "myanmar":   ("🇲🇲", "MM"), "mm": ("🇲🇲", "MM"),
+    "nepal":     ("🇳🇵", "NP"), "np": ("🇳🇵", "NP"),
+    "china":     ("🇨🇳", "CN"), "cn": ("🇨🇳", "CN"),
+    "taiwan":    ("🇹🇼", "TW"), "tw": ("🇹🇼", "TW"),
+    "japan":     ("🇯🇵", "JP"), "jp": ("🇯🇵", "JP"),
+    "south korea":("🇰🇷","KR"), "kr": ("🇰🇷", "KR"),
+    "singapore": ("🇸🇬", "SG"), "sg": ("🇸🇬", "SG"),
+    "hong kong": ("🇭🇰", "HK"), "hk": ("🇭🇰", "HK"),
+    "saudi arabia":("🇸🇦","SA"), "sa": ("🇸🇦", "SA"),
+    "uae":       ("🇦🇪", "AE"), "ae": ("🇦🇪", "AE"),
+    "turkey":    ("🇹🇷", "TR"), "tr": ("🇹🇷", "TR"),
+    "israel":    ("🇮🇱", "IL"), "il": ("🇮🇱", "IL"),
+    "iran":      ("🇮🇷", "IR"), "ir": ("🇮🇷", "IR"),
+    "iraq":      ("🇮🇶", "IQ"), "iq": ("🇮🇶", "IQ"),
+    "qatar":     ("🇶🇦", "QA"), "qa": ("🇶🇦", "QA"),
+    "kuwait":    ("🇰🇼", "KW"), "kw": ("🇰🇼", "KW"),
+    "oman":      ("🇴🇲", "OM"), "om": ("🇴🇲", "OM"),
+    "jordan":    ("🇯🇴", "JO"), "jo": ("🇯🇴", "JO"),
+    "lebanon":   ("🇱🇧", "LB"), "lb": ("🇱🇧", "LB"),
+    "kazakhstan":("🇰🇿", "KZ"), "kz": ("🇰🇿", "KZ"),
+    "uzbekistan":("🇺🇿", "UZ"), "uz": ("🇺🇿", "UZ"),
+    # Europe
+    "united kingdom":("🇬🇧","GB"), "uk": ("🇬🇧", "GB"), "gb": ("🇬🇧", "GB"),
+    "germany":   ("🇩🇪", "DE"), "de": ("🇩🇪", "DE"),
+    "france":    ("🇫🇷", "FR"), "fr": ("🇫🇷", "FR"),
+    "italy":     ("🇮🇹", "IT"), "it": ("🇮🇹", "IT"),
+    "spain":     ("🇪🇸", "ES"), "es": ("🇪🇸", "ES"),
+    "netherlands":("🇳🇱","NL"), "nl": ("🇳🇱", "NL"),
+    "poland":    ("🇵🇱", "PL"), "pl": ("🇵🇱", "PL"),
+    "russia":    ("🇷🇺", "RU"), "ru": ("🇷🇺", "RU"),
+    "ukraine":   ("🇺🇦", "UA"), "ua": ("🇺🇦", "UA"),
+    "sweden":    ("🇸🇪", "SE"), "se": ("🇸🇪", "SE"),
+    "norway":    ("🇳🇴", "NO"), "no": ("🇳🇴", "NO"),
+    "denmark":   ("🇩🇰", "DK"), "dk": ("🇩🇰", "DK"),
+    "finland":   ("🇫🇮", "FI"), "fi": ("🇫🇮", "FI"),
+    "belgium":   ("🇧🇪", "BE"), "be": ("🇧🇪", "BE"),
+    "switzerland":("🇨🇭","CH"), "ch": ("🇨🇭", "CH"),
+    "austria":   ("🇦🇹", "AT"), "at": ("🇦🇹", "AT"),
+    "portugal":  ("🇵🇹", "PT"), "pt": ("🇵🇹", "PT"),
+    "greece":    ("🇬🇷", "GR"), "gr": ("🇬🇷", "GR"),
+    "czech republic":("🇨🇿","CZ"), "cz": ("🇨🇿", "CZ"),
+    "romania":   ("🇷🇴", "RO"), "ro": ("🇷🇴", "RO"),
+    "hungary":   ("🇭🇺", "HU"), "hu": ("🇭🇺", "HU"),
+    "ireland":   ("🇮🇪", "IE"), "ie": ("🇮🇪", "IE"),
+    # Americas
+    "united states":("🇺🇸","US"), "usa": ("🇺🇸", "US"), "us": ("🇺🇸", "US"),
+    "canada":    ("🇨🇦", "CA"), "ca": ("🇨🇦", "CA"),
+    "brazil":    ("🇧🇷", "BR"), "br": ("🇧🇷", "BR"),
+    "mexico":    ("🇲🇽", "MX"), "mx": ("🇲🇽", "MX"),
+    "argentina": ("🇦🇷", "AR"), "ar": ("🇦🇷", "AR"),
+    "colombia":  ("🇨🇴", "CO"), "co": ("🇨🇴", "CO"),
+    "chile":     ("🇨🇱", "CL"), "cl": ("🇨🇱", "CL"),
+    "peru":      ("🇵🇪", "PE"), "pe": ("🇵🇪", "PE"),
+    # Africa
+    "nigeria":   ("🇳🇬", "NG"), "ng": ("🇳🇬", "NG"),
+    "egypt":     ("🇪🇬", "EG"), "eg": ("🇪🇬", "EG"),
+    "south africa":("🇿🇦","ZA"), "za": ("🇿🇦", "ZA"),
+    "kenya":     ("🇰🇪", "KE"), "ke": ("🇰🇪", "KE"),
+    "ghana":     ("🇬🇭", "GH"), "gh": ("🇬🇭", "GH"),
+    "morocco":   ("🇲🇦", "MA"), "ma": ("🇲🇦", "MA"),
+    # Oceania
+    "australia": ("🇦🇺", "AU"), "au": ("🇦🇺", "AU"),
+    "new zealand":("🇳🇿","NZ"), "nz": ("🇳🇿", "NZ"),
+}
+
+def extract_otp_code(text: str) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = text.replace("\u200b", "").replace("\xa0", " ").strip()
+    kw_match = re.search(
+        r"(?:code|otp|pin|passcode|secret|verif\w*|kod\w*|c[oó]digo|clave|is)[:\s\-]+([A-Za-z0-9\-]{3,10})\b",
+        cleaned, re.IGNORECASE,
+    )
+    if kw_match:
+        code = kw_match.group(1).strip().replace("-", "").replace("–", "")
+        if any(c.isdigit() for c in code) and len(code) >= 3:
+            return code
+    hyphen_match = re.findall(r"\b\d{3}[-–]\d{3}\b|\b\d{3}[-–]\d{4}\b|\b\d{4}[-–]\d{4}\b", cleaned)
+    if hyphen_match:
+        return hyphen_match[0].replace("-", "").replace("–", "")
+    digits_match = re.findall(r"\b[0-9]{4,8}\b", cleaned)
+    if digits_match:
+        for d in digits_match:
+            if not (len(d) == 4 and d.startswith(("19", "20"))):
+                return d
+    return None
+
+def detect_sms_language(text: str) -> Tuple[str, str]:
+    if not text:
+        return ("English", "EN")
+    t = text.strip()
+    if re.search(r"[\u0600-\u06FF]", t):
+        return ("Arabic", "AR")
+    if re.search(r"[\u0400-\u04FF]", t):
+        return ("Russian", "RU")
+    if re.search(r"[\u4E00-\u9FFF]", t):
+        return ("Chinese", "ZH")
+    if re.search(r"[\u3040-\u30FF]", t):
+        return ("Japanese", "JA")
+    if re.search(r"[\u0590-\u05FF]", t):
+        return ("Hebrew", "HE")
+    if re.search(r"[\u0E00-\u0E7F]", t):
+        return ("Thai", "TH")
+    if re.search(r"[\u0370-\u03FF]", t):
+        return ("Greek", "EL")
+
+    low = t.lower()
+    if any(w in low for w in ["kodunuz", "doğrulama", "şifre", "giriş", "paylaşmayın", "onay"]):
+        return ("Turkish", "TR")
+    if any(w in low for w in ["mã", "xác minh", "mật khẩu", "không chia sẻ", "đăng nhập"]):
+        return ("Vietnamese", "VI")
+    if any(w in low for w in ["código", "codigo", "tu código", "no compartas", "iniciar sesión", "verificación", "clave"]):
+        return ("Spanish", "ES")
+    if any(w in low for w in ["seu código", "não compartilhe", "senha", "segurança", "verificação"]):
+        return ("Portuguese", "PT")
+    if any(w in low for w in ["votre code", "ne partagez", "mot de passe", "vérification", "connexion"]):
+        return ("French", "FR")
+    if any(w in low for w in ["dein code", "ihr code", "bestätigungscode", "verifizierung", "passwort", "nicht weitergeben"]):
+        return ("German", "DE")
+    if any(w in low for w in ["il tuo codice", "non condividere", "verifica", "accesso"]):
+        return ("Italian", "IT")
+    if any(w in low for w in ["kode verifikasi", "jangan berikan", "jangan bagikan", "rahasia", "masuk"]):
+        return ("Indonesian", "ID")
+    if any(w in low for w in ["twój kod", "hasło", "weryfikacyjny", "nie udostępniaj"]):
+        return ("Polish", "PL")
+
+    return ("English", "EN")
+
+def get_country_info_from_item(item: Dict[str, Any], country_hint: str = "") -> Tuple[str, str, str]:
+    """Returns (flag, country_name, iso)."""
+    raw_c = str(country_hint or item.get("country") or item.get("country_code") or item.get("iso") or "").strip().lower()
+    if raw_c in COUNTRY_ISO_DATA:
+        flag, iso = COUNTRY_ISO_DATA[raw_c]
+        cname = country_hint.title() if country_hint else raw_c.title()
+        return flag, cname, iso
+    for k, (f, i) in COUNTRY_ISO_DATA.items():
+        if k in raw_c or raw_c.startswith(k):
+            return f, k.title(), i
+    for k, flag in COUNTRY_FLAGS.items():
+        if k in raw_c:
+            return flag, k.title(), k.upper()
+    return "🌐", (country_hint or "Global").title(), "XX"
+
+def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", force_full: Optional[bool] = None, sms_id: str = "") -> Tuple[str, Optional[str], Optional[InlineKeyboardMarkup]]:
+    raw_number  = str(item.get("number") or item.get("phone") or item.get("destinationNumber") or item.get("dst") or "")
+    formatted_number = sanitize_phone_number(raw_number) or raw_number
+    source      = html.escape(str(item.get("source") or item.get("sender") or item.get("caller") or "SMS Service").strip())
+    raw_message = str(item.get("message") or item.get("text") or item.get("body") or item.get("messageBody") or "")
+    otp_code    = extract_otp_code(raw_message)
+
+    flag, country_name, iso = get_country_info_from_item(item, country_hint=country_hint)
+    lang_name, _ = detect_sms_language(raw_message)
+
+    low_source = source.lower()
+    low_msg = raw_message.lower()
+    wa_keywords = ["whatsapp", "‏واتساب‏", "واتساب", "ватсап", "wa code", "wa.me"]
+    is_wa = "whatsapp" in low_source or any(k in low_msg for k in wa_keywords)
+    wa_tag = ""
+    if is_wa:
+        if "whatsapp" not in low_source:
+            source = "WhatsApp"
+        old_indicators = [
+            "new device", "being registered", "dispositivo nuevo", "nuevo dispositivo",
+            "novo aparelho", "novo dispositivo", "новом устройстве", "нового устройства",
+            "perangkat baru", "neuem gerät", "neuen gerat", "nouvel appareil",
+            "nuovo dispositivo", "yeni bir cihaz", "nowym urządzeniu", "nowe urządzenie",
+            "جهاز جديد", "دستگاه جدید", "dispositif nouveau",
+        ]
+        is_old = any(ind in low_msg for ind in old_indicators)
+        wa_tag = "OLD" if is_old else "NEW"
+
+    DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
+    INDENT_NUM = "        "
+    INDENT  = "          "
+
+    header = "⚡ <b>NEW OTP SMS RECEIVED</b> ⚡" if otp_code else "⚡ <b>NEW SMS RECEIVED</b> ⚡"
+    lines = [header, DIVIDER]
+    lines.append(f"{INDENT_NUM}{flag} <code>{html.escape(formatted_number)}</code>")
+
+    if is_wa and wa_tag:
+        lines.append(f"{INDENT}<b>Service:</b> <code>{source}</code> <b>[{wa_tag}]</b>")
+    else:
+        lines.append(f"{INDENT}<b>Service:</b> <code>{source}</code>")
+
+    lines.append(f"{INDENT}<b>Country:</b> <code>{html.escape(country_name)} ({iso})</code>")
+    lines.append(f"{INDENT}<b>Language:</b> <code>{lang_name}</code>")
+
+    sms_view_mode = get_bot_setting("sms_view_mode", "default")
+    should_show_full = (force_full is True) or (force_full is None and sms_view_mode == "full")
+
+    if should_show_full and raw_message:
+        lines.append(DIVIDER)
+        lines.append("📜 <b>Full Message:</b>")
+        lines.append(f"<code>{html.escape(raw_message)}</code>")
+
+    lines.append(DIVIDER)
+    text = "\n".join(lines)
+
+    buttons = []
+    if otp_code:
+        if CopyTextButton:
+            buttons.append([InlineKeyboardButton(otp_code, copy_text=CopyTextButton(text=otp_code))])
+        else:
+            buttons.append([InlineKeyboardButton(f"📋 {otp_code}", callback_data=f"otp_copy_{otp_code}")])
+
+    if sms_id:
+        if should_show_full:
+            if sms_view_mode == "default":
+                buttons.append([InlineKeyboardButton("🔙 Collapse SMS", callback_data=f"collapse_sms_{sms_id}")])
+        else:
+            if sms_view_mode == "default":
+                buttons.append([InlineKeyboardButton("📜 Full SMS", callback_data=f"view_full_sms_{sms_id}")])
+
+    group_link = get_otp_group_link()
+    if group_link:
+        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
+
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    return text, otp_code, markup
+
+# ==========================================
+# 5e. Multi-Provider API Engine & Live Polling
+# ==========================================
+SEEN_SMS_CACHE: Set[str] = set()
+
+def is_sms_processed(sms_id: str) -> bool:
+    if not sms_id:
+        return False
+    if sms_id in SEEN_SMS_CACHE:
+        return True
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT 1 FROM seen_sms_deliveries WHERE id = ? LIMIT 1;", (sms_id,)).fetchone()
+            if row:
+                SEEN_SMS_CACHE.add(sms_id)
+                return True
+    except Exception:
+        pass
+    return False
+
+def mark_sms_processed(sms_id: str, number: str = "", user_id: int = 0, full_text: str = "", raw_json: str = ""):
+    if not sms_id:
+        return
+    SEEN_SMS_CACHE.add(sms_id)
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO seen_sms_deliveries (id, number, user_id, full_text, raw_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    number = excluded.number,
+                    user_id = excluded.user_id,
+                    full_text = CASE WHEN excluded.full_text != '' THEN excluded.full_text ELSE seen_sms_deliveries.full_text END,
+                    raw_json = CASE WHEN excluded.raw_json != '' THEN excluded.raw_json ELSE seen_sms_deliveries.raw_json END;
+            """, (sms_id, number, user_id, full_text, raw_json))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"Error marking sms processed: {e}")
+
+async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
+    if not THIRDWAVE_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(
+                f"{THIRDWAVE_BASE_URL}/api/v1/traffic",
+                headers={"Authorization": f"Bearer {THIRDWAVE_API_KEY}", "Accept": "application/json"},
+                params={"page": 1, "pageSize": 50}
+            )
+            if res.is_success:
+                data = res.json()
+                rows = data.get("rows") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                return [r for r in rows if isinstance(r, dict)]
+    except Exception as e:
+        logger.debug(f"Thirdwave fetch notice: {e}")
+    return []
+
+async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
+    if not OTPMAN_API_KEY:
+        return []
+    try:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(
+                f"{OTPMAN_BASE_URL}/api/v1/iprn/messages",
+                headers={"Authorization": f"Bearer {OTPMAN_API_KEY}", "Accept": "application/json"},
+                params={"per_page": 100, "start_date": start_date}
+            )
+            if res.is_success:
+                data = res.json()
+                items = data.get("data") if isinstance(data, dict) and "data" in data else (
+                    data.get("rows") if isinstance(data, dict) and "rows" in data else (
+                        data if isinstance(data, list) else []
+                    )
+                )
+                return [r for r in items if isinstance(r, dict)]
+    except Exception as e:
+        logger.debug(f"Augestel fetch notice: {e}")
+    return []
+
+async def fetch_otpman2_incoming() -> List[Dict[str, Any]]:
+    if not OTPMAN2_API_KEY:
+        return []
+    try:
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(
+                f"{OTPMAN2_BASE_URL}/api/v1/iprn/messages",
+                headers={"Authorization": f"Bearer {OTPMAN2_API_KEY}", "Accept": "application/json"},
+                params={"per_page": 100, "start_date": start_date}
+            )
+            if res.is_success:
+                data = res.json()
+                items = data.get("data") if isinstance(data, dict) and "data" in data else (
+                    data.get("rows") if isinstance(data, dict) and "rows" in data else (
+                        data if isinstance(data, list) else []
+                    )
+                )
+                return [r for r in items if isinstance(r, dict)]
+    except Exception as e:
+        logger.debug(f"OTPMan2 fetch notice: {e}")
+    return []
+
+async def sms_polling_worker(application: Application):
+    """
+    Continuous background loop that polls all enabled OTP provider APIs,
+    matches incoming SMS against active_user_numbers,
+    and forwards OTP messages directly to the users who got those numbers.
+    """
+    logger.info("📡 Live Multi-API SMS Polling Engine started for Number Bot.")
+    await asyncio.sleep(5.0)
+    while True:
+        try:
+            if get_bot_setting("sms_receiving_enabled", "1") != "1":
+                await asyncio.sleep(8.0)
+                continue
+
+            tasks = []
+            if get_bot_setting("api_thirdwave_enabled", "1") == "1" and THIRDWAVE_API_KEY:
+                tasks.append(("Thirdwave", fetch_thirdwave_incoming()))
+            if get_bot_setting("api_augestel_enabled", "1") == "1" and OTPMAN_API_KEY:
+                tasks.append(("Augestel", fetch_augestel_incoming()))
+            if get_bot_setting("api_otpman2_enabled", "1") == "1" and OTPMAN2_API_KEY:
+                tasks.append(("OTPMan2", fetch_otpman2_incoming()))
+
+            for provider_name, coro in tasks:
+                try:
+                    items = await coro
+                    for item in items:
+                        sms_id = str(item.get("id") or item.get("message_id") or "")
+                        if not sms_id:
+                            sms_id = f"{item.get('number')}_{item.get('message')}_{item.get('received_at')}"
+                        if is_sms_processed(sms_id):
+                            continue
+
+                        raw_msg = str(item.get("message") or item.get("text") or item.get("body") or item.get("messageBody") or "")
+                        item_json = json.dumps(item)
+                        raw_num = str(item.get("number") or item.get("phone") or item.get("destinationNumber") or item.get("dst") or "")
+                        user_info = find_user_for_phone_number(raw_num)
+                        if user_info:
+                            user_id = user_info["user_id"]
+                            c_hint  = user_info.get("country_name", "")
+                            text, otp, markup = format_user_otp_notification(item, country_hint=c_hint, sms_id=sms_id)
+                            sent = await send_with_retry(application.bot, user_id, text, reply_markup=markup)
+                            if sent:
+                                logger.info(f"📨 Live OTP forwarded to user {user_id} for number {raw_num} ({provider_name})")
+                                mark_sms_processed(sms_id, number=raw_num, user_id=user_id, full_text=raw_msg, raw_json=item_json)
+                        else:
+                            mark_sms_processed(sms_id, number=raw_num, user_id=0, full_text=raw_msg, raw_json=item_json)
+                except Exception as pe:
+                    logger.debug(f"Provider {provider_name} cycle notice: {pe}")
+
+        except Exception as e:
+            logger.warning(f"SMS Polling worker loop exception: {e}")
+
+        await asyncio.sleep(6.0)
+
+async def check_all_connected_apis_status() -> Dict[str, Any]:
+    """Tests connection, latency, and operational health for all 3 linked OTP provider APIs."""
+    results = {}
+
+    # 1. Thirdwave
+    tw_enabled = (get_bot_setting("api_thirdwave_enabled", "1") == "1")
+    if not THIRDWAVE_API_KEY:
+        results["thirdwave"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": tw_enabled, "url": THIRDWAVE_BASE_URL}
+    elif not tw_enabled:
+        results["thirdwave"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": THIRDWAVE_BASE_URL}
+    else:
+        try:
+            t0 = time.time()
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.get(
+                    f"{THIRDWAVE_BASE_URL}/api/v1/traffic",
+                    headers={"Authorization": f"Bearer {THIRDWAVE_API_KEY}", "Accept": "application/json"},
+                    params={"page": 1, "pageSize": 1}
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                if res.is_success:
+                    results["thirdwave"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": THIRDWAVE_BASE_URL, "key": f"••••{THIRDWAVE_API_KEY[-4:]}"}
+                else:
+                    results["thirdwave"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": THIRDWAVE_BASE_URL}
+        except Exception as e:
+            results["thirdwave"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": THIRDWAVE_BASE_URL}
+
+    # 2. Augestel / OTPMan
+    aug_enabled = (get_bot_setting("api_augestel_enabled", "1") == "1")
+    if not OTPMAN_API_KEY:
+        results["augestel"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": aug_enabled, "url": OTPMAN_BASE_URL}
+    elif not aug_enabled:
+        results["augestel"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": OTPMAN_BASE_URL}
+    else:
+        try:
+            t0 = time.time()
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.get(
+                    f"{OTPMAN_BASE_URL}/api/v1/iprn/messages",
+                    headers={"Authorization": f"Bearer {OTPMAN_API_KEY}", "Accept": "application/json"},
+                    params={"per_page": 1}
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                if res.is_success:
+                    results["augestel"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": OTPMAN_BASE_URL, "key": f"••••{OTPMAN_API_KEY[-4:]}"}
+                else:
+                    results["augestel"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": OTPMAN_BASE_URL}
+        except Exception as e:
+            results["augestel"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": OTPMAN_BASE_URL}
+
+    # 3. KSI / OTPMan2
+    ksi_enabled = (get_bot_setting("api_otpman2_enabled", "1") == "1")
+    if not OTPMAN2_API_KEY:
+        results["otpman2"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": ksi_enabled, "url": OTPMAN2_BASE_URL}
+    elif not ksi_enabled:
+        results["otpman2"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": OTPMAN2_BASE_URL}
+    else:
+        try:
+            t0 = time.time()
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.get(
+                    f"{OTPMAN2_BASE_URL}/api/v1/iprn/messages",
+                    headers={"Authorization": f"Bearer {OTPMAN2_API_KEY}", "Accept": "application/json"},
+                    params={"per_page": 1}
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                if res.is_success:
+                    results["otpman2"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": OTPMAN2_BASE_URL, "key": f"••••{OTPMAN2_API_KEY[-4:]}"}
+                else:
+                    results["otpman2"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": OTPMAN2_BASE_URL}
+        except Exception as e:
+            results["otpman2"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": OTPMAN2_BASE_URL}
+
+    with get_main_db() as conn:
+        active_numbers_count = conn.execute("SELECT COUNT(DISTINCT user_id) FROM active_user_numbers;").fetchone()[0]
+        total_delivered_count = conn.execute("SELECT COUNT(*) FROM seen_sms_deliveries WHERE user_id > 0;").fetchone()[0]
+
+    results["active_users"] = active_numbers_count
+    results["total_delivered"] = total_delivered_count
+    results["sms_forwarding"] = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+    results["view_mode"] = get_bot_setting("sms_view_mode", "default")
+    return results
+
+def format_api_status_report(status_data: Dict[str, Any]) -> str:
+    tw  = status_data.get("thirdwave", {})
+    aug = status_data.get("augestel", {})
+    ksi = status_data.get("otpman2", {})
+
+    mode = status_data.get("view_mode", "default")
+    mode_label = "📜 Default (With Full SMS Button)" if mode == "default" else ("📄 Fixed Always Full" if mode == "full" else "📦 Fixed Short Only")
+    master_sms = "✅ Active (Forwarding ON)" if status_data.get("sms_forwarding") else "❌ Disabled (Forwarding OFF)"
+
+    return (
+        "📡 <b>Connected OTP Bots & API Status</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🌐 <b>1. Thirdwave OTP API</b>\n"
+        f"• <b>Status:</b> {tw.get('status', 'Unknown')}\n"
+        f"• <b>Base URL:</b> <code>{tw.get('url', 'N/A')}</code>\n\n"
+        "🌐 <b>2. Augestel / OTPMan API</b>\n"
+        f"• <b>Status:</b> {aug.get('status', 'Unknown')}\n"
+        f"• <b>Base URL:</b> <code>{aug.get('url', 'N/A')}</code>\n\n"
+        "🌐 <b>3. KSI / OTPMan2 API</b>\n"
+        f"• <b>Status:</b> {ksi.get('status', 'Unknown')}\n"
+        f"• <b>Base URL:</b> <code>{ksi.get('url', 'N/A')}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 <b>SMS Forwarding Engine:</b>\n"
+        f"• <b>Master Forwarder:</b> {master_sms}\n"
+        f"• <b>Recipients Tracked:</b> <code>{status_data.get('active_users', 0)} active users</code>\n"
+        f"• <b>Total SMS Delivered:</b> <code>{status_data.get('total_delivered', 0)} forwarded</code>\n"
+        f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <i>Tap 'Test & Ping APIs Now' to run a live connection check across all 3 providers.</i>"
+    )
+
+def get_admin_api_status_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Test & Ping APIs Now", callback_data="admin_otp_status_refresh")],
+        [InlineKeyboardButton("⚙️ SMS Forwarding Controls", callback_data="admin_sms_menu")],
+        [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
+    ])
+
+# ==========================================
 # 6. Gist Persistent Storage Sync
 # ==========================================
 GIST_HEADERS = {
@@ -1046,12 +1773,16 @@ class GistStorage:
                             used_data[cname] = u_list
 
                 # Export users
-                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at FROM users;")
+                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, user_quantity, joined_at FROM users;")
                 users_data = [dict(r) for r in users_cur.fetchall()]
 
                 # Export dynamic database administrators
                 admins_cur = conn.execute("SELECT user_id, added_by, username, first_name FROM bot_admins;")
                 admins_data = [dict(r) for r in admins_cur.fetchall()]
+
+                # Export bot_settings
+                settings_cur = conn.execute("SELECT key, value FROM bot_settings;")
+                settings_data = {r["key"]: r["value"] for r in settings_cur.fetchall()}
 
                 current_group_link = get_otp_group_link()
                 current_group_name = get_otp_group_name()
@@ -1063,6 +1794,7 @@ class GistStorage:
                         "content": json.dumps({
                             "bot": self.bot_name,
                             "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "bot_settings": settings_data,
                             "otp_group_link": current_group_link,
                             "otp_group_name": current_group_name,
                             "total_countries": len(countries_data),
@@ -1107,9 +1839,15 @@ class GistStorage:
                             _is_handover = True
                             _handover_epoch = float(parsed.get("handover_epoch") or 0.0)
                             logger.info(f"🔄 Zero-Restart Handover Detected from Gist (handover epoch {_handover_epoch:.0f}).")
-                        
 
-                        # 0. Restore OTP Group Link & Button Name
+                        # 0. Restore Bot Settings
+                        saved_settings = parsed.get("bot_settings", {})
+                        if isinstance(saved_settings, dict):
+                            for sk, sv in saved_settings.items():
+                                set_bot_setting(str(sk), str(sv))
+                            logger.info(f"☁️ Restored {len(saved_settings)} bot settings from Gist.")
+
+                        # 0b. Restore OTP Group Link & Button Name
                         saved_group = parsed.get("otp_group_link")
                         if saved_group:
                             set_otp_group_link(str(saved_group).strip())
@@ -1127,15 +1865,16 @@ class GistStorage:
                                 if not uid:
                                     continue
                                 mconn.execute("""
-                                    INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, user_quantity, joined_at, last_seen)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                                     ON CONFLICT(user_id) DO UPDATE SET
                                         username = CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
                                         first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
                                         numbers_consumed = max(users.numbers_consumed, excluded.numbers_consumed),
                                         has_secret_access = excluded.has_secret_access,
                                         prefer_plus = excluded.prefer_plus,
-                                        is_admin = max(users.is_admin, excluded.is_admin);
+                                        is_admin = max(users.is_admin, excluded.is_admin),
+                                        user_quantity = excluded.user_quantity;
                                 """, (
                                     uid,
                                     u.get("username", ""),
@@ -1144,6 +1883,7 @@ class GistStorage:
                                     u.get("has_secret_access", 0),
                                     u.get("prefer_plus", 1),
                                     u.get("is_admin", 0),
+                                    u.get("user_quantity", 10),
                                     u.get("joined_at", datetime.now(timezone.utc).isoformat())
                                 ))
 
@@ -1364,8 +2104,8 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
     return InlineKeyboardMarkup(buttons)
 
-def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plus: bool = True) -> InlineKeyboardMarkup:
-    """Builds number result keyboard with dynamic '+' toggle button and OTP Group."""
+def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plus: bool = True, quantity: int = 10, is_fixed: bool = False) -> InlineKeyboardMarkup:
+    """Builds number result keyboard with dynamic '+' toggle button, quantity selector, and OTP Group."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
     sec_tag = "sec" if is_secret else "std"
@@ -1375,20 +2115,71 @@ def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plu
     else:
         toggle_btn = InlineKeyboardButton("➕ Add '+' Prefix", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
 
-    buttons = [
-        [toggle_btn],
-        [
-            InlineKeyboardButton("🔄 Get 10 More Numbers", callback_data=change_cb),
-            InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
-        ],
-    ]
+    btn_rows = [[toggle_btn]]
+
+    # If quantity is not fixed globally by admin, give user the button to change quantity (1-10)
+    if not is_fixed:
+        qty_btn = InlineKeyboardButton(f"🔢 Quantity: {quantity} (Change 1-10)", callback_data=f"user_qty_menu_{country_id}_{sec_tag}")
+        btn_rows.append([qty_btn])
+
+    btn_rows.append([
+        InlineKeyboardButton(f"🔄 Get {quantity} More Numbers", callback_data=change_cb),
+        InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
+    ])
 
     group_link = get_otp_group_link()
     if group_link:
-        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
+        btn_rows.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
 
-    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
-    return InlineKeyboardMarkup(buttons)
+    btn_rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
+    return InlineKeyboardMarkup(btn_rows)
+
+def get_user_quantity_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:
+    sec_tag = "sec" if is_secret else "std"
+    row1 = [InlineKeyboardButton(str(i), callback_data=f"user_set_qty_{country_id}_{sec_tag}_{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(str(i), callback_data=f"user_set_qty_{country_id}_{sec_tag}_{i}") for i in range(6, 11)]
+    back_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
+    return InlineKeyboardMarkup([
+        row1,
+        row2,
+        [InlineKeyboardButton("🔙 Back to Numbers", callback_data=back_cb)]
+    ])
+
+def get_admin_quantity_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Reset to Default (User Choice 1-10)", callback_data="admin_set_qty_default")],
+        [
+            InlineKeyboardButton("Fixed: 1", callback_data="admin_set_qty_fixed_1"),
+            InlineKeyboardButton("Fixed: 2", callback_data="admin_set_qty_fixed_2"),
+            InlineKeyboardButton("Fixed: 5", callback_data="admin_set_qty_fixed_5"),
+            InlineKeyboardButton("Fixed: 10", callback_data="admin_set_qty_fixed_10"),
+        ],
+        [InlineKeyboardButton("✏️ Type Custom Quantity (1–1000)", callback_data="admin_set_qty_prompt")],
+        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+    ])
+
+def get_admin_sms_keyboard() -> InlineKeyboardMarkup:
+    sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+    tw_on  = (get_bot_setting("api_thirdwave_enabled", "1") == "1")
+    aug_on = (get_bot_setting("api_augestel_enabled", "1") == "1")
+    ksi_on = (get_bot_setting("api_otpman2_enabled", "1") == "1")
+    view_mode = get_bot_setting("sms_view_mode", "default")
+    if view_mode == "default":
+        fmt_label = "📜 View Mode: Default (Expand Button)"
+    elif view_mode == "full":
+        fmt_label = "📄 View Mode: Fixed Always Full"
+    else:
+        fmt_label = "📦 View Mode: Fixed Short Only"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔔 Master Forwarding: {'✅ ON' if sms_on else '❌ OFF'}", callback_data="admin_toggle_sms_master")],
+        [InlineKeyboardButton(fmt_label, callback_data="admin_cycle_sms_mode")],
+        [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+        [InlineKeyboardButton(f"🌐 Thirdwave API: {'✅ Active' if tw_on else '❌ OFF'}", callback_data="admin_toggle_api_thirdwave")],
+        [InlineKeyboardButton(f"🌐 Augestel API: {'✅ Active' if aug_on else '❌ OFF'}", callback_data="admin_toggle_api_augestel")],
+        [InlineKeyboardButton(f"🌐 KSI / OTPMan2 API: {'✅ Active' if ksi_on else '❌ OFF'}", callback_data="admin_toggle_api_otpman2")],
+        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+    ])
 
 # ==========================================
 # 10. Command Handlers
@@ -1428,7 +2219,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif arg.startswith("c_"):
             try:
                 cid = int(arg.split("_")[1])
-                numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=10, is_secret=False)
+                limit, is_fixed = get_effective_quantity_for_user(user.id)
+                numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
                 if numbers:
                     pref_plus = get_user_plus_preference(user.id)
                     num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
@@ -1441,7 +2233,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📊 <b>Remaining in Stock:</b> <code>{remaining} numbers</code>\n"
                         f"🔒 <i>All {len(numbers)} numbers are reserved for you and removed from stock.</i>"
                     )
-                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus))
+                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed))
                     if gist_storage.enabled:
                         asyncio.create_task(gist_storage.export_and_sync())
                     return
@@ -1574,10 +2366,18 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         handover_info = "<code>Always-Online (Continuous)</code>"
 
+    current_bot_name = get_bot_name()
+    fixed_qty = get_admin_fixed_quantity()
+    qty_label = f"Fixed ({fixed_qty})" if fixed_qty else "Default (1–10)"
+    sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+
     admin_text = (
-        f"👑 <b>NUMBER BOTMAN — Admin Dashboard</b>\n"
+        f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Engine Status:</b> <code>100% Online & Delivering ✅</code>\n"
+        f"• <b>Bot Display Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+        f"• <b>Quantity Mode:</b> <code>{qty_label}</code> (/setquantity)\n"
+        f"• <b>SMS Forwarding:</b> <code>{'✅ Active' if sms_on else '❌ Disabled'}</code>\n"
         f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
         f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
@@ -1591,16 +2391,172 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
+        f"⚡ <i>Configure number quantity, linked OTP APIs, and bot display name below:</i>"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
+        [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
+        [InlineKeyboardButton("📡 Connected OTP Bots Status", callback_data="admin_otp_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
         [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
         [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
-        [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist")],
-        [InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
+        [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
+        [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist"), InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
     ])
     await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    new_name = " ".join(context.args).strip() if context.args else ""
+    if not new_name:
+        await update.message.reply_text(
+            "✏️ <b>Change Bot Name:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Usage: <code>/setname Your New Bot Name</code>\n"
+            "To reset to default: <code>/resetname</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/setname Number Hub VIP</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if len(new_name) > 64:
+        await update.message.reply_text("❌ Name must be 64 characters or fewer.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        await context.bot.set_my_name(name=new_name)
+    except Exception as e:
+        logger.warning(f"Could not set Telegram bot name: {e}")
+
+    set_bot_name(new_name)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    await update.message.reply_text(
+        f"✅ <b>Bot Name Successfully Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>\n"
+        f"• <b>Telegram API:</b> <code>Applied Officially ✅</code>\n"
+        f"• <b>Database:</b> <code>Saved & Synced 🔒</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def resetname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        await context.bot.set_my_name(name=DEFAULT_BOT_NAME)
+    except Exception as e:
+        logger.warning(f"Could not reset Telegram bot name: {e}")
+
+    set_bot_name(DEFAULT_BOT_NAME)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    await update.message.reply_text(
+        f"✅ <b>Bot Name Reset to Default!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Active Name:</b> <code>{DEFAULT_BOT_NAME}</code>\n"
+        f"• <b>Database:</b> <code>Reset & Synced 🔒</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def setquantity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    arg = context.args[0].strip().lower() if context.args else ""
+    if not arg:
+        current_fixed = get_admin_fixed_quantity()
+        curr_str = f"Fixed to {current_fixed} numbers" if current_fixed else "Default (Users choose 1–10)"
+        await update.message.reply_text(
+            f"⚙️ <b>Number Quantity Distribution Control:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Setting:</b> <code>{curr_str}</code>\n\n"
+            f"<b>Usage:</b>\n"
+            f"• <code>/setquantity &lt;1-1000&gt;</code> — Fix quantity for all users (e.g. <code>/setquantity 2</code>)\n"
+            f"• <code>/setquantity default</code> — Reset to default mode (users select 1–10)",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if arg == "default":
+        set_admin_fixed_quantity("default")
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            "✅ <b>Quantity Mode Reset to Default!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Users can now select or type their desired quantity between <b>1 and 10</b>.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if arg.isdigit() and 1 <= int(arg) <= 1000:
+        val = int(arg)
+        set_admin_fixed_quantity(str(val))
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>Fixed Quantity Applied Globally!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Fixed Count:</b> <code>{val} numbers</code>\n"
+            f"• <b>Rule:</b> All users will now receive exactly <code>{val}</code> numbers when choosing a country.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    await update.message.reply_text("❌ Quantity must be between <code>1</code> and <code>1000</code>, or <code>default</code>.", parse_mode=ParseMode.HTML)
+
+async def user_quantity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    register_user(user.id, user.username, user.first_name)
+
+    fixed = get_admin_fixed_quantity()
+    if fixed is not None:
+        await update.message.reply_text(
+            f"ℹ️ <b>Quantity is currently fixed by Admin.</b>\n"
+            f"All requests will automatically receive <b>{fixed} numbers</b>.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    arg = context.args[0].strip() if context.args else ""
+    if not arg or not arg.isdigit() or not (1 <= int(arg) <= 10):
+        curr = get_user_quantity_preference(user.id)
+        await update.message.reply_text(
+            f"🔢 <b>Set Desired Number Quantity:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Your Current Setting:</b> <code>{curr} numbers</code>\n\n"
+            f"<b>Usage:</b>\n"
+            f"<code>/quantity &lt;1-10&gt;</code> or <code>/qty &lt;1-10&gt;</code>\n\n"
+            f"<b>Example:</b>\n"
+            f"<code>/qty 2</code> (Receive 2 numbers at once)\n"
+            f"<code>/qty 5</code> (Receive 5 numbers at once)",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    val = int(arg)
+    set_user_quantity_preference(user.id, val)
+    await update.message.reply_text(
+        f"✅ <b>Number Quantity Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"You will now receive <b>{val} numbers</b> per request.\n"
+        f"Use <code>/getnumber</code> to choose a country!",
+        parse_mode=ParseMode.HTML
+    )
 
 async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2118,13 +3074,100 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text.strip()
-    if not user or not is_user_authorized(user.id) or not text:
+    text = update.message.text.strip() if (update.message and update.message.text) else ""
+    if not user or not text:
+        return
+
+    # 1. Check if user is setting their quantity
+    user_state = USER_STATES.get(user.id)
+    if user_state and user_state.get("awaiting_user_quantity"):
+        del USER_STATES[user.id]
+        if text.isdigit() and 1 <= int(text) <= 10:
+            q = int(text)
+            set_user_quantity_preference(user.id, q)
+            await update.message.reply_text(
+                f"✅ <b>Number Quantity Set to {q}!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"You will now receive <b>{q} numbers</b> per request.\n"
+                f"Use <code>/getnumber</code> to request numbers!",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        else:
+            await update.message.reply_text("❌ Please enter a valid number between <b>1 and 10</b>.", parse_mode=ParseMode.HTML)
+            return
+
+    if not is_user_authorized(user.id):
         return
 
     admin_state = ADMIN_STATES.get(user.id)
     if not admin_state:
         return
+
+    if admin_state.get("awaiting_bot_name"):
+        del ADMIN_STATES[user.id]
+        new_name = text if text.lower() != "default" else DEFAULT_BOT_NAME
+        try:
+            await context.bot.set_my_name(name=new_name)
+        except Exception as e:
+            logger.warning(f"Could not set Telegram bot name: {e}")
+        set_bot_name(new_name)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>Bot Display Name Saved!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 <b>Active Name:</b> <code>{html.escape(new_name)}</code>\n"
+            f"• <b>Telegram API:</b> <code>Applied Officially ✅</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+        return
+
+    if admin_state.get("awaiting_fixed_quantity"):
+        del ADMIN_STATES[user.id]
+        if text.lower() == "default":
+            set_admin_fixed_quantity("default")
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await update.message.reply_text(
+                "✅ <b>Quantity Mode Reset to Default!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Users can now select or type their desired quantity between <b>1 and 10</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+        elif text.isdigit() and 1 <= int(text) <= 1000:
+            val = int(text)
+            set_admin_fixed_quantity(str(val))
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            await update.message.reply_text(
+                f"✅ <b>Fixed Quantity Applied Globally!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Fixed Count:</b> <code>{val} numbers</code>\n"
+                f"• <b>Rule:</b> All users will receive exactly <code>{val}</code> numbers automatically.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+        else:
+            await update.message.reply_text(
+                "❌ Quantity must be between <code>1</code> and <code>1000</code>, or send <code>default</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
 
     if admin_state.get("awaiting_otp_group_name"):
         del ADMIN_STATES[user.id]
@@ -2355,11 +3398,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 3. Deliver Standard Numbers
     elif (data.startswith("c_") and not data.startswith("change_num_") and not data.startswith("cancel_")) or data.startswith("change_num_"):
         country_id = int(data.split("_")[1]) if data.startswith("c_") else int(data.split("_")[2])
+        limit, is_fixed = get_effective_quantity_for_user(user.id)
 
         numbers, remaining_count, country_name = consume_numbers_for_user(
             country_id=country_id,
             user_id=user.id,
-            limit=10,
+            limit=limit,
             is_secret=False
         )
 
@@ -2398,7 +3442,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
         )
 
     # 3b. Deliver Secret Numbers
@@ -2408,11 +3452,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         country_id = int(data.split("_")[2]) if data.startswith("sec_c_") else int(data.split("_")[3])
+        limit, is_fixed = get_effective_quantity_for_user(user.id)
 
         numbers, remaining_count, country_name = consume_numbers_for_user(
             country_id=country_id,
             user_id=user.id,
-            limit=10,
+            limit=limit,
             is_secret=True
         )
 
@@ -2451,7 +3496,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
         )
 
     # 3c. Interactive Instant '+' Toggle for Delivered Numbers
@@ -2464,6 +3509,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Update user's persistent preference
         set_user_plus_preference(user.id, target_plus)
+        limit, is_fixed = get_effective_quantity_for_user(user.id)
 
         current_text = query.message.text_html or query.message.text or ""
 
@@ -2492,10 +3538,123 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 new_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus)
+                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus, quantity=limit, is_fixed=is_fixed)
             )
         except Exception as e:
             logger.debug(f"Toggle plus message update notice: {e}")
+
+    # 3d. User Quantity Selection Menu
+    elif data.startswith("user_qty_menu_"):
+        parts = data.split("_")
+        country_id = int(parts[3])
+        is_secret = (parts[4] == "sec")
+        await query.edit_message_text(
+            "🔢 <b>Choose Number Quantity (1–10):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Select how many numbers you would like to receive at once:</i>\n"
+            "<i>(You can also type /quantity &lt;1-10&gt; in chat)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_user_quantity_keyboard(country_id, is_secret=is_secret)
+        )
+
+    # 3e. User Set Quantity & Deliver
+    elif data.startswith("user_set_qty_"):
+        parts = data.split("_")
+        country_id = int(parts[3])
+        is_secret = (parts[4] == "sec")
+        chosen_qty = int(parts[5])
+        set_user_quantity_preference(user.id, chosen_qty)
+
+        numbers, remaining_count, country_name = consume_numbers_for_user(
+            country_id=country_id,
+            user_id=user.id,
+            limit=chosen_qty,
+            is_secret=is_secret
+        )
+
+        if not numbers:
+            back_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
+            await query.edit_message_text(
+                f"⚠️ <b>No more numbers available in stock for {country_name}.</b>\n"
+                f"All available numbers have been consumed. Please select another country.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌍 Choose Another Country", callback_data=back_cb)],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+                ])
+            )
+            return
+
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        pref_plus = get_user_plus_preference(user.id)
+        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
+        numbers_formatted = "\n".join(num_lines)
+
+        group_link = get_otp_group_link()
+        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
+
+        title_prefix = "🔒 <b>Your SECRET Numbers" if is_secret else "📱 <b>Your Exclusive Numbers"
+        response_text = (
+            f"{title_prefix} — {country_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{numbers_formatted}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔒 <i>These {len(numbers)} numbers are reserved for you and removed from stock.</i>\n"
+            f"📊 <b>Remaining in Stock:</b> <code>{remaining_count}</code>\n"
+            f"💡 <b>Tap any number above to copy it instantly!</b>"
+            f"{group_notice}"
+        )
+        await query.edit_message_text(
+            response_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=pref_plus, quantity=chosen_qty, is_fixed=False)
+        )
+
+    # 3f. Expand Full Received SMS Text
+    elif data.startswith("view_full_sms_"):
+        sms_id = data.replace("view_full_sms_", "", 1)
+        with get_main_db() as conn:
+            row = conn.execute("SELECT number, full_text, raw_json FROM seen_sms_deliveries WHERE id = ? LIMIT 1;", (sms_id,)).fetchone()
+        if not row or not row["full_text"]:
+            await query.answer("ℹ️ Full message details are no longer cached.", show_alert=True)
+            return
+
+        raw_msg = row["full_text"]
+        try:
+            item = json.loads(row["raw_json"]) if row["raw_json"] else {"number": row["number"], "message": raw_msg}
+        except Exception:
+            item = {"number": row["number"], "message": raw_msg}
+
+        text, otp, markup = format_user_otp_notification(item, force_full=True, sms_id=sms_id)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            logger.debug(f"Error expanding full SMS: {e}")
+        await query.answer("📜 Full SMS revealed!")
+
+    # 3g. Collapse Full Received SMS Text
+    elif data.startswith("collapse_sms_"):
+        sms_id = data.replace("collapse_sms_", "", 1)
+        with get_main_db() as conn:
+            row = conn.execute("SELECT number, full_text, raw_json FROM seen_sms_deliveries WHERE id = ? LIMIT 1;", (sms_id,)).fetchone()
+        if not row:
+            await query.answer()
+            return
+
+        raw_msg = row["full_text"] or ""
+        try:
+            item = json.loads(row["raw_json"]) if row["raw_json"] else {"number": row["number"], "message": raw_msg}
+        except Exception:
+            item = {"number": row["number"], "message": raw_msg}
+
+        text, otp, markup = format_user_otp_notification(item, force_full=False, sms_id=sms_id)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception as e:
+            logger.debug(f"Error collapsing SMS: {e}")
+        await query.answer("📦 SMS collapsed!")
 
     # 3d. Main Menu Preference Switcher
     elif data == "btn_toggle_plus_pref":
@@ -2612,33 +3771,214 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 6. Admin Panel
     elif data == "admin_panel" and user_admin:
         stats = get_system_stats()
+        current_bot_name = get_bot_name()
+        fixed_qty = get_admin_fixed_quantity()
+        qty_label = f"Fixed ({fixed_qty})" if fixed_qty else "Default (1–10)"
+        sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+        view_mode = get_bot_setting("sms_view_mode", "default")
+        mode_label = "Default (Button 📜)" if view_mode == "default" else ("Fixed Full 📄" if view_mode == "full" else "Short 📦")
         curr_link = get_otp_group_link()
         curr_name = get_otp_group_name()
         link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
         admin_text = (
-            f"👑 <b>NUMBER BOTMAN — Admin Management Panel</b>\n"
+            f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Bot Display Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+            f"• <b>Quantity Mode:</b> <code>{qty_label}</code> (/setquantity)\n"
+            f"• <b>SMS Forwarding:</b> <code>{'✅ Active' if sms_on else '❌ Disabled'}</code>\n"
+            f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n"
+            f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>Real-time Live Inventory:</b>\n"
             f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
             f"• <b>Secret Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
-            f"• <b>Total Delivered:</b> <code>{stats['total_consumed']} numbers</code>\n"
+            f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
             f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
             f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
             f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
             f"• <b>OTP Group Link:</b> {link_display}\n"
-            f"• <b>Group Button Name:</b> <code>{curr_name}</code>\n"
-            f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Easily upload .txt numbers for users or secret pools:</i>"
+            f"⚡ <i>Configure number quantities, linked OTP APIs, and bot display name below:</i>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
+            [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
+            [InlineKeyboardButton("📡 Connected OTP Bots Status", callback_data="admin_otp_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
             [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
             [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
-            [InlineKeyboardButton(f"🔗 Set Group Link {'✅' if curr_link else '➕'}", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
+            [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
             [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist"), InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
         ])
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 6-a. Bot Display Name Prompt
+    elif data == "admin_set_name_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_bot_name": True}
+        curr = get_bot_name()
+        await query.edit_message_text(
+            f"✏️ <b>Change Bot Display Name</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Name:</b> <code>{curr}</code>\n\n"
+            f"Please send the new bot display name (1–64 characters) in chat.\n"
+            f"It will be updated on the Telegram Bot API and saved across reboots.\n\n"
+            f"💡 <i>Tip: Send <code>reset</code> or <code>default</code> to restore the default name.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            ])
+        )
+
+    # 6-b. Admin Quantity Management Menu
+    elif data == "admin_qty_menu" and user_admin:
+        fixed_qty = get_admin_fixed_quantity()
+        status_str = f"Fixed ({fixed_qty} numbers per issue)" if fixed_qty else "Default (User Choice 1–10)"
+        await query.edit_message_text(
+            f"🔢 <b>Number Distribution Quantity Control</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Policy:</b> <code>{status_str}</code>\n\n"
+            f"<b>How this works:</b>\n"
+            f"• <b>Fixed Quantity:</b> Users will directly receive this exact amount of numbers (1–1000) with no prompt.\n"
+            f"• <b>Default Mode:</b> Users can select or type their desired quantity between 1 and 10.\n\n"
+            f"Select a preset below or type a custom quantity (1–1000):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_quantity_keyboard()
+        )
+
+    elif data == "admin_set_qty_default" and user_admin:
+        set_admin_fixed_quantity("default")
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer("🔄 Number quantity reset to Default (User choice 1–10)!", show_alert=True)
+        await query.edit_message_text(
+            "🔢 <b>Number Distribution Quantity Control</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "• <b>Current Policy:</b> <code>Default (User Choice 1–10) ✅</code>\n\n"
+            "Users can now select or type their desired quantity (1–10).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_quantity_keyboard()
+        )
+
+    elif data.startswith("admin_set_qty_fixed_") and user_admin:
+        val = int(data.replace("admin_set_qty_fixed_", ""))
+        set_admin_fixed_quantity(val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer(f"✅ Fixed quantity set to {val} numbers!", show_alert=True)
+        await query.edit_message_text(
+            f"🔢 <b>Number Distribution Quantity Control</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Policy:</b> <code>Fixed ({val} numbers) ✅</code>\n\n"
+            f"All users will now receive exactly {val} number(s) on every request without being prompted.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_quantity_keyboard()
+        )
+
+    elif data == "admin_set_qty_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_fixed_quantity": True}
+        await query.edit_message_text(
+            "✏️ <b>Set Custom Fixed Number Quantity (1–1000)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Send an integer between <b>1 and 1000</b> in chat to fix the quantity globally.\n\n"
+            "💡 <i>Or send <code>default</code> to restore user choice (1–10).</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_qty_menu")]
+            ])
+        )
+
+    # 6-c. SMS Controls & Linked Provider APIs
+    elif data == "admin_sms_menu" and user_admin:
+        sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+        view_mode = get_bot_setting("sms_view_mode", "default")
+        mode_label = "Default (Button 📜)" if view_mode == "default" else ("Fixed Always Full 📄" if view_mode == "full" else "Fixed Short Only 📦")
+        await query.edit_message_text(
+            f"📡 <b>SMS Forwarding & Linked OTP APIs</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Master SMS Receiving:</b> <code>{'✅ Active (ON)' if sms_on else '❌ Disabled (OFF)'}</code>\n"
+            f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n\n"
+            f"<b>How this works:</b>\n"
+            f"When a user gets numbers from this bot, incoming OTP messages on those numbers are fetched from your linked OTP bots/APIs and forwarded directly to the user.\n\n"
+            f"Toggle the master switch, view format, or individual APIs below:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_sms_keyboard()
+        )
+
+    elif data == "admin_toggle_sms_master" and user_admin:
+        curr = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+        new_val = "0" if curr else "1"
+        set_bot_setting("sms_receiving_enabled", new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer(f"Master SMS Forwarding {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+
+    elif data == "admin_cycle_sms_mode" and user_admin:
+        curr = get_bot_setting("sms_view_mode", "default")
+        modes = ["default", "full", "short"]
+        next_idx = (modes.index(curr) + 1) % len(modes) if curr in modes else 0
+        new_mode = modes[next_idx]
+        set_bot_setting("sms_view_mode", new_mode)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        mode_label = "Default (Expand Button 📜)" if new_mode == "default" else ("Fixed Always Full 📄" if new_mode == "full" else "Fixed Short Only 📦")
+        await query.answer(f"SMS View Format: {mode_label}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+
+    elif data == "admin_toggle_api_thirdwave" and user_admin:
+        curr = (get_bot_setting("api_thirdwave_enabled", "1") == "1")
+        new_val = "0" if curr else "1"
+        set_bot_setting("api_thirdwave_enabled", new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer(f"Thirdwave API {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+
+    elif data == "admin_toggle_api_augestel" and user_admin:
+        curr = (get_bot_setting("api_augestel_enabled", "1") == "1")
+        new_val = "0" if curr else "1"
+        set_bot_setting("api_augestel_enabled", new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer(f"Augestel API {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+
+    elif data == "admin_toggle_api_otpman2" and user_admin:
+        curr = (get_bot_setting("api_otpman2_enabled", "1") == "1")
+        new_val = "0" if curr else "1"
+        set_bot_setting("api_otpman2_enabled", new_val)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer(f"KSI / OTPMan2 API {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
+        except Exception:
+            pass
+
+    # 6-d. Connected OTP Bots Status Diagnostic Check
+    elif (data == "admin_otp_status" or data == "admin_otp_status_refresh") and user_admin:
+        await query.answer("⏳ Pinging connected OTP APIs...")
+        status_data = await check_all_connected_apis_status()
+        report_text = format_api_status_report(status_data)
+        try:
+            await query.edit_message_text(
+                report_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_admin_api_status_keyboard()
+            )
+        except Exception as e:
+            logger.debug(f"API status edit notice: {e}")
 
     # 6a. Admin Management Submenu
     elif data == "admin_manage_admins" and user_admin:
@@ -3478,6 +4818,12 @@ def main():
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
     app.add_handler(CommandHandler("user", user_lookup_command))
     app.add_handler(CommandHandler("users", admin_command))
+    app.add_handler(CommandHandler("setname", setname_command))
+    app.add_handler(CommandHandler("resetname", resetname_command))
+    app.add_handler(CommandHandler("quantity", user_quantity_command))
+    app.add_handler(CommandHandler("qty", user_quantity_command))
+    app.add_handler(CommandHandler("setquantity", setquantity_command))
+    app.add_handler(CommandHandler("setqty", setquantity_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
@@ -3488,7 +4834,8 @@ def main():
             # 1. Default user commands
             user_commands = [
                 BotCommand("start", "🚀 Start bot & open main menu"),
-                BotCommand("getnumber", "📱 Get 10 numbers by country"),
+                BotCommand("getnumber", "📱 Get numbers by country"),
+                BotCommand("quantity", "🔢 Set quantity preference (1–10)"),
                 BotCommand("inventory", "📊 View live number stock"),
                 BotCommand("help", "ℹ️ How to use the bot"),
                 BotCommand("stats", "📈 View live statistics"),
@@ -3503,6 +4850,9 @@ def main():
                 BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
                 BotCommand("status", "⚡ Live Zero-Restart Status"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
+                BotCommand("setquantity", "🔢 Set fixed quantity (1–1000)"),
+                BotCommand("setname", "✏️ Change bot display name"),
+                BotCommand("resetname", "🔄 Reset bot display name"),
                 BotCommand("admins", "👥 View Active Administrators"),
                 BotCommand("addadmin", "➕ Promote user to Admin"),
                 BotCommand("removeadmin", "🗑️ Demote Admin to user"),
@@ -3579,6 +4929,9 @@ def main():
                 logger.warning(f"Gist startup sync notice: {e}")
         await setup_bot_commands(application)
         await send_startup_announcement(application)
+
+        # Launch Live Multi-API SMS Polling Engine
+        asyncio.create_task(sms_polling_worker(application))
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))

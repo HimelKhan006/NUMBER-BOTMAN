@@ -351,6 +351,21 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_sms_deliv ON seen_sms_deliveries(delivered_at);")
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_otps (
+                id TEXT PRIMARY KEY,
+                provider TEXT,
+                country TEXT,
+                number TEXT,
+                otp_code TEXT,
+                raw_message TEXT,
+                user_id INTEGER,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_user ON processed_otps(user_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_time ON processed_otps(received_at);")
+
         try:
             conn.execute("ALTER TABLE seen_sms_deliveries ADD COLUMN full_text TEXT;")
         except Exception:
@@ -560,17 +575,88 @@ def set_user_secret_access(user_id: int, granted: bool) -> bool:
         logger.error(f"Error setting secret access for {user_id}: {e}")
         return False
 
-def delete_user(user_id: int) -> bool:
-    """Permanently removes a user and their delivery log entries from the main database."""
+class UserDeletionResult(dict):
+    """Detailed summary of a user permanent purge that evaluates to True if user was found/deleted."""
+    def __bool__(self) -> bool:
+        return bool(self.get("deleted_user", False)) or bool(self.get("user_existed", False))
+
+def delete_user(user_id: int) -> UserDeletionResult:
+    """Permanently purges a user and ALL their data across main DB, active numbers, OTP history, and country stocks."""
+    result = UserDeletionResult({
+        "user_id": user_id,
+        "user_existed": False,
+        "deleted_user": False,
+        "deleted_active_numbers": 0,
+        "deleted_processed_otps": 0,
+        "deleted_sms_deliveries": 0,
+        "deleted_delivery_logs": 0,
+        "deleted_stock_logs": 0,
+        "was_admin": False,
+    })
     try:
         with get_main_db() as conn:
-            conn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (user_id,))
-            conn.execute("DELETE FROM users WHERE user_id = ?;", (user_id,))
+            u_check = conn.execute("SELECT 1 FROM users WHERE user_id = ? LIMIT 1;", (user_id,)).fetchone()
+            if u_check:
+                result["user_existed"] = True
+
+            # 1. Clear active assigned numbers for this user
+            cur = conn.execute("DELETE FROM active_user_numbers WHERE user_id = ?;", (user_id,))
+            result["deleted_active_numbers"] = cur.rowcount
+
+            # 2. Clear processed OTP history for this user
+            try:
+                cur = conn.execute("DELETE FROM processed_otps WHERE user_id = ?;", (user_id,))
+                result["deleted_processed_otps"] = cur.rowcount
+            except Exception:
+                pass
+
+            # 3. Clear seen SMS deliveries for this user
+            try:
+                cur = conn.execute("DELETE FROM seen_sms_deliveries WHERE user_id = ?;", (user_id,))
+                result["deleted_sms_deliveries"] = cur.rowcount
+            except Exception:
+                pass
+
+            # 4. Clear delivery log entries
+            cur = conn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (user_id,))
+            result["deleted_delivery_logs"] = cur.rowcount
+
+            # 5. Clear bot_admins if promoted
+            cur = conn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (user_id,))
+            if cur.rowcount > 0:
+                result["was_admin"] = True
+
+            # 6. Delete user account record
+            cur = conn.execute("DELETE FROM users WHERE user_id = ?;", (user_id,))
+            result["deleted_user"] = (cur.rowcount > 0)
+
             conn.commit()
-            return True
+
+        # 7. Purge user records across all per-country stock databases
+        if os.path.exists(STOCKS_DIR):
+            for fname in os.listdir(STOCKS_DIR):
+                if fname.startswith("country_") and fname.endswith(".db"):
+                    c_path = os.path.join(STOCKS_DIR, fname)
+                    try:
+                        with sqlite3.connect(c_path, timeout=10.0) as cconn:
+                            c_cur = cconn.execute("DELETE FROM used_numbers WHERE user_id = ?;", (user_id,))
+                            result["deleted_stock_logs"] += max(0, c_cur.rowcount)
+                            cconn.commit()
+                    except Exception as ce:
+                        logger.debug(f"Error purging user {user_id} in {fname}: {ce}")
+
+        # 8. Purge in-memory state
+        if user_id in ADMIN_USER_IDS:
+            ADMIN_USER_IDS.discard(user_id)
+            set_bot_setting("admin_ids", ",".join(map(str, sorted(ADMIN_USER_IDS))))
+        ADMIN_STATES.pop(user_id, None)
+        USER_STATES.pop(user_id, None)
+
+        logger.info(f"🗑️ User {user_id} permanently purged: {dict(result)}")
+        return result
     except Exception as e:
         logger.error(f"Error deleting user {user_id}: {e}")
-        return False
+        return result
 
 def get_all_users_detailed(limit: int = 10, offset: int = 0, search: str = "") -> Tuple[List[Dict[str, Any]], int]:
     with get_main_db() as conn:
@@ -1116,6 +1202,48 @@ def get_effective_quantity_for_user(user_id: int) -> Tuple[int, bool]:
     user_pref = get_user_quantity_preference(user_id)
     return user_pref, False
 
+def get_thirdwave_config() -> Tuple[str, str]:
+    key = get_bot_setting("api_thirdwave_key", THIRDWAVE_API_KEY).strip()
+    url = get_bot_setting("api_thirdwave_url", THIRDWAVE_BASE_URL).strip().rstrip("/")
+    return key, url
+
+def set_thirdwave_config(key: Optional[str] = None, url: Optional[str] = None) -> bool:
+    if key is not None:
+        set_bot_setting("api_thirdwave_key", key.strip())
+    if url is not None:
+        clean_url = url.strip().rstrip("/")
+        if clean_url:
+            set_bot_setting("api_thirdwave_url", clean_url)
+    return True
+
+def get_augestel_config() -> Tuple[str, str]:
+    key = get_bot_setting("api_augestel_key", OTPMAN_API_KEY).strip()
+    url = get_bot_setting("api_augestel_url", OTPMAN_BASE_URL).strip().rstrip("/")
+    return key, url
+
+def set_augestel_config(key: Optional[str] = None, url: Optional[str] = None) -> bool:
+    if key is not None:
+        set_bot_setting("api_augestel_key", key.strip())
+    if url is not None:
+        clean_url = url.strip().rstrip("/")
+        if clean_url:
+            set_bot_setting("api_augestel_url", clean_url)
+    return True
+
+def get_otpman2_config() -> Tuple[str, str]:
+    key = get_bot_setting("api_otpman2_key", OTPMAN2_API_KEY).strip()
+    url = get_bot_setting("api_otpman2_url", OTPMAN2_BASE_URL).strip().rstrip("/")
+    return key, url
+
+def set_otpman2_config(key: Optional[str] = None, url: Optional[str] = None) -> bool:
+    if key is not None:
+        set_bot_setting("api_otpman2_key", key.strip())
+    if url is not None:
+        clean_url = url.strip().rstrip("/")
+        if clean_url:
+            set_bot_setting("api_otpman2_url", clean_url)
+    return True
+
 # ==========================================
 # 5c. Active Number Tracking & Direct SMS Delivery
 # ==========================================
@@ -1404,6 +1532,7 @@ def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", f
 # 5e. Multi-Provider API Engine & Live Polling
 # ==========================================
 SEEN_SMS_CACHE: Set[str] = set()
+SEEN_SMS_TIMESTAMPS: Dict[str, float] = {}
 
 def is_sms_processed(sms_id: str) -> bool:
     if not sms_id:
@@ -1415,6 +1544,7 @@ def is_sms_processed(sms_id: str) -> bool:
             row = conn.execute("SELECT 1 FROM seen_sms_deliveries WHERE id = ? LIMIT 1;", (sms_id,)).fetchone()
             if row:
                 SEEN_SMS_CACHE.add(sms_id)
+                SEEN_SMS_TIMESTAMPS[sms_id] = time.time()
                 return True
     except Exception:
         pass
@@ -1424,6 +1554,7 @@ def mark_sms_processed(sms_id: str, number: str = "", user_id: int = 0, full_tex
     if not sms_id:
         return
     SEEN_SMS_CACHE.add(sms_id)
+    SEEN_SMS_TIMESTAMPS[sms_id] = time.time()
     try:
         with get_main_db() as conn:
             conn.execute("""
@@ -1439,14 +1570,99 @@ def mark_sms_processed(sms_id: str, number: str = "", user_id: int = 0, full_tex
     except Exception as e:
         logger.debug(f"Error marking sms processed: {e}")
 
+def record_processed_otp(
+    sms_id: str,
+    provider: str,
+    country: str,
+    number: str,
+    otp_code: str,
+    raw_message: str,
+    user_id: int = 0
+):
+    """Persistently logs received OTP into processed_otps table like OTP bots."""
+    if not sms_id:
+        return
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO processed_otps
+                    (id, provider, country, number, otp_code, raw_message, user_id, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+            """, (sms_id, provider, country, number, otp_code, raw_message, user_id))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"DB save error for processed OTP: {e}")
+
+def cleanup_28h_otp_records():
+    """Purges OTP messages and seen deliveries older than 28 hours (like OTP bots)."""
+    try:
+        with get_main_db() as conn:
+            c1 = conn.execute("DELETE FROM processed_otps WHERE received_at < datetime('now', '-28 hours');")
+            c2 = conn.execute("DELETE FROM seen_sms_deliveries WHERE delivered_at < datetime('now', '-28 hours');")
+            conn.commit()
+            logger.info(f"🧹 Pruned 28h history: {c1.rowcount} OTP records, {c2.rowcount} SMS delivery records.")
+    except Exception as e:
+        logger.warning(f"Error running 28h OTP database cleanup: {e}")
+
+async def periodic_db_cleanup_loop():
+    """Periodic background maintenance loop running every 30m to enforce 28h retention like OTP bots."""
+    while True:
+        await asyncio.sleep(1800)  # every 30m
+        try:
+            cleanup_28h_otp_records()
+            cutoff = time.time() - (28 * 3600)
+            stale_keys = [k for k, v in SEEN_SMS_TIMESTAMPS.items() if v < cutoff]
+            for k in stale_keys:
+                SEEN_SMS_TIMESTAMPS.pop(k, None)
+                SEEN_SMS_CACHE.discard(k)
+        except Exception as e:
+            logger.warning(f"Periodic 28h cleanup error: {e}")
+
+async def ping_provider_test(key: str, url: str, provider: str) -> Tuple[bool, str]:
+    """Instantly pings a provider endpoint to test authentication, reachability, and latency."""
+    clean_key = (key or "").strip()
+    clean_url = (url or "").rstrip("/")
+    if not clean_key or not clean_url:
+        return False, "❌ API Key or Base URL is missing."
+
+    prov = provider.lower()
+    endpoint = f"{clean_url}/api/v1/traffic" if prov in ("thirdwave", "tw") else f"{clean_url}/api/v1/iprn/messages"
+    params = {"page": 1, "pageSize": 1} if prov in ("thirdwave", "tw") else {"per_page": 1}
+
+    try:
+        t0 = time.time()
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {clean_key}", "Accept": "application/json"},
+                params=params
+            )
+            elapsed = int((time.time() - t0) * 1000)
+            if res.is_success:
+                return True, f"✅ Connected successfully (HTTP 200 OK, {elapsed}ms)!"
+            elif res.status_code in (401, 403):
+                return False, f"❌ Unauthorized (HTTP {res.status_code}, {elapsed}ms) - Invalid API Key."
+            elif res.status_code == 404:
+                return False, f"❌ Not Found (HTTP 404, {elapsed}ms) - Invalid Base URL."
+            else:
+                return False, f"⚠️ HTTP {res.status_code} ({elapsed}ms): {res.text[:80]}"
+    except httpx.ConnectTimeout:
+        return False, "❌ Connection timed out after 8s."
+    except httpx.ConnectError:
+        return False, "❌ Failed to connect (hostname/network unreachable)."
+    except Exception as e:
+        return False, f"❌ Ping error: {type(e).__name__} ({e})"
+
+
 async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
-    if not THIRDWAVE_API_KEY:
+    key, url = get_thirdwave_config()
+    if not key:
         return []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(
-                f"{THIRDWAVE_BASE_URL}/api/v1/traffic",
-                headers={"Authorization": f"Bearer {THIRDWAVE_API_KEY}", "Accept": "application/json"},
+                f"{url}/api/v1/traffic",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
                 params={"page": 1, "pageSize": 50}
             )
             if res.is_success:
@@ -1458,14 +1674,15 @@ async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
     return []
 
 async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
-    if not OTPMAN_API_KEY:
+    key, url = get_augestel_config()
+    if not key:
         return []
     try:
         start_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(
-                f"{OTPMAN_BASE_URL}/api/v1/iprn/messages",
-                headers={"Authorization": f"Bearer {OTPMAN_API_KEY}", "Accept": "application/json"},
+                f"{url}/api/v1/iprn/messages",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
                 params={"per_page": 100, "start_date": start_date}
             )
             if res.is_success:
@@ -1481,15 +1698,16 @@ async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
     return []
 
 async def fetch_otpman2_incoming() -> List[Dict[str, Any]]:
-    if not OTPMAN2_API_KEY:
+    key, url = get_otpman2_config()
+    if not key:
         return []
     try:
         now = datetime.now(timezone.utc)
         start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(
-                f"{OTPMAN2_BASE_URL}/api/v1/iprn/messages",
-                headers={"Authorization": f"Bearer {OTPMAN2_API_KEY}", "Accept": "application/json"},
+                f"{url}/api/v1/iprn/messages",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
                 params={"per_page": 100, "start_date": start_date}
             )
             if res.is_success:
@@ -1518,12 +1736,16 @@ async def sms_polling_worker(application: Application):
                 await asyncio.sleep(8.0)
                 continue
 
+            tw_key, _ = get_thirdwave_config()
+            aug_key, _ = get_augestel_config()
+            ksi_key, _ = get_otpman2_config()
+
             tasks = []
-            if get_bot_setting("api_thirdwave_enabled", "1") == "1" and THIRDWAVE_API_KEY:
+            if get_bot_setting("api_thirdwave_enabled", "1") == "1" and tw_key:
                 tasks.append(("Thirdwave", fetch_thirdwave_incoming()))
-            if get_bot_setting("api_augestel_enabled", "1") == "1" and OTPMAN_API_KEY:
+            if get_bot_setting("api_augestel_enabled", "1") == "1" and aug_key:
                 tasks.append(("Augestel", fetch_augestel_incoming()))
-            if get_bot_setting("api_otpman2_enabled", "1") == "1" and OTPMAN2_API_KEY:
+            if get_bot_setting("api_otpman2_enabled", "1") == "1" and ksi_key:
                 tasks.append(("OTPMan2", fetch_otpman2_incoming()))
 
             for provider_name, coro in tasks:
@@ -1548,8 +1770,26 @@ async def sms_polling_worker(application: Application):
                             if sent:
                                 logger.info(f"📨 Live OTP forwarded to user {user_id} for number {raw_num} ({provider_name})")
                                 mark_sms_processed(sms_id, number=raw_num, user_id=user_id, full_text=raw_msg, raw_json=item_json)
+                                record_processed_otp(
+                                    sms_id=sms_id,
+                                    provider=provider_name,
+                                    country=c_hint,
+                                    number=raw_num,
+                                    otp_code=otp or "",
+                                    raw_message=raw_msg,
+                                    user_id=user_id
+                                )
                         else:
                             mark_sms_processed(sms_id, number=raw_num, user_id=0, full_text=raw_msg, raw_json=item_json)
+                            record_processed_otp(
+                                sms_id=sms_id,
+                                provider=provider_name,
+                                country="",
+                                number=raw_num,
+                                otp_code="",
+                                raw_message=raw_msg,
+                                user_id=0
+                            )
                 except Exception as pe:
                     logger.debug(f"Provider {provider_name} cycle notice: {pe}")
 
@@ -1563,73 +1803,76 @@ async def check_all_connected_apis_status() -> Dict[str, Any]:
     results = {}
 
     # 1. Thirdwave
+    tw_key, tw_url = get_thirdwave_config()
     tw_enabled = (get_bot_setting("api_thirdwave_enabled", "1") == "1")
-    if not THIRDWAVE_API_KEY:
-        results["thirdwave"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": tw_enabled, "url": THIRDWAVE_BASE_URL}
+    if not tw_key:
+        results["thirdwave"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": tw_enabled, "url": tw_url}
     elif not tw_enabled:
-        results["thirdwave"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": THIRDWAVE_BASE_URL}
+        results["thirdwave"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": tw_url}
     else:
         try:
             t0 = time.time()
             async with httpx.AsyncClient(timeout=6.0) as client:
                 res = await client.get(
-                    f"{THIRDWAVE_BASE_URL}/api/v1/traffic",
-                    headers={"Authorization": f"Bearer {THIRDWAVE_API_KEY}", "Accept": "application/json"},
+                    f"{tw_url}/api/v1/traffic",
+                    headers={"Authorization": f"Bearer {tw_key}", "Accept": "application/json"},
                     params={"page": 1, "pageSize": 1}
                 )
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
-                    results["thirdwave"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": THIRDWAVE_BASE_URL, "key": f"••••{THIRDWAVE_API_KEY[-4:]}"}
+                    results["thirdwave"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": tw_url, "key": f"••••{tw_key[-4:]}"}
                 else:
-                    results["thirdwave"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": THIRDWAVE_BASE_URL}
+                    results["thirdwave"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": tw_url}
         except Exception as e:
-            results["thirdwave"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": THIRDWAVE_BASE_URL}
+            results["thirdwave"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": tw_url}
 
     # 2. Augestel / OTPMan
+    aug_key, aug_url = get_augestel_config()
     aug_enabled = (get_bot_setting("api_augestel_enabled", "1") == "1")
-    if not OTPMAN_API_KEY:
-        results["augestel"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": aug_enabled, "url": OTPMAN_BASE_URL}
+    if not aug_key:
+        results["augestel"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": aug_enabled, "url": aug_url}
     elif not aug_enabled:
-        results["augestel"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": OTPMAN_BASE_URL}
+        results["augestel"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": aug_url}
     else:
         try:
             t0 = time.time()
             async with httpx.AsyncClient(timeout=6.0) as client:
                 res = await client.get(
-                    f"{OTPMAN_BASE_URL}/api/v1/iprn/messages",
-                    headers={"Authorization": f"Bearer {OTPMAN_API_KEY}", "Accept": "application/json"},
+                    f"{aug_url}/api/v1/iprn/messages",
+                    headers={"Authorization": f"Bearer {aug_key}", "Accept": "application/json"},
                     params={"per_page": 1}
                 )
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
-                    results["augestel"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": OTPMAN_BASE_URL, "key": f"••••{OTPMAN_API_KEY[-4:]}"}
+                    results["augestel"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": aug_url, "key": f"••••{aug_key[-4:]}"}
                 else:
-                    results["augestel"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": OTPMAN_BASE_URL}
+                    results["augestel"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": aug_url}
         except Exception as e:
-            results["augestel"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": OTPMAN_BASE_URL}
+            results["augestel"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": aug_url}
 
     # 3. KSI / OTPMan2
+    ksi_key, ksi_url = get_otpman2_config()
     ksi_enabled = (get_bot_setting("api_otpman2_enabled", "1") == "1")
-    if not OTPMAN2_API_KEY:
-        results["otpman2"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": ksi_enabled, "url": OTPMAN2_BASE_URL}
+    if not ksi_key:
+        results["otpman2"] = {"status": "⚠️ Not Configured (API Key Missing)", "ok": False, "enabled": ksi_enabled, "url": ksi_url}
     elif not ksi_enabled:
-        results["otpman2"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": OTPMAN2_BASE_URL}
+        results["otpman2"] = {"status": "⏸️ Disabled by Admin", "ok": True, "enabled": False, "url": ksi_url}
     else:
         try:
             t0 = time.time()
             async with httpx.AsyncClient(timeout=6.0) as client:
                 res = await client.get(
-                    f"{OTPMAN2_BASE_URL}/api/v1/iprn/messages",
-                    headers={"Authorization": f"Bearer {OTPMAN2_API_KEY}", "Accept": "application/json"},
+                    f"{ksi_url}/api/v1/iprn/messages",
+                    headers={"Authorization": f"Bearer {ksi_key}", "Accept": "application/json"},
                     params={"per_page": 1}
                 )
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
-                    results["otpman2"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": OTPMAN2_BASE_URL, "key": f"••••{OTPMAN2_API_KEY[-4:]}"}
+                    results["otpman2"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": ksi_url, "key": f"••••{ksi_key[-4:]}"}
                 else:
-                    results["otpman2"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": OTPMAN2_BASE_URL}
+                    results["otpman2"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": ksi_url}
         except Exception as e:
-            results["otpman2"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": OTPMAN2_BASE_URL}
+            results["otpman2"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": ksi_url}
 
     with get_main_db() as conn:
         active_numbers_count = conn.execute("SELECT COUNT(DISTINCT user_id) FROM active_user_numbers;").fetchone()[0]
@@ -2174,11 +2417,29 @@ def get_admin_sms_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔔 Master Forwarding: {'✅ ON' if sms_on else '❌ OFF'}", callback_data="admin_toggle_sms_master")],
         [InlineKeyboardButton(fmt_label, callback_data="admin_cycle_sms_mode")],
+        [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
         [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
         [InlineKeyboardButton(f"🌐 Thirdwave API: {'✅ Active' if tw_on else '❌ OFF'}", callback_data="admin_toggle_api_thirdwave")],
         [InlineKeyboardButton(f"🌐 Augestel API: {'✅ Active' if aug_on else '❌ OFF'}", callback_data="admin_toggle_api_augestel")],
         [InlineKeyboardButton(f"🌐 KSI / OTPMan2 API: {'✅ Active' if ksi_on else '❌ OFF'}", callback_data="admin_toggle_api_otpman2")],
         [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+    ])
+
+def get_admin_setup_apis_keyboard() -> InlineKeyboardMarkup:
+    tw_key, tw_url = get_thirdwave_config()
+    aug_key, aug_url = get_augestel_config()
+    ksi_key, ksi_url = get_otpman2_config()
+
+    tw_mask = f"••••{tw_key[-4:]}" if tw_key else "Not Set ❌"
+    aug_mask = f"••••{aug_key[-4:]}" if aug_key else "Not Set ❌"
+    ksi_mask = f"••••{ksi_key[-4:]}" if ksi_key else "Not Set ❌"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🌐 1. Thirdwave ({tw_mask})", callback_data="admin_setup_tw_prompt")],
+        [InlineKeyboardButton(f"🌐 2. Augestel ({aug_mask})", callback_data="admin_setup_aug_prompt")],
+        [InlineKeyboardButton(f"🌐 3. KSI / OTPMan2 ({ksi_mask})", callback_data="admin_setup_ksi_prompt")],
+        [InlineKeyboardButton("📡 Ping & Verify Connections", callback_data="admin_otp_status")],
+        [InlineKeyboardButton("🔙 Back to SMS Controls", callback_data="admin_sms_menu")]
     ])
 
 # ==========================================
@@ -2922,8 +3183,317 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await grantsecret_command(update, context)
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alias for /revokesecret — revokes access from secret numbers pool."""
-    await revokesecret_command(update, context)
+    """Permanently purges a user and all their records from the bot, main DB, country stocks, and Gist."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> <code>/removeuser <user_id></code>\n\n"
+            "This will permanently delete the user, their active assigned numbers, delivery logs, OTP history, and country stock logs.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_str = context.args[0].strip()
+    if not target_str.isdigit():
+        await update.message.reply_text("❌ <b>Error:</b> Please provide a valid numeric User ID.", parse_mode=ParseMode.HTML)
+        return
+
+    target_id = int(target_str)
+    u = get_user_details(target_id)
+    uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
+
+    res = delete_user(target_id)
+    if res and gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    if res:
+        text = (
+            f"✅ <b>User Permanently Purged from Bot & Databases</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Target User ID:</b> <code>{target_id}</code> ({uname})\n"
+            f"👤 <b>Account Record:</b> <code>Permanently Deleted 🗑️</code>\n"
+            f"📱 <b>Active Numbers Cleared:</b> <code>{res['deleted_active_numbers']}</code>\n"
+            f"📨 <b>OTP Messages Cleared:</b> <code>{res['deleted_processed_otps'] + res['deleted_sms_deliveries']}</code>\n"
+            f"📜 <b>Delivery Logs Cleared:</b> <code>{res['deleted_delivery_logs']}</code>\n"
+            f"📦 <b>Country Stock Records Purged:</b> <code>{res['deleted_stock_logs']}</code>\n"
+            f"☁️ <b>Cloud Sync:</b> <code>Committed to Gist ☁️</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ <i>All traces of user {target_id} have been completely removed.</i>"
+        )
+    else:
+        text = f"❌ <b>Notice:</b> User ID <code>{target_id}</code> was not found in the database."
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 User Management", callback_data="admin_users")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View or update base URL for connected OTP providers.
+    Usage:
+      /seturl (shows current URLs)
+      /seturl <thirdwave|augestel|ksi> <base_url>
+      /seturl <base_url> (defaults to Thirdwave)
+    """
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    tw_key, tw_url = get_thirdwave_config()
+    aug_key, aug_url = get_augestel_config()
+    ksi_key, ksi_url = get_otpman2_config()
+
+    if not context.args:
+        text = (
+            f"🌐 <b>Connected Provider Base URLs</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"1️⃣ <b>Thirdwave:</b>\n<code>{html.escape(tw_url)}</code>\n\n"
+            f"2️⃣ <b>Augestel / OTPMan:</b>\n<code>{html.escape(aug_url)}</code>\n\n"
+            f"3️⃣ <b>KSI / OTPMan2:</b>\n<code>{html.escape(ksi_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <b>To update a URL, use:</b>\n"
+            f"<code>/seturl thirdwave &lt;new_url&gt;</code>\n"
+            f"<code>/seturl augestel &lt;new_url&gt;</code>\n"
+            f"<code>/seturl ksi &lt;new_url&gt;</code>\n\n"
+            f"<i>Or use the interactive buttons in the Admin Panel!</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+            [InlineKeyboardButton("📡 Ping & Verify Connections", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    args = context.args
+    provider_arg = args[0].lower()
+
+    if provider_arg in ("thirdwave", "tw", "1"):
+        if len(args) < 2:
+            await update.message.reply_text("⚠️ <b>Usage:</b> <code>/seturl thirdwave https://domain.com</code>", parse_mode=ParseMode.HTML)
+            return
+        new_url = args[1].strip()
+        set_thirdwave_config(tw_key, new_url)
+        target_name = "Thirdwave"
+        prov_key = "thirdwave"
+        active_key = tw_key
+    elif provider_arg in ("augestel", "aug", "otpman", "2"):
+        if len(args) < 2:
+            await update.message.reply_text("⚠️ <b>Usage:</b> <code>/seturl augestel https://domain.com</code>", parse_mode=ParseMode.HTML)
+            return
+        new_url = args[1].strip()
+        set_augestel_config(aug_key, new_url)
+        target_name = "Augestel / OTPMan"
+        prov_key = "augestel"
+        active_key = aug_key
+    elif provider_arg in ("ksi", "otpman2", "3"):
+        if len(args) < 2:
+            await update.message.reply_text("⚠️ <b>Usage:</b> <code>/seturl ksi https://domain.com</code>", parse_mode=ParseMode.HTML)
+            return
+        new_url = args[1].strip()
+        set_otpman2_config(ksi_key, new_url)
+        target_name = "KSI / OTPMan2"
+        prov_key = "otpman2"
+        active_key = ksi_key
+    else:
+        new_url = args[0].strip()
+        set_thirdwave_config(tw_key, new_url)
+        target_name = "Thirdwave"
+        prov_key = "thirdwave"
+        active_key = tw_key
+
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    ping_ok, ping_msg = await ping_provider_test(active_key, new_url, prov_key)
+
+    resp_text = (
+        f"✅ <b>{target_name} Base URL Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>New URL:</b> <code>{html.escape(new_url)}</code>\n"
+        f"📡 <b>Live Ping Status:</b> {ping_msg}\n"
+        f"💾 <b>Persistence:</b> Saved to DB & Cloud Gist\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+        [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+    ])
+    await update.message.reply_text(resp_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def setthirdwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configure Thirdwave API Key and optional URL."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    full_arg = " ".join(context.args).strip()
+    tw_key, tw_url = get_thirdwave_config()
+    if not full_arg:
+        mask = f"••••{tw_key[-4:]}" if tw_key else "Not Configured ❌"
+        await update.message.reply_text(
+            f"🌐 <b>Thirdwave IPRN API Configuration</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>Current API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Current Base URL:</b> <code>{html.escape(tw_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <b>To update, send:</b>\n"
+            f"<code>/setthirdwave &lt;api_key&gt;</code>\n"
+            f"<i>Or with URL:</i>\n"
+            f"<code>/setthirdwave &lt;api_key&gt; | https://domain.com</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if "|" in full_arg:
+        parts = [p.strip() for p in full_arg.split("|", 1)]
+        new_key = parts[0]
+        new_url = parts[1] if parts[1] else tw_url
+    else:
+        parts = full_arg.split(None, 1)
+        new_key = parts[0]
+        new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else tw_url
+
+    set_thirdwave_config(new_key, new_url)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "thirdwave")
+    mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+    await update.message.reply_text(
+        f"✅ <b>Thirdwave Configuration Saved!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+        f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+        f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 <i>Saved secretly to database and synced to cloud backup.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+            [InlineKeyboardButton("📡 Check Connected APIs", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
+async def setaugestel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configure Augestel / OTPMan API Key and optional URL."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    full_arg = " ".join(context.args).strip()
+    aug_key, aug_url = get_augestel_config()
+    if not full_arg:
+        mask = f"••••{aug_key[-4:]}" if aug_key else "Not Configured ❌"
+        await update.message.reply_text(
+            f"🌐 <b>Augestel / OTPMan API Configuration</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>Current API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Current Base URL:</b> <code>{html.escape(aug_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <b>To update, send:</b>\n"
+            f"<code>/setaugestel &lt;api_key&gt;</code>\n"
+            f"<i>Or with URL:</i>\n"
+            f"<code>/setaugestel &lt;api_key&gt; | https://domain.com</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if "|" in full_arg:
+        parts = [p.strip() for p in full_arg.split("|", 1)]
+        new_key = parts[0]
+        new_url = parts[1] if parts[1] else aug_url
+    else:
+        parts = full_arg.split(None, 1)
+        new_key = parts[0]
+        new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else aug_url
+
+    set_augestel_config(new_key, new_url)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "augestel")
+    mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+    await update.message.reply_text(
+        f"✅ <b>Augestel Configuration Saved!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+        f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+        f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 <i>Saved secretly to database and synced to cloud backup.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+            [InlineKeyboardButton("📡 Check Connected APIs", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
+async def setotpman2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configure KSI / OTPMan2 API Key and optional URL."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    full_arg = " ".join(context.args).strip()
+    ksi_key, ksi_url = get_otpman2_config()
+    if not full_arg:
+        mask = f"••••{ksi_key[-4:]}" if ksi_key else "Not Configured ❌"
+        await update.message.reply_text(
+            f"🌐 <b>KSI / OTPMan2 API Configuration</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>Current API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Current Base URL:</b> <code>{html.escape(ksi_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <b>To update, send:</b>\n"
+            f"<code>/setotpman2 &lt;api_key&gt;</code>\n"
+            f"<i>Or with URL:</i>\n"
+            f"<code>/setotpman2 &lt;api_key&gt; | https://domain.com</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if "|" in full_arg:
+        parts = [p.strip() for p in full_arg.split("|", 1)]
+        new_key = parts[0]
+        new_url = parts[1] if parts[1] else ksi_url
+    else:
+        parts = full_arg.split(None, 1)
+        new_key = parts[0]
+        new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else ksi_url
+
+    set_otpman2_config(new_key, new_url)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "otpman2")
+    mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+    await update.message.reply_text(
+        f"✅ <b>KSI / OTPMan2 Configuration Saved!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+        f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+        f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 <i>Saved secretly to database and synced to cloud backup.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+            [InlineKeyboardButton("📡 Check Connected APIs", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -3263,6 +3833,126 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Failed to add administrator.", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ]))
+        return
+
+    if admin_state.get("awaiting_tw_setup"):
+        del ADMIN_STATES[user.id]
+        if text.strip().lower() == "cancel":
+            await update.message.reply_text("❌ Setup cancelled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Setup Menu", callback_data="admin_setup_apis_menu")]]))
+            return
+
+        tw_key, tw_url = get_thirdwave_config()
+        if "|" in text:
+            parts = [p.strip() for p in text.split("|", 1)]
+            new_key = parts[0]
+            new_url = parts[1] if parts[1] else tw_url
+        else:
+            parts = text.split(None, 1)
+            new_key = parts[0]
+            new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else tw_url
+
+        set_thirdwave_config(new_key, new_url)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "thirdwave")
+        mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+        await update.message.reply_text(
+            f"✅ <b>Thirdwave Credentials Configured!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+            f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+            f"💾 <b>Cloud Backup:</b> Synchronized secretly with Gist ☁️\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+                [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+        return
+
+    if admin_state.get("awaiting_aug_setup"):
+        del ADMIN_STATES[user.id]
+        if text.strip().lower() == "cancel":
+            await update.message.reply_text("❌ Setup cancelled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Setup Menu", callback_data="admin_setup_apis_menu")]]))
+            return
+
+        aug_key, aug_url = get_augestel_config()
+        if "|" in text:
+            parts = [p.strip() for p in text.split("|", 1)]
+            new_key = parts[0]
+            new_url = parts[1] if parts[1] else aug_url
+        else:
+            parts = text.split(None, 1)
+            new_key = parts[0]
+            new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else aug_url
+
+        set_augestel_config(new_key, new_url)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "augestel")
+        mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+        await update.message.reply_text(
+            f"✅ <b>Augestel / OTPMan Credentials Configured!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+            f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+            f"💾 <b>Cloud Backup:</b> Synchronized secretly with Gist ☁️\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+                [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+        return
+
+    if admin_state.get("awaiting_ksi_setup"):
+        del ADMIN_STATES[user.id]
+        if text.strip().lower() == "cancel":
+            await update.message.reply_text("❌ Setup cancelled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Setup Menu", callback_data="admin_setup_apis_menu")]]))
+            return
+
+        ksi_key, ksi_url = get_otpman2_config()
+        if "|" in text:
+            parts = [p.strip() for p in text.split("|", 1)]
+            new_key = parts[0]
+            new_url = parts[1] if parts[1] else ksi_url
+        else:
+            parts = text.split(None, 1)
+            new_key = parts[0]
+            new_url = parts[1].strip() if len(parts) > 1 and parts[1].startswith("http") else ksi_url
+
+        set_otpman2_config(new_key, new_url)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        ping_ok, ping_msg = await ping_provider_test(new_key, new_url, "otpman2")
+        mask = f"••••{new_key[-4:]}" if new_key else "None"
+
+        await update.message.reply_text(
+            f"✅ <b>KSI / OTPMan2 Credentials Configured!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
+            f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
+            f"📡 <b>Live Ping Test:</b> {ping_msg}\n"
+            f"💾 <b>Cloud Backup:</b> Synchronized secretly with Gist ☁️\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
+                [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
         return
 
     if admin_state.get("awaiting_country_name"):
@@ -3966,6 +4656,95 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
+    # 6-e. Setup Websites & API Keys Menu
+    elif data == "admin_setup_apis_menu" and user_admin:
+        tw_key, tw_url = get_thirdwave_config()
+        aug_key, aug_url = get_augestel_config()
+        ksi_key, ksi_url = get_otpman2_config()
+
+        tw_status = f"✅ Configured (••••{tw_key[-4:]})" if tw_key else "❌ Missing Key"
+        aug_status = f"✅ Configured (••••{aug_key[-4:]})" if aug_key else "❌ Missing Key"
+        ksi_status = f"✅ Configured (••••{ksi_key[-4:]})" if ksi_key else "❌ Missing Key"
+
+        text = (
+            f"⚙️ <b>Setup OTP Websites & API Keys</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Configure and connect the 3 OTP provider bots/APIs for live SMS receiving:\n\n"
+            f"1️⃣ <b>Thirdwave:</b>\n"
+            f"• Key: <code>{tw_status}</code>\n"
+            f"• URL: <code>{html.escape(tw_url)}</code>\n\n"
+            f"2️⃣ <b>Augestel / OTPMan:</b>\n"
+            f"• Key: <code>{aug_status}</code>\n"
+            f"• URL: <code>{html.escape(aug_url)}</code>\n\n"
+            f"3️⃣ <b>KSI / OTPMan2:</b>\n"
+            f"• Key: <code>{ksi_status}</code>\n"
+            f"• URL: <code>{html.escape(ksi_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Click a provider below to input your API Key and URL:</i>"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_setup_apis_keyboard())
+
+    elif data == "admin_setup_tw_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_tw_setup": True}
+        tw_key, tw_url = get_thirdwave_config()
+        mask = f"••••{tw_key[-4:]}" if tw_key else "None"
+        text = (
+            f"🌐 <b>Setup Thirdwave IPRN API</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Key:</b> <code>{mask}</code>\n"
+            f"• <b>Current URL:</b> <code>{html.escape(tw_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send your new <b>Thirdwave API Key</b> by typing it in this chat.\n\n"
+            f"💡 <i>To set both Key and URL together, use:</i>\n"
+            f"<code>&lt;api_key&gt; | https://your-domain.com</code>\n\n"
+            f"<i>Send <code>CANCEL</code> to abort.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Setup Menu", callback_data="admin_setup_apis_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "admin_setup_aug_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_aug_setup": True}
+        aug_key, aug_url = get_augestel_config()
+        mask = f"••••{aug_key[-4:]}" if aug_key else "None"
+        text = (
+            f"🌐 <b>Setup Augestel / OTPMan API</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Key:</b> <code>{mask}</code>\n"
+            f"• <b>Current URL:</b> <code>{html.escape(aug_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send your new <b>Augestel API Key</b> by typing it in this chat.\n\n"
+            f"💡 <i>To set both Key and URL together, use:</i>\n"
+            f"<code>&lt;api_key&gt; | https://your-domain.com</code>\n\n"
+            f"<i>Send <code>CANCEL</code> to abort.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Setup Menu", callback_data="admin_setup_apis_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "admin_setup_ksi_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_ksi_setup": True}
+        ksi_key, ksi_url = get_otpman2_config()
+        mask = f"••••{ksi_key[-4:]}" if ksi_key else "None"
+        text = (
+            f"🌐 <b>Setup KSI / OTPMan2 API</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Key:</b> <code>{mask}</code>\n"
+            f"• <b>Current URL:</b> <code>{html.escape(ksi_url)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send your new <b>KSI / OTPMan2 API Key</b> by typing it in this chat.\n\n"
+            f"💡 <i>To set both Key and URL together, use:</i>\n"
+            f"<code>&lt;api_key&gt; | https://your-domain.com</code>\n\n"
+            f"<i>Send <code>CANCEL</code> to abort.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Setup Menu", callback_data="admin_setup_apis_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
     # 6-d. Connected OTP Bots Status Diagnostic Check
     elif (data == "admin_otp_status" or data == "admin_otp_status_refresh") and user_admin:
         await query.answer("⏳ Pinging connected OTP APIs...")
@@ -4464,26 +5243,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
         consumed = u.get("numbers_consumed", 0) if u else 0
 
-        ok = delete_user(target_id)
-        if ok and gist_storage.enabled:
+        res = delete_user(target_id)
+        if res and gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        if ok:
-            await query.answer("🗑️ User removed successfully!", show_alert=True)
+        if res:
+            await query.answer("🗑️ User permanently purged!", show_alert=True)
             result_text = (
-                f"✅ <b>User Removed Successfully</b>\n"
+                f"✅ <b>User Permanently Purged from Bot & Databases</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 <b>Removed User ID:</b> <code>{target_id}</code>\n"
+                f"🆔 <b>Target User ID:</b> <code>{target_id}</code>\n"
                 f"📛 <b>Name:</b> <code>{uname}</code>\n"
-                f"🔢 <b>Numbers They Consumed:</b> <code>{consumed}</code>\n"
+                f"👤 <b>Account Record:</b> <code>Permanently Deleted 🗑️</code>\n"
+                f"📱 <b>Active Numbers Cleared:</b> <code>{res['deleted_active_numbers']}</code>\n"
+                f"📨 <b>OTP Messages Cleared:</b> <code>{res['deleted_processed_otps'] + res['deleted_sms_deliveries']}</code>\n"
+                f"📜 <b>Delivery Logs Cleared:</b> <code>{res['deleted_delivery_logs']}</code>\n"
+                f"📦 <b>Country Stock Records Purged:</b> <code>{res['deleted_stock_logs']}</code>\n"
+                f"☁️ <b>Cloud Sync:</b> <code>Purged from Gist ☁️</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🗑️ <i>User and their delivery log have been permanently deleted from the database.</i>"
+                f"🗑️ <i>All user data and database entries have been permanently removed.</i>"
             )
         else:
-            await query.answer("❌ Failed to remove user.", show_alert=True)
+            await query.answer("❌ User not found or already removed.", show_alert=True)
             result_text = (
-                f"❌ <b>Failed to Remove User</b>\n"
-                f"<i>An error occurred while removing user <code>{target_id}</code>. Check logs.</i>"
+                f"⚠️ <b>User Not Found</b>\n"
+                f"<i>User ID <code>{target_id}</code> was not found in the database.</i>"
             )
 
         keyboard = InlineKeyboardMarkup([
@@ -4824,6 +5608,14 @@ def main():
     app.add_handler(CommandHandler("qty", user_quantity_command))
     app.add_handler(CommandHandler("setquantity", setquantity_command))
     app.add_handler(CommandHandler("setqty", setquantity_command))
+    app.add_handler(CommandHandler("seturl", seturl_command))
+    app.add_handler(CommandHandler("setthirdwave", setthirdwave_command))
+    app.add_handler(CommandHandler("settw", setthirdwave_command))
+    app.add_handler(CommandHandler("setaugestel", setaugestel_command))
+    app.add_handler(CommandHandler("setaug", setaugestel_command))
+    app.add_handler(CommandHandler("setotpman", setaugestel_command))
+    app.add_handler(CommandHandler("setotpman2", setotpman2_command))
+    app.add_handler(CommandHandler("setksi", setotpman2_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
@@ -4851,11 +5643,16 @@ def main():
                 BotCommand("status", "⚡ Live Zero-Restart Status"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
                 BotCommand("setquantity", "🔢 Set fixed quantity (1–1000)"),
+                BotCommand("seturl", "🌐 View / Update Provider URLs"),
+                BotCommand("setthirdwave", "🔑 Set Thirdwave Key / URL"),
+                BotCommand("setaugestel", "🔑 Set Augestel Key / URL"),
+                BotCommand("setotpman2", "🔑 Set KSI/OTPMan2 Key / URL"),
                 BotCommand("setname", "✏️ Change bot display name"),
                 BotCommand("resetname", "🔄 Reset bot display name"),
                 BotCommand("admins", "👥 View Active Administrators"),
                 BotCommand("addadmin", "➕ Promote user to Admin"),
                 BotCommand("removeadmin", "🗑️ Demote Admin to user"),
+                BotCommand("removeuser", "🗑️ Permanently purge user"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
                 BotCommand("setgroup", "🔗 Set OTP Group link & name"),
@@ -4932,6 +5729,9 @@ def main():
 
         # Launch Live Multi-API SMS Polling Engine
         asyncio.create_task(sms_polling_worker(application))
+
+        # Launch 28h Database Retention Maintenance Loop
+        asyncio.create_task(periodic_db_cleanup_loop())
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))

@@ -6855,6 +6855,14 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ CRITICAL: TELEGRAM_BOT_TOKEN is missing! Please configure .env or GitHub Secrets.")
         sys.exit(1)
+    try:
+        r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=6.0)
+        if r.status_code == 401 or not r.json().get("ok"):
+            logger.error("❌ CRITICAL: TELEGRAM_BOT_TOKEN was REJECTED by Telegram (401 Unauthorized)!")
+            logger.error("👉 The token was deleted, revoked, or regenerated in @BotFather. Please get your active token from @BotFather and update GitHub Secrets & .env.")
+            sys.exit(1)
+    except Exception:
+        pass
 
     init_db()
 

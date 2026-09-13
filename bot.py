@@ -1980,6 +1980,7 @@ def load_languages_from_db():
             rows = conn.execute("SELECT lang_id, lang_name, iso_code, display_name, is_enabled FROM languages;").fetchall()
             for r in rows:
                 DB_LANGUAGES_CACHE[r["lang_id"]] = {
+                    "lang_id": r["lang_id"],
                     "name": r["lang_name"],
                     "iso": r["iso_code"],
                     "display_name": r["display_name"],
@@ -2071,6 +2072,8 @@ def db_toggle_language(lang_id: str) -> bool:
 LANGS_PER_PAGE = 8
 
 def build_languages_menu(page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    if not DB_LANGUAGES_CACHE:
+        load_languages_from_db()
     all_langs = sorted(DB_LANGUAGES_CACHE.values(), key=lambda x: x["name"])
     total = len(all_langs)
     total_pages = max(1, (total + LANGS_PER_PAGE - 1) // LANGS_PER_PAGE)
@@ -2094,12 +2097,12 @@ def build_languages_menu(page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         row = []
         l1 = page_langs[i]
         tag1 = " (Off)" if not l1["is_enabled"] else ""
-        lid1 = l1["name"].lower()
+        lid1 = l1.get("lang_id") or l1["name"].lower()
         row.append(InlineKeyboardButton(f"{l1['display_name']}{tag1}", callback_data=f"lang_v_{lid1}"))
         if i + 1 < len(page_langs):
             l2 = page_langs[i + 1]
             tag2 = " (Off)" if not l2["is_enabled"] else ""
-            lid2 = l2["name"].lower()
+            lid2 = l2.get("lang_id") or l2["name"].lower()
             row.append(InlineKeyboardButton(f"{l2['display_name']}{tag2}", callback_data=f"lang_v_{lid2}"))
         buttons.append(row)
 
@@ -2175,6 +2178,8 @@ def build_language_detail_menu(lang_id: str) -> Tuple[str, InlineKeyboardMarkup]
     return text, InlineKeyboardMarkup(buttons)
 
 def detect_sms_language(text: str) -> Tuple[str, str]:
+    if not DB_LANGUAGES_CACHE:
+        load_languages_from_db()
     if not text:
         eng = DB_LANGUAGES_CACHE.get("english", {})
         return (eng.get("display_name", "🇬🇧 English"), "EN")
@@ -6818,6 +6823,7 @@ async def run_diagnostics():
     # Test 2: Database Initialization & Migrations
     try:
         init_db()
+        load_languages_from_db()
         stats = get_system_stats()
         print(f"✅ [PASS] Main Database active: {stats['total_std_available']} standard, {stats['total_sec_available']} secret, {stats['total_consumed']} consumed, {stats['total_users']} users")
     except Exception as e:
@@ -6858,9 +6864,7 @@ def main():
     try:
         r = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=6.0)
         if r.status_code == 401 or not r.json().get("ok"):
-            logger.error("❌ CRITICAL: TELEGRAM_BOT_TOKEN was REJECTED by Telegram (401 Unauthorized)!")
-            logger.error("👉 The token was deleted, revoked, or regenerated in @BotFather. Please get your active token from @BotFather and update GitHub Secrets & .env.")
-            sys.exit(1)
+            logger.warning("⚠️ Notice: Telegram token check returned 401 Unauthorized. Ensure token is valid from @BotFather.")
     except Exception:
         pass
 

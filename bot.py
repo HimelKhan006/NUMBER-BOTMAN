@@ -1019,7 +1019,7 @@ def set_otp_group_link(link: str) -> bool:
 
     return success
 
-DEFAULT_OTP_GROUP_NAME = "💬 Join OTP Group"
+DEFAULT_OTP_GROUP_NAME = "💬 Join Updates Channel"
 
 def get_otp_group_name() -> str:
     # Tier 1: Check SQLite database
@@ -1480,20 +1480,26 @@ def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", f
         wa_tag = "OLD" if is_old else "NEW"
 
     DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
-    INDENT_NUM = "        "
-    INDENT  = "          "
 
-    header = "⚡ <b>NEW OTP SMS RECEIVED</b> ⚡" if otp_code else "⚡ <b>NEW SMS RECEIVED</b> ⚡"
+    header = "⚡ <b>NEW SMS RECEIVED</b> ⚡"
     lines = [header, DIVIDER]
-    lines.append(f"{INDENT_NUM}{flag} <code>{html.escape(formatted_number)}</code>")
+
+    clean_num_disp = str(formatted_number).strip().lstrip("+")
+    final_num = f"+{clean_num_disp}" if clean_num_disp else ""
+
+    if final_num:
+        lines.append(f"• <b>Number:</b> {flag} <code>{html.escape(final_num)}</code>")
+    else:
+        lines.append(f"• <b>Country:</b> {flag} <code>{html.escape(country_name)} ({iso})</code>")
 
     if is_wa and wa_tag:
-        lines.append(f"{INDENT}<b>Service:</b> <code>{source}</code> <b>[{wa_tag}]</b>")
+        lines.append(f"• <b>Service:</b> <code>{source}</code> <b>[{wa_tag}]</b>")
     else:
-        lines.append(f"{INDENT}<b>Service:</b> <code>{source}</code>")
+        lines.append(f"• <b>Service:</b> <code>{source}</code>")
 
-    lines.append(f"{INDENT}<b>Country:</b> <code>{html.escape(country_name)} ({iso})</code>")
-    lines.append(f"{INDENT}<b>Language:</b> <code>{lang_name}</code>")
+    if final_num:
+        lines.append(f"• <b>Country:</b> <code>{html.escape(country_name)} ({iso})</code>")
+    lines.append(f"• <b>Language:</b> <code>{lang_name}</code>")
 
     sms_view_mode = get_bot_setting("sms_view_mode", "default")
     should_show_full = (force_full is True) or (force_full is None and sms_view_mode == "full")
@@ -4203,7 +4209,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
+        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
 
         response_text = (
             f"📱 <b>Your Exclusive Numbers — {country_name}</b>\n"
@@ -4257,7 +4263,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
+        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
 
         response_text = (
             f"🔒 <b>Your SECRET Numbers — {country_name}</b>\n"
@@ -4369,7 +4375,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers_formatted = "\n".join(num_lines)
 
         group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need OTP codes? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
+        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
 
         title_prefix = "🔒 <b>Your SECRET Numbers" if is_secret else "📱 <b>Your Exclusive Numbers"
         response_text = (

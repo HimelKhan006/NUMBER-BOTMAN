@@ -1624,6 +1624,15 @@ async def periodic_db_cleanup_loop():
         except Exception as e:
             logger.warning(f"Periodic 28h cleanup error: {e}")
 
+PROVIDER_RATE_LIMIT_BACKOFF: Dict[str, float] = {
+    "thirdwave": 0.0,
+    "augestel": 0.0,
+    "otpman2": 0.0,
+}
+
+_API_STATUS_CACHE: Dict[str, Any] = {}
+_API_STATUS_CACHE_TIME: float = 0.0
+
 async def ping_provider_test(key: str, url: str, provider: str) -> Tuple[bool, str]:
     """Instantly pings a provider endpoint to test authentication, reachability, and latency."""
     clean_key = (key or "").strip()
@@ -1646,6 +1655,8 @@ async def ping_provider_test(key: str, url: str, provider: str) -> Tuple[bool, s
             elapsed = int((time.time() - t0) * 1000)
             if res.is_success:
                 return True, f"✅ Connected successfully (HTTP 200 OK, {elapsed}ms)!"
+            elif res.status_code == 429:
+                return True, f"🟢 Connected successfully (HTTP 429 Cooldown, {elapsed}ms) - API Key verified & Active!"
             elif res.status_code in (401, 403):
                 return False, f"❌ Unauthorized (HTTP {res.status_code}, {elapsed}ms) - Invalid API Key."
             elif res.status_code == 404:
@@ -1664,6 +1675,8 @@ async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
     key, url = get_thirdwave_config()
     if not key:
         return []
+    if time.time() < PROVIDER_RATE_LIMIT_BACKOFF.get("thirdwave", 0.0):
+        return []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(
@@ -1675,6 +1688,9 @@ async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
                 data = res.json()
                 rows = data.get("rows") if isinstance(data, dict) else (data if isinstance(data, list) else [])
                 return [r for r in rows if isinstance(r, dict)]
+            elif res.status_code == 429:
+                logger.info("⏳ Thirdwave rate limit active (HTTP 429). Cooldown 25s...")
+                PROVIDER_RATE_LIMIT_BACKOFF["thirdwave"] = time.time() + 25.0
     except Exception as e:
         logger.debug(f"Thirdwave fetch notice: {e}")
     return []
@@ -1682,6 +1698,8 @@ async def fetch_thirdwave_incoming() -> List[Dict[str, Any]]:
 async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
     key, url = get_augestel_config()
     if not key:
+        return []
+    if time.time() < PROVIDER_RATE_LIMIT_BACKOFF.get("augestel", 0.0):
         return []
     try:
         start_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1699,6 +1717,9 @@ async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
                     )
                 )
                 return [r for r in items if isinstance(r, dict)]
+            elif res.status_code == 429:
+                logger.info("⏳ Augestel rate limit active (HTTP 429). Cooldown 25s...")
+                PROVIDER_RATE_LIMIT_BACKOFF["augestel"] = time.time() + 25.0
     except Exception as e:
         logger.debug(f"Augestel fetch notice: {e}")
     return []
@@ -1706,6 +1727,8 @@ async def fetch_augestel_incoming() -> List[Dict[str, Any]]:
 async def fetch_otpman2_incoming() -> List[Dict[str, Any]]:
     key, url = get_otpman2_config()
     if not key:
+        return []
+    if time.time() < PROVIDER_RATE_LIMIT_BACKOFF.get("otpman2", 0.0):
         return []
     try:
         now = datetime.now(timezone.utc)
@@ -1724,15 +1747,18 @@ async def fetch_otpman2_incoming() -> List[Dict[str, Any]]:
                     )
                 )
                 return [r for r in items if isinstance(r, dict)]
+            elif res.status_code == 429:
+                logger.info("⏳ KSI rate limit active (HTTP 429). Cooldown 25s...")
+                PROVIDER_RATE_LIMIT_BACKOFF["otpman2"] = time.time() + 25.0
     except Exception as e:
-        logger.debug(f"OTPMan2 fetch notice: {e}")
+        logger.debug(f"KSI fetch notice: {e}")
     return []
 
 async def sms_polling_worker(application: Application):
     """
-    Continuous background loop that polls all enabled OTP provider APIs,
+    Continuous background loop that polls all enabled provider APIs,
     matches incoming SMS against active_user_numbers,
-    and forwards OTP messages directly to the users who got those numbers.
+    and forwards messages directly to the users who got those numbers.
     """
     logger.info("📡 Live Multi-API SMS Polling Engine started for Number Bot.")
     await asyncio.sleep(5.0)
@@ -1752,7 +1778,7 @@ async def sms_polling_worker(application: Application):
             if get_bot_setting("api_augestel_enabled", "1") == "1" and aug_key:
                 tasks.append(("Augestel", fetch_augestel_incoming()))
             if get_bot_setting("api_otpman2_enabled", "1") == "1" and ksi_key:
-                tasks.append(("OTPMan2", fetch_otpman2_incoming()))
+                tasks.append(("KSI", fetch_otpman2_incoming()))
 
             for provider_name, coro in tasks:
                 try:
@@ -1774,7 +1800,7 @@ async def sms_polling_worker(application: Application):
                             text, otp, markup = format_user_otp_notification(item, country_hint=c_hint, sms_id=sms_id)
                             sent = await send_with_retry(application.bot, user_id, text, reply_markup=markup)
                             if sent:
-                                logger.info(f"📨 Live OTP forwarded to user {user_id} for number {raw_num} ({provider_name})")
+                                logger.info(f"📨 Live SMS forwarded to user {user_id} for number {raw_num} ({provider_name})")
                                 mark_sms_processed(sms_id, number=raw_num, user_id=user_id, full_text=raw_msg, raw_json=item_json)
                                 record_processed_otp(
                                     sms_id=sms_id,
@@ -1802,10 +1828,15 @@ async def sms_polling_worker(application: Application):
         except Exception as e:
             logger.warning(f"SMS Polling worker loop exception: {e}")
 
-        await asyncio.sleep(6.0)
+        await asyncio.sleep(12.0)
 
-async def check_all_connected_apis_status() -> Dict[str, Any]:
-    """Tests connection, latency, and operational health for all 3 linked OTP provider APIs."""
+async def check_all_connected_apis_status(force: bool = False) -> Dict[str, Any]:
+    """Tests connection, latency, and operational health for all 3 linked provider APIs with 45s caching and 429 support."""
+    global _API_STATUS_CACHE, _API_STATUS_CACHE_TIME
+    now = time.time()
+    if not force and _API_STATUS_CACHE and (now - _API_STATUS_CACHE_TIME < 45.0):
+        return _API_STATUS_CACHE
+
     results = {}
 
     # 1. Thirdwave
@@ -1827,12 +1858,19 @@ async def check_all_connected_apis_status() -> Dict[str, Any]:
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
                     results["thirdwave"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": tw_url, "key": f"••••{tw_key[-4:]}"}
+                elif res.status_code == 429:
+                    PROVIDER_RATE_LIMIT_BACKOFF["thirdwave"] = time.time() + 20.0
+                    results["thirdwave"] = {"status": f"🟢 Online (Active Cooldown / 429, {elapsed}ms)", "ok": True, "enabled": True, "url": tw_url, "key": f"••••{tw_key[-4:]}"}
+                elif res.status_code in (401, 403):
+                    results["thirdwave"] = {"status": f"❌ Unauthorized (HTTP {res.status_code}, {elapsed}ms) - Invalid API Key", "ok": False, "enabled": True, "url": tw_url}
+                elif res.status_code == 404:
+                    results["thirdwave"] = {"status": f"❌ Not Found (HTTP 404, {elapsed}ms) - Invalid Base URL", "ok": False, "enabled": True, "url": tw_url}
                 else:
                     results["thirdwave"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": tw_url}
         except Exception as e:
             results["thirdwave"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": tw_url}
 
-    # 2. Augestel / OTPMan
+    # 2. Augestel
     aug_key, aug_url = get_augestel_config()
     aug_enabled = (get_bot_setting("api_augestel_enabled", "1") == "1")
     if not aug_key:
@@ -1851,12 +1889,19 @@ async def check_all_connected_apis_status() -> Dict[str, Any]:
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
                     results["augestel"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": aug_url, "key": f"••••{aug_key[-4:]}"}
+                elif res.status_code == 429:
+                    PROVIDER_RATE_LIMIT_BACKOFF["augestel"] = time.time() + 20.0
+                    results["augestel"] = {"status": f"🟢 Online (Active Cooldown / 429, {elapsed}ms)", "ok": True, "enabled": True, "url": aug_url, "key": f"••••{aug_key[-4:]}"}
+                elif res.status_code in (401, 403):
+                    results["augestel"] = {"status": f"❌ Unauthorized (HTTP {res.status_code}, {elapsed}ms) - Invalid API Key", "ok": False, "enabled": True, "url": aug_url}
+                elif res.status_code == 404:
+                    results["augestel"] = {"status": f"❌ Not Found (HTTP 404, {elapsed}ms) - Invalid Base URL", "ok": False, "enabled": True, "url": aug_url}
                 else:
                     results["augestel"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": aug_url}
         except Exception as e:
             results["augestel"] = {"status": f"❌ Offline ({type(e).__name__})", "ok": False, "enabled": True, "url": aug_url}
 
-    # 3. KSI / OTPMan2
+    # 3. KSI
     ksi_key, ksi_url = get_otpman2_config()
     ksi_enabled = (get_bot_setting("api_otpman2_enabled", "1") == "1")
     if not ksi_key:
@@ -1875,6 +1920,13 @@ async def check_all_connected_apis_status() -> Dict[str, Any]:
                 elapsed = int((time.time() - t0) * 1000)
                 if res.is_success:
                     results["otpman2"] = {"status": f"✅ Online (200 OK, {elapsed}ms)", "ok": True, "enabled": True, "url": ksi_url, "key": f"••••{ksi_key[-4:]}"}
+                elif res.status_code == 429:
+                    PROVIDER_RATE_LIMIT_BACKOFF["otpman2"] = time.time() + 20.0
+                    results["otpman2"] = {"status": f"🟢 Online (Active Cooldown / 429, {elapsed}ms)", "ok": True, "enabled": True, "url": ksi_url, "key": f"••••{ksi_key[-4:]}"}
+                elif res.status_code in (401, 403):
+                    results["otpman2"] = {"status": f"❌ Unauthorized (HTTP {res.status_code}, {elapsed}ms) - Invalid API Key", "ok": False, "enabled": True, "url": ksi_url}
+                elif res.status_code == 404:
+                    results["otpman2"] = {"status": f"❌ Not Found (HTTP 404, {elapsed}ms) - Invalid Base URL", "ok": False, "enabled": True, "url": ksi_url}
                 else:
                     results["otpman2"] = {"status": f"❌ Error (HTTP {res.status_code}, {elapsed}ms)", "ok": False, "enabled": True, "url": ksi_url}
         except Exception as e:
@@ -1888,6 +1940,9 @@ async def check_all_connected_apis_status() -> Dict[str, Any]:
     results["total_delivered"] = total_delivered_count
     results["sms_forwarding"] = (get_bot_setting("sms_receiving_enabled", "1") == "1")
     results["view_mode"] = get_bot_setting("sms_view_mode", "default")
+
+    _API_STATUS_CACHE = results
+    _API_STATUS_CACHE_TIME = now
     return results
 
 def format_api_status_report(status_data: Dict[str, Any]) -> str:
@@ -1900,15 +1955,15 @@ def format_api_status_report(status_data: Dict[str, Any]) -> str:
     master_sms = "✅ Active (Forwarding ON)" if status_data.get("sms_forwarding") else "❌ Disabled (Forwarding OFF)"
 
     return (
-        "📡 <b>Connected OTP Bots & API Status</b>\n"
+        "📡 <b>Connected Provider Services & API Status</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 <b>1. Thirdwave OTP API</b>\n"
+        "🌐 <b>1. Thirdwave Service API</b>\n"
         f"• <b>Status:</b> {tw.get('status', 'Unknown')}\n"
         f"• <b>Base URL:</b> <code>{tw.get('url', 'N/A')}</code>\n\n"
-        "🌐 <b>2. Augestel / OTPMan API</b>\n"
+        "🌐 <b>2. Augestel Service API</b>\n"
         f"• <b>Status:</b> {aug.get('status', 'Unknown')}\n"
         f"• <b>Base URL:</b> <code>{aug.get('url', 'N/A')}</code>\n\n"
-        "🌐 <b>3. KSI / OTPMan2 API</b>\n"
+        "🌐 <b>3. KSI Service API</b>\n"
         f"• <b>Status:</b> {ksi.get('status', 'Unknown')}\n"
         f"• <b>Base URL:</b> <code>{ksi.get('url', 'N/A')}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1918,12 +1973,12 @@ def format_api_status_report(status_data: Dict[str, Any]) -> str:
         f"• <b>Total SMS Delivered:</b> <code>{status_data.get('total_delivered', 0)} forwarded</code>\n"
         f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ <i>Tap 'Test & Ping APIs Now' to run a live connection check across all 3 providers.</i>"
+        "⚡ <i>Tap 'Refresh Service Status' to run a live connection check across all 3 providers.</i>"
     )
 
 def get_admin_api_status_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Test & Ping APIs Now", callback_data="admin_otp_status_refresh")],
+        [InlineKeyboardButton("🔄 Refresh Service Status", callback_data="admin_api_status_refresh")],
         [InlineKeyboardButton("⚙️ SMS Forwarding Controls", callback_data="admin_sms_menu")],
         [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
     ])
@@ -2510,10 +2565,10 @@ def get_admin_sms_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🔔 Master Forwarding: {'✅ ON' if sms_on else '❌ OFF'}", callback_data="admin_toggle_sms_master")],
         [InlineKeyboardButton(fmt_label, callback_data="admin_cycle_sms_mode")],
         [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-        [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+        [InlineKeyboardButton("📡 Check Connected Services Status", callback_data="admin_api_status")],
         [InlineKeyboardButton(f"🌐 Thirdwave API: {'✅ Active' if tw_on else '❌ OFF'}", callback_data="admin_toggle_api_thirdwave")],
         [InlineKeyboardButton(f"🌐 Augestel API: {'✅ Active' if aug_on else '❌ OFF'}", callback_data="admin_toggle_api_augestel")],
-        [InlineKeyboardButton(f"🌐 KSI / OTPMan2 API: {'✅ Active' if ksi_on else '❌ OFF'}", callback_data="admin_toggle_api_otpman2")],
+        [InlineKeyboardButton(f"🌐 KSI Service API: {'✅ Active' if ksi_on else '❌ OFF'}", callback_data="admin_toggle_api_otpman2")],
         [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
     ])
 
@@ -2529,8 +2584,8 @@ def get_admin_setup_apis_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌐 1. Thirdwave ({tw_mask})", callback_data="admin_setup_tw_prompt")],
         [InlineKeyboardButton(f"🌐 2. Augestel ({aug_mask})", callback_data="admin_setup_aug_prompt")],
-        [InlineKeyboardButton(f"🌐 3. KSI / OTPMan2 ({ksi_mask})", callback_data="admin_setup_ksi_prompt")],
-        [InlineKeyboardButton("📡 Ping & Verify Connections", callback_data="admin_otp_status")],
+        [InlineKeyboardButton(f"🌐 3. KSI ({ksi_mask})", callback_data="admin_setup_ksi_prompt")],
+        [InlineKeyboardButton("📡 Ping & Verify Services", callback_data="admin_api_status")],
         [InlineKeyboardButton("🔙 Back to SMS Controls", callback_data="admin_sms_menu")]
     ])
 
@@ -2744,12 +2799,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Configure number quantity, linked OTP APIs, and bot display name below:</i>"
+        f"⚡ <i>Configure number quantity, linked provider APIs, and bot display name below:</i>"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
         [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
-        [InlineKeyboardButton("📡 Connected OTP Bots Status", callback_data="admin_otp_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
+        [InlineKeyboardButton("📡 Connected Services Status", callback_data="admin_api_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
         [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
         [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
         [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
@@ -3398,8 +3453,8 @@ async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌐 <b>Connected Provider Base URLs</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"1️⃣ <b>Thirdwave:</b>\n<code>{html.escape(tw_url)}</code>\n\n"
-            f"2️⃣ <b>Augestel / OTPMan:</b>\n<code>{html.escape(aug_url)}</code>\n\n"
-            f"3️⃣ <b>KSI / OTPMan2:</b>\n<code>{html.escape(ksi_url)}</code>\n"
+            f"2️⃣ <b>Augestel:</b>\n<code>{html.escape(aug_url)}</code>\n\n"
+            f"3️⃣ <b>KSI:</b>\n<code>{html.escape(ksi_url)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <b>To update a URL, use:</b>\n"
             f"<code>/seturl thirdwave &lt;new_url&gt;</code>\n"
@@ -3409,7 +3464,7 @@ async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-            [InlineKeyboardButton("📡 Ping & Verify Connections", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("📡 Ping & Verify Services", callback_data="admin_api_status")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -3433,7 +3488,7 @@ async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         new_url = args[1].strip()
         set_augestel_config(aug_key, new_url)
-        target_name = "Augestel / OTPMan"
+        target_name = "Augestel Service"
         prov_key = "augestel"
         active_key = aug_key
     elif provider_arg in ("ksi", "otpman2", "3"):
@@ -3442,7 +3497,7 @@ async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         new_url = args[1].strip()
         set_otpman2_config(ksi_key, new_url)
-        target_name = "KSI / OTPMan2"
+        target_name = "KSI Service"
         prov_key = "otpman2"
         active_key = ksi_key
     else:
@@ -3539,7 +3594,7 @@ async def setaugestel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not full_arg:
         mask = f"••••{aug_key[-4:]}" if aug_key else "Not Configured ❌"
         await update.message.reply_text(
-            f"🌐 <b>Augestel / OTPMan API Configuration</b>\n"
+            f"🌐 <b>Augestel Service API Configuration</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>Current API Key:</b> <code>{mask}</code>\n"
             f"🌐 <b>Current Base URL:</b> <code>{html.escape(aug_url)}</code>\n"
@@ -3579,13 +3634,13 @@ async def setaugestel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-            [InlineKeyboardButton("📡 Check Connected APIs", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("📡 Check Connected Services", callback_data="admin_api_status")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
     )
 
 async def setotpman2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Configure KSI / OTPMan2 API Key and optional URL."""
+    """Configure KSI Service API Key and optional URL."""
     user = update.effective_user
     if not user or not is_admin(user.id):
         return
@@ -3595,7 +3650,7 @@ async def setotpman2_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not full_arg:
         mask = f"••••{ksi_key[-4:]}" if ksi_key else "Not Configured ❌"
         await update.message.reply_text(
-            f"🌐 <b>KSI / OTPMan2 API Configuration</b>\n"
+            f"🌐 <b>KSI Service API Configuration</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>Current API Key:</b> <code>{mask}</code>\n"
             f"🌐 <b>Current Base URL:</b> <code>{html.escape(ksi_url)}</code>\n"
@@ -3625,7 +3680,7 @@ async def setotpman2_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     mask = f"••••{new_key[-4:]}" if new_key else "None"
 
     await update.message.reply_text(
-        f"✅ <b>KSI / OTPMan2 Configuration Saved!</b>\n"
+        f"✅ <b>KSI Service Configuration Saved!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
         f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
@@ -3635,7 +3690,7 @@ async def setotpman2_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-            [InlineKeyboardButton("📡 Check Connected APIs", callback_data="admin_otp_status")],
+            [InlineKeyboardButton("📡 Check Connected Services", callback_data="admin_api_status")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
     )
@@ -4045,7 +4100,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         mask = f"••••{new_key[-4:]}" if new_key else "None"
 
         await update.message.reply_text(
-            f"✅ <b>Augestel / OTPMan Credentials Configured!</b>\n"
+            f"✅ <b>Augestel Credentials Configured!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
             f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
@@ -4055,7 +4110,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-                [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+                [InlineKeyboardButton("📡 Check Connected Services Status", callback_data="admin_api_status")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
@@ -4085,7 +4140,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         mask = f"••••{new_key[-4:]}" if new_key else "None"
 
         await update.message.reply_text(
-            f"✅ <b>KSI / OTPMan2 Credentials Configured!</b>\n"
+            f"✅ <b>KSI Credentials Configured!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 <b>API Key:</b> <code>{mask}</code>\n"
             f"🌐 <b>Base URL:</b> <code>{html.escape(new_url)}</code>\n"
@@ -4095,7 +4150,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Setup Websites & API Keys", callback_data="admin_setup_apis_menu")],
-                [InlineKeyboardButton("📡 Check Connected APIs Status", callback_data="admin_otp_status")],
+                [InlineKeyboardButton("📡 Check Connected Services Status", callback_data="admin_api_status")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
@@ -4634,12 +4689,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
             f"• <b>OTP Group Link:</b> {link_display}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Configure number quantities, linked OTP APIs, and bot display name below:</i>"
+            f"⚡ <i>Configure number quantities, linked provider APIs, and bot display name below:</i>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
             [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
-            [InlineKeyboardButton("📡 Connected OTP Bots Status", callback_data="admin_otp_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
+            [InlineKeyboardButton("📡 Connected Services Status", callback_data="admin_api_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
             [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
             [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
             [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
@@ -4728,12 +4783,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         view_mode = get_bot_setting("sms_view_mode", "default")
         mode_label = "Default (Button 📜)" if view_mode == "default" else ("Fixed Always Full 📄" if view_mode == "full" else "Fixed Short Only 📦")
         await query.edit_message_text(
-            f"📡 <b>SMS Forwarding & Linked OTP APIs</b>\n"
+            f"📡 <b>SMS Forwarding & Linked Provider APIs</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Master SMS Receiving:</b> <code>{'✅ Active (ON)' if sms_on else '❌ Disabled (OFF)'}</code>\n"
             f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n\n"
             f"<b>How this works:</b>\n"
-            f"When a user gets numbers from this bot, incoming OTP messages on those numbers are fetched from your linked OTP bots/APIs and forwarded directly to the user.\n\n"
+            f"When a user gets numbers from this bot, incoming SMS messages on those numbers are fetched from your linked provider APIs and forwarded directly to the user.\n\n"
             f"Toggle the master switch, view format, or individual APIs below:",
             parse_mode=ParseMode.HTML,
             reply_markup=get_admin_sms_keyboard()
@@ -4796,7 +4851,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         set_bot_setting("api_otpman2_enabled", new_val)
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
-        await query.answer(f"KSI / OTPMan2 API {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
+        await query.answer(f"KSI Service API {'ENABLED ✅' if new_val == '1' else 'DISABLED ❌'}", show_alert=True)
         try:
             await query.edit_message_reply_markup(reply_markup=get_admin_sms_keyboard())
         except Exception:
@@ -4813,16 +4868,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ksi_status = f"✅ Configured (••••{ksi_key[-4:]})" if ksi_key else "❌ Missing Key"
 
         text = (
-            f"⚙️ <b>Setup OTP Websites & API Keys</b>\n"
+            f"⚙️ <b>Setup Provider Websites & API Keys</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Configure and connect the 3 OTP provider bots/APIs for live SMS receiving:\n\n"
+            f"Configure and connect the 3 provider services/APIs for live SMS receiving:\n\n"
             f"1️⃣ <b>Thirdwave:</b>\n"
             f"• Key: <code>{tw_status}</code>\n"
             f"• URL: <code>{html.escape(tw_url)}</code>\n\n"
-            f"2️⃣ <b>Augestel / OTPMan:</b>\n"
+            f"2️⃣ <b>Augestel Service:</b>\n"
             f"• Key: <code>{aug_status}</code>\n"
             f"• URL: <code>{html.escape(aug_url)}</code>\n\n"
-            f"3️⃣ <b>KSI / OTPMan2:</b>\n"
+            f"3️⃣ <b>KSI Service:</b>\n"
             f"• Key: <code>{ksi_status}</code>\n"
             f"• URL: <code>{html.escape(ksi_url)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -4855,7 +4910,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         aug_key, aug_url = get_augestel_config()
         mask = f"••••{aug_key[-4:]}" if aug_key else "None"
         text = (
-            f"🌐 <b>Setup Augestel / OTPMan API</b>\n"
+            f"🌐 <b>Setup Augestel Service API</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Current Key:</b> <code>{mask}</code>\n"
             f"• <b>Current URL:</b> <code>{html.escape(aug_url)}</code>\n"
@@ -4875,12 +4930,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ksi_key, ksi_url = get_otpman2_config()
         mask = f"••••{ksi_key[-4:]}" if ksi_key else "None"
         text = (
-            f"🌐 <b>Setup KSI / OTPMan2 API</b>\n"
+            f"🌐 <b>Setup KSI Service API</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Current Key:</b> <code>{mask}</code>\n"
             f"• <b>Current URL:</b> <code>{html.escape(ksi_url)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Send your new <b>KSI / OTPMan2 API Key</b> by typing it in this chat.\n\n"
+            f"Send your new <b>KSI Service API Key</b> by typing it in this chat.\n\n"
             f"💡 <i>To set both Key and URL together, use:</i>\n"
             f"<code>&lt;api_key&gt; | https://your-domain.com</code>\n\n"
             f"<i>Send <code>CANCEL</code> to abort.</i>"
@@ -4891,10 +4946,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
-    # 6-d. Connected OTP Bots Status Diagnostic Check
-    elif (data == "admin_otp_status" or data == "admin_otp_status_refresh") and user_admin:
-        await query.answer("⏳ Pinging connected OTP APIs...")
-        status_data = await check_all_connected_apis_status()
+    # 6-d. Connected Provider Services Status Diagnostic Check
+    elif (data in ("admin_otp_status", "admin_otp_status_refresh", "admin_api_status", "admin_api_status_refresh")) and user_admin:
+        force = ("refresh" in data)
+        await query.answer("⏳ Checking connected provider APIs...")
+        status_data = await check_all_connected_apis_status(force=force)
         report_text = format_api_status_report(status_data)
         try:
             await query.edit_message_text(
@@ -5795,7 +5851,7 @@ def main():
                 BotCommand("seturl", "🌐 View / Update Provider URLs"),
                 BotCommand("setthirdwave", "🔑 Set Thirdwave Key / URL"),
                 BotCommand("setaugestel", "🔑 Set Augestel Key / URL"),
-                BotCommand("setotpman2", "🔑 Set KSI/OTPMan2 Key / URL"),
+                BotCommand("setotpman2", "🔑 Set KSI Service Key / URL"),
                 BotCommand("setname", "✏️ Change bot display name"),
                 BotCommand("resetname", "🔄 Reset bot display name"),
                 BotCommand("admins", "👥 View Active Administrators"),
@@ -5804,8 +5860,8 @@ def main():
                 BotCommand("removeuser", "🗑️ Permanently purge user"),
                 BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
                 BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
-                BotCommand("setgroup", "🔗 Set OTP Group link & name"),
-                BotCommand("setgroupname", "🏷️ Set OTP Group button label"),
+                BotCommand("setgroup", "🔗 Set Channel link & name"),
+                BotCommand("setgroupname", "🏷️ Set Channel button label"),
                 BotCommand("user", "👤 Lookup user details & usage"),
                 BotCommand("stats", "📊 View live system statistics"),
                 BotCommand("help", "ℹ️ How to use the bot"),

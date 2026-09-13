@@ -1465,19 +1465,8 @@ def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", f
     low_msg = raw_message.lower()
     wa_keywords = ["whatsapp", "‏واتساب‏", "واتساب", "ватсап", "wa code", "wa.me"]
     is_wa = "whatsapp" in low_source or any(k in low_msg for k in wa_keywords)
-    wa_tag = ""
-    if is_wa:
-        if "whatsapp" not in low_source:
-            source = "WhatsApp"
-        old_indicators = [
-            "new device", "being registered", "dispositivo nuevo", "nuevo dispositivo",
-            "novo aparelho", "novo dispositivo", "новом устройстве", "нового устройства",
-            "perangkat baru", "neuem gerät", "neuen gerat", "nouvel appareil",
-            "nuovo dispositivo", "yeni bir cihaz", "nowym urządzeniu", "nowe urządzenie",
-            "جهاز جديد", "دستگاه جدید", "dispositif nouveau",
-        ]
-        is_old = any(ind in low_msg for ind in old_indicators)
-        wa_tag = "OLD" if is_old else "NEW"
+    if is_wa and "whatsapp" not in low_source:
+        source = "WhatsApp"
 
     DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
@@ -1492,10 +1481,7 @@ def format_user_otp_notification(item: Dict[str, Any], country_hint: str = "", f
     else:
         lines.append(f"• <b>Country:</b> {flag} <code>{html.escape(country_name)} ({iso})</code>")
 
-    if is_wa and wa_tag:
-        lines.append(f"• <b>Service:</b> <code>{source}</code> <b>[{wa_tag}]</b>")
-    else:
-        lines.append(f"• <b>Service:</b> <code>{source}</code>")
+    lines.append(f"• <b>Service:</b> <code>{source}</code>")
 
     if final_num:
         lines.append(f"• <b>Country:</b> <code>{html.escape(country_name)} ({iso})</code>")

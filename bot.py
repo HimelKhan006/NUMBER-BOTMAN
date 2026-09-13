@@ -3324,6 +3324,60 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ])
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to restart the bot, perform database checkpoint, and trigger next cloud runner."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    msg = await update.message.reply_text(
+        "🔄 <b>Restarting Bot Engine...</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💾 <i>Saving databases & syncing state to cloud Gist...</i>\n"
+        "🚀 <i>Triggering clean handover to reload latest GitHub secrets...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        with get_main_db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        if os.path.exists(STOCKS_DIR):
+            for f in os.listdir(STOCKS_DIR):
+                if f.endswith(".db"):
+                    try:
+                        with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                            cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Checkpoint notice: {e}")
+
+    if gist_storage.enabled:
+        try:
+            await gist_storage.export_and_sync(is_handover=True)
+        except Exception as e:
+            logger.warning(f"Gist sync error: {e}")
+
+    try:
+        await msg.edit_text(
+            "✅ <b>Database Saved! Handover Initiated.</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🔄 <i>Bot is now restarting with fresh environment variables & secrets.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    async def _do_stop():
+        await asyncio.sleep(1.0)
+        try:
+            context.application.stop_running()
+        except Exception:
+            import sys
+            sys.exit(0)
+
+    asyncio.create_task(_do_stop())
+
 async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View or update base URL for connected OTP providers.
     Usage:
@@ -5708,6 +5762,8 @@ def main():
     app.add_handler(CommandHandler("setotpman", setaugestel_command))
     app.add_handler(CommandHandler("setotpman2", setotpman2_command))
     app.add_handler(CommandHandler("setksi", setotpman2_command))
+    app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("reboot", restart_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
@@ -5734,6 +5790,7 @@ def main():
                 BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
                 BotCommand("status", "⚡ Live Zero-Restart Status"),
                 BotCommand("admin", "👑 Open Admin Management Panel"),
+                BotCommand("restart", "🔄 Reload Bot & Secrets"),
                 BotCommand("setquantity", "🔢 Set fixed quantity (1–1000)"),
                 BotCommand("seturl", "🌐 View / Update Provider URLs"),
                 BotCommand("setthirdwave", "🔑 Set Thirdwave Key / URL"),

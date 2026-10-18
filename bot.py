@@ -3328,14 +3328,12 @@ def format_delivered_numbers(
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery text with Country, File name, and Available numbers."""
+    """Builds clean, professional delivery text with Country and Available numbers."""
     flag, cname, _ = get_country_info_from_item({}, country_hint=country_name)
     display_cname = cname or country_name
-    file_name = display_cname if display_cname.lower().endswith(".txt") else f"{display_cname}.txt"
 
     lines = [
         f"<b>Country:</b> <code>{html.escape(display_cname)}</code>",
-        f"<b>File:</b> <code>{html.escape(file_name)}</code>",
     ]
     if available_count is not None:
         lines.append(f"<b>Available:</b> <code>{available_count} numbers</code>")
@@ -4227,7 +4225,7 @@ async def secretnumbers_command(update: Update, context: ContextTypes.DEFAULT_TY
             "<i>No secret numbers currently available in stock.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+                [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_secret_number")]
             ])
         )
         return
@@ -5770,7 +5768,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "Please check back soon or contact admin.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
+                    [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_secret_number")]
                 ])
             )
             return

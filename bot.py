@@ -6695,7 +6695,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "<i>No country files or numbers available to remove.</i>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
                     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )

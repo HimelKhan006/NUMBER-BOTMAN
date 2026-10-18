@@ -3328,21 +3328,18 @@ def format_delivered_numbers(
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery text with File name, Available numbers, and one-tap copy numbers."""
+    """Builds clean, professional delivery text with Country, File name, and Available numbers."""
     flag, cname, _ = get_country_info_from_item({}, country_hint=country_name)
     display_cname = cname or country_name
-    flag_str = f"{flag} " if (flag and flag != "🌐") else ""
+    file_name = display_cname if display_cname.lower().endswith(".txt") else f"{display_cname}.txt"
 
     lines = [
-        f"📁 <b>File:</b> {flag_str}<code>{html.escape(display_cname)}</code>",
+        f"<b>Country:</b> <code>{html.escape(display_cname)}</code>",
+        f"<b>File:</b> <code>{html.escape(file_name)}</code>",
     ]
     if available_count is not None:
-        lines.append(f"📊 <b>Available:</b> <code>{available_count} numbers</code>")
+        lines.append(f"<b>Available:</b> <code>{available_count} numbers</code>")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-
-    for n in numbers:
-        clean = _clean_number(n, with_plus)
-        lines.append(f"<code>{clean}</code>")
 
     return "\n".join(lines)
 
@@ -3443,14 +3440,19 @@ def get_numbers_view_keyboard(
             if CopyTextButton is not None:
                 btn_rows.append([
                     InlineKeyboardButton(
-                        f"📋  {clean}",
+                        clean,
                         copy_text=CopyTextButton(text=clean)
                     )
                 ])
             else:
                 btn_rows.append([
-                    InlineKeyboardButton(f"📋  {clean}", callback_data=f"copy_num_{country_id}")
+                    InlineKeyboardButton(clean, callback_data=f"copy_num_{country_id}")
                 ])
+
+    # Notification / Group channel button placed at the top of Next and Change buttons
+    group_link = get_otp_group_link()
+    if group_link:
+        btn_rows.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
 
     btn_rows.append([
         InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
@@ -3462,10 +3464,6 @@ def get_numbers_view_keyboard(
     else:
         toggle_btn = InlineKeyboardButton("➕ Add '+'", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
     btn_rows.append([toggle_btn])
-
-    group_link = get_otp_group_link()
-    if group_link:
-        btn_rows.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
 
     return InlineKeyboardMarkup(btn_rows)
 
@@ -5875,10 +5873,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if query.message and query.message.reply_markup:
             for r in query.message.reply_markup.inline_keyboard:
                 for b in r:
-                    if b.text and "📋" in b.text:
-                        num = b.text.replace("📋", "").strip()
-                        if num:
-                            found_nums.append(num)
+                    if b.text:
+                        cleaned_btn_text = b.text.replace("📋", "").strip()
+                        if re.match(r"^\+?\d{7,16}$", cleaned_btn_text):
+                            found_nums.append(cleaned_btn_text)
 
         if not found_nums:
             current_text = query.message.text_html or query.message.text or ""

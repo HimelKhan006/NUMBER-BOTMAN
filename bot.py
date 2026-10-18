@@ -3970,7 +3970,6 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt")
         ],
         [
-            InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_files_menu"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
     ])
@@ -7137,9 +7136,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-                [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
-                [InlineKeyboardButton("📁 All Uploaded Files", callback_data="admin_uploaded_files")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_uploaded_files")]
             ])
         )
 

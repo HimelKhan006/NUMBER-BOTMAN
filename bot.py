@@ -3916,8 +3916,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
         f"• <b>OTP Channel:</b> {link_display}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Select an option below to manage:</i>"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -3942,7 +3941,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
         [
-            InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")
+            InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")
         ]
     ])
     return admin_text, keyboard

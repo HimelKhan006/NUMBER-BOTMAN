@@ -3359,8 +3359,9 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
     ]
-    if user_id and is_admin(user_id):
+    if user_id and (is_admin(user_id) or user_has_secret_access(user_id)):
         keyboard.append([KeyboardButton("🔒 Secret Numbers")])
+    if user_id and is_admin(user_id):
         keyboard.append([KeyboardButton("👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -4344,6 +4345,15 @@ async def grantsecret_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     u = get_user_details(target_id)
     uname = f"@{u['username']}" if u and u.get('username') else (u.get('first_name') if u else str(target_id))
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🎉 <b>Secret Numbers Access Granted!</b>\n\nYou are now authorized to access the <b>🔒 Secret Numbers Pool</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_user_reply_keyboard(target_id)
+        )
+    except Exception:
+        pass
     await update.message.reply_text(
         f"🔓 <b>Secret Numbers Access Granted!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -4378,6 +4388,15 @@ async def revokesecret_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     u = get_user_details(target_id)
     uname = f"@{u['username']}" if u and u.get('username') else (u.get('first_name') if u else str(target_id))
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🔒 <b>Secret Numbers Access Revoked.</b>\n\nYour access to the Secret Numbers Pool has been removed.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_user_reply_keyboard(target_id)
+        )
+    except Exception:
+        pass
     await update.message.reply_text(
         f"🔒 <b>Secret Numbers Access Revoked!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -5154,7 +5173,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await admin_command(update, context)
         return
 
-    if text in ["🔒 Secret Numbers", "/secretnumbers"] and is_admin(user.id):
+    if text in ["🔒 Secret Numbers", "/secretnumbers"] and (is_admin(user.id) or user_has_secret_access(user.id)):
         await secretnumbers_command(update, context)
         return
 
@@ -6923,6 +6942,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         status_alert = "🔓 Secret Access Granted!" if new_val else "🔒 Secret Access Revoked!"
         await query.answer(status_alert, show_alert=True)
+
+        try:
+            if new_val:
+                notice = "🎉 <b>Secret Numbers Access Granted!</b>\n\nYou are now authorized to access the <b>🔒 Secret Numbers Pool</b>."
+            else:
+                notice = "🔒 <b>Secret Numbers Access Revoked.</b>\n\nYour access to the Secret Numbers Pool has been removed."
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=notice,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(target_id)
+            )
+        except Exception:
+            pass
 
         profile_text = (
             f"👤 <b>User Account Details</b>\n"

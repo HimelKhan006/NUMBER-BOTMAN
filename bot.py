@@ -3303,33 +3303,17 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
     Minimal professional reply keyboard:
     Row 1: ⚡ Get Number
-    Row 2: 👑 Admin Panel (admins only)
+    Row 2: 🔒 Secret Numbers (admins only)
+    Row 3: 👑 Admin Panel (admins only)
     """
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
     ]
     if user_id and is_admin(user_id):
+        keyboard.append([KeyboardButton("🔒 Secret Numbers")])
         keyboard.append([KeyboardButton("👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
-    """Builds a clean, professional main menu keyboard."""
-    buttons = [
-        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-    ]
-
-    # Secret numbers visible only to admins (not to regular users)
-    if user_id and is_admin(user_id):
-        buttons.append([InlineKeyboardButton("🔒 Secret Numbers", callback_data="btn_get_secret_number")])
-
-    group_link = get_otp_group_link()
-    if group_link:
-        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
-
-    if user_id and is_admin(user_id):
-        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-
-    return InlineKeyboardMarkup(buttons)
 
 def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool = False, is_secret_mode: bool = False) -> InlineKeyboardMarkup:
     countries = get_all_countries_with_stock(only_active=(not is_admin_mode), secret_mode=is_secret_mode)
@@ -3940,9 +3924,6 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_files_menu"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
-        [
-            InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")
-        ]
     ])
     return admin_text, keyboard
 
@@ -5102,6 +5083,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await admin_command(update, context)
         return
 
+    if text in ["🔒 Secret Numbers", "/secretnumbers"] and is_admin(user.id):
+        await secretnumbers_command(update, context)
+        return
+
     if not is_user_authorized(user.id):
         return
 
@@ -5634,17 +5619,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    # 1. Main Menu
+    # 1. Main Menu - dismiss inline, welcome shown via reply keyboard
     if data == "btn_main_menu":
         welcome_text = (
             f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
             f"⚡ <b>Ready to get numbers:</b> Tap <b>⚡ Get Number</b> below."
         )
-        await query.edit_message_text(
-            welcome_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_main_menu_keyboard(user.id)
-        )
+        try:
+            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML)
+        except Exception:
+            await query.message.reply_text(welcome_text, parse_mode=ParseMode.HTML,
+                                           reply_markup=get_user_reply_keyboard(user.id))
 
     # 2. Get Standard Numbers -> Choose Country
     elif data == "btn_get_number" or data.startswith("page_std_") or (data.startswith("page_") and not data.startswith("page_adm_") and not data.startswith("page_sec_") and not data.startswith("page_users_") and not data.startswith("page_rmfiles_") and not data.startswith("page_upfiles_")):

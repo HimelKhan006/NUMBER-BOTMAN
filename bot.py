@@ -3966,7 +3966,6 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕ Add Numbers", callback_data="admin_upload_prompt"),
             InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
         ],
         [
@@ -6623,7 +6622,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "Upload your first file (.txt) to start serving numbers!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
                     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )
@@ -6660,7 +6658,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")])
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
 
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
@@ -7158,8 +7155,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-                [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")],
-                [InlineKeyboardButton("📁 All Uploaded Files", callback_data="admin_uploaded_files")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
         )
@@ -7355,10 +7350,9 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. Minimal user command menu - just what's needed
+            # 1. Minimal user command menu - just start
             user_commands = [
                 BotCommand("start", "🚀 Main Menu"),
-                BotCommand("getnumber", "⚡ Get Number"),
             ]
             await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
             await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -7366,7 +7360,6 @@ def main():
             # 2. Admin command menu - includes admin tools
             admin_commands = [
                 BotCommand("start", "🚀 Main Menu"),
-                BotCommand("getnumber", "⚡ Get Number"),
                 BotCommand("admin", "👑 Admin Panel"),
                 BotCommand("stats", "📊 Live Statistics"),
             ]
@@ -7377,8 +7370,6 @@ def main():
                     except Exception:
                         pass
             logger.info("✅ Telegram Bot Command Menu & Menu Button configured cleanly.")
-        except Exception as e:
-            logger.warning(f"Could not configure Bot Command Menu: {e}")
         except Exception as e:
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 

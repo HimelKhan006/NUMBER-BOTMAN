@@ -3318,6 +3318,10 @@ def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
     ]
 
+    # Secret numbers visible only to admins (not to regular users)
+    if user_id and is_admin(user_id):
+        buttons.append([InlineKeyboardButton("🔒 Secret Numbers", callback_data="btn_get_secret_number")])
+
     group_link = get_otp_group_link()
     if group_link:
         buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
@@ -5635,7 +5639,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "btn_main_menu":
         welcome_text = (
             f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-            f"Select an option below to get numbers:"
+            f"⚡ <b>Ready to get numbers:</b> Tap <b>⚡ Get Number</b> below."
         )
         await query.edit_message_text(
             welcome_text,
@@ -5649,11 +5653,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
         if not countries:
             await query.edit_message_text(
-                "⚠️ <b>No numbers are currently available in stock.</b>\n\n"
-                "Please check back soon or contact the admin to upload new numbers.",
+                "⚠️ <b>No numbers are currently available in stock.</b>\n"
+                "Please check back soon or contact the admin.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
+                    [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_number")]
                 ])
             )
             return
@@ -7289,24 +7293,20 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. Clean, minimal default user command menu (no duplicates/clutter)
+            # 1. Minimal user command menu - just what's needed
             user_commands = [
                 BotCommand("start", "🚀 Main Menu"),
                 BotCommand("getnumber", "⚡ Get Number"),
-                BotCommand("history", "👤 My History"),
-                BotCommand("help", "🎧 Help & Support"),
             ]
             await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
             await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-            # 2. Clean, focused admin command menu (all advanced settings accessible via /admin)
+            # 2. Admin command menu - includes admin tools
             admin_commands = [
                 BotCommand("start", "🚀 Main Menu"),
                 BotCommand("getnumber", "⚡ Get Number"),
-                BotCommand("admin", "👑 Admin Management Panel"),
+                BotCommand("admin", "👑 Admin Panel"),
                 BotCommand("stats", "📊 Live Statistics"),
-                BotCommand("history", "👤 My History"),
-                BotCommand("help", "🎧 Help & Support"),
             ]
             for aid in get_all_admin_ids():
                 if aid:

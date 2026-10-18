@@ -3412,22 +3412,20 @@ def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plu
     else:
         toggle_btn = InlineKeyboardButton("➕ Add '+'", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
 
+    # Row 1: Next Number | Change Country
+    # Row 2: toggle +/- (full width, clean)
+    # Row 3: group notification link (if configured)
     btn_rows = [
         [
             InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
             InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
         ],
-        [toggle_btn]
+        [toggle_btn],
     ]
-
-    if not is_fixed:
-        btn_rows[1].append(InlineKeyboardButton(f"🔢 Qty: {quantity}", callback_data=f"user_qty_menu_{country_id}_{sec_tag}"))
 
     group_link = get_otp_group_link()
     if group_link:
         btn_rows.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
-
-    btn_rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")])
     return InlineKeyboardMarkup(btn_rows)
 
 def get_user_quantity_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:

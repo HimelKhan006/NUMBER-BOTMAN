@@ -3301,45 +3301,22 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
-    Builds the persistent mobile reply keyboard menu matching user specification:
+    Minimal professional reply keyboard:
     Row 1: ⚡ Get Number
-    Row 2: 👤 My History
-    Row 3: 💳 Withdraw | 💬 Ws Checker
-    Row 4: 🎓 Language | 🎧 Help
-    Row 5: 📁 File Number
-    Row 6: 👑 Admin Panel (if admin)
+    Row 2: 👑 Admin Panel (admins only)
     """
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
-        [KeyboardButton("👤 My History")],
-        [KeyboardButton("💳 Withdraw"), KeyboardButton("💬 Ws Checker")],
-        [KeyboardButton("🎓 Language"), KeyboardButton("🎧 Help")],
-        [KeyboardButton("📁 File Number")],
     ]
     if user_id and is_admin(user_id):
         keyboard.append([KeyboardButton("👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
-    """Builds the main menu keyboard with standard and secret number options."""
+    """Builds a clean, professional main menu keyboard."""
     buttons = [
-        [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")],
+        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
     ]
-
-    # Display Secret Numbers button if admin or user has whitelisted secret access
-    if user_id and user_has_secret_access(user_id):
-        buttons.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
-
-    # Quick toggle / status of user's preferred number format (with + or without +)
-    if user_id:
-        pref_plus = get_user_plus_preference(user_id)
-        fmt_label = "⚙️ Format: With '+' (+123) (Tap to switch)" if pref_plus else "⚙️ Format: Without '+' (123) (Tap to switch)"
-        buttons.append([InlineKeyboardButton(fmt_label, callback_data="btn_toggle_plus_pref")])
-
-    buttons.append([
-        InlineKeyboardButton("📊 Number Inventory", callback_data="btn_inventory"),
-        InlineKeyboardButton("ℹ️ Help / Info", callback_data="btn_help")
-    ])
 
     group_link = get_otp_group_link()
     if group_link:

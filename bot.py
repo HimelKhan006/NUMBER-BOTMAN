@@ -3287,15 +3287,41 @@ async def send_startup_announcement(application: Application):
 # ==========================================
 # 9. Keyboards & Views
 # ==========================================
+def _clean_number(n: str, with_plus: bool = True) -> str:
+    """Returns a consistently formatted phone number."""
+    raw = n.strip()
+    if with_plus:
+        return f"+{raw.lstrip('+')}"
+    return raw.lstrip("+")
+
+def _get_prefix(numbers: List[str]) -> str:
+    """Derives the shared prefix from delivered numbers (first 4 digits after country code)."""
+    try:
+        sample = numbers[0].strip().lstrip("+")
+        return sample[:4] + "XXX" if len(sample) >= 4 else sample
+    except Exception:
+        return ""
+
+def format_delivered_numbers_header(numbers: List[str], country_name: str, with_plus: bool = True) -> str:
+    """Builds the header text shown above the number buttons."""
+    prefix = _get_prefix(numbers)
+    flag, cname, _ = get_country_info_from_item({}, country_hint=country_name)
+    display_cname = cname or country_name
+    flag_str = f"{flag} " if flag else ""
+
+    lines = [
+        f"{flag_str}<b>{html.escape(display_cname)} Allocated</b>  📱 WhatsApp",
+        f"Otp Rate : <code>$0.00</code>",
+        f"Waiting for OTP.....",
+        f"Prefix: <code>{prefix}</code>",
+    ]
+    return "\n".join(lines)
+
 def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -> str:
-    """Delivers numbers with zero extra text: pure monospace numbers ready for one-tap copying."""
+    """Legacy: plain text number list (kept for compatibility)."""
     lines = []
     for n in numbers:
-        raw = n.strip()
-        if with_plus:
-            clean = f"+{raw.lstrip('+')}"
-        else:
-            clean = raw.lstrip("+")
+        clean = _clean_number(n, with_plus)
         lines.append(f"<code>{clean}</code>")
     return "\n".join(lines)
 
@@ -3366,31 +3392,66 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
     return InlineKeyboardMarkup(buttons)
 
-def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plus: bool = True, quantity: int = 10, is_fixed: bool = False) -> InlineKeyboardMarkup:
-    """Builds clean, simple action keyboard for delivered numbers."""
+def get_numbers_view_keyboard(
+    country_id: int,
+    is_secret: bool = False,
+    with_plus: bool = True,
+    quantity: int = 10,
+    is_fixed: bool = False,
+    numbers: Optional[List[str]] = None
+) -> InlineKeyboardMarkup:
+    """Builds the number delivery keyboard: each number as a copy+WhatsApp row."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
     sec_tag = "sec" if is_secret else "std"
 
-    if with_plus:
-        toggle_btn = InlineKeyboardButton("➖ Remove '+'", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
-    else:
-        toggle_btn = InlineKeyboardButton("➕ Add '+'", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
+    btn_rows = []
 
-    # Row 1: Next Number | Change Country
-    # Row 2: toggle +/- (full width, clean)
-    # Row 3: group notification link (if configured)
-    btn_rows = [
-        [
-            InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
-            InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
-        ],
-        [toggle_btn],
-    ]
+    # --- Number rows: each number gets its own [📋 Copy] [↗️ WhatsApp] row ---
+    if numbers:
+        for n in numbers:
+            clean = _clean_number(n, with_plus)
+            wa_number = clean.lstrip("+")
+            row = [
+                InlineKeyboardButton(
+                    f"📋  {clean}",
+                    callback_data=f"copy_num_{country_id}"
+                ),
+            ]
+            # CopyTextButton available in PTB v21+
+            if CopyTextButton is not None:
+                row = [
+                    InlineKeyboardButton(
+                        f"📋  {clean}",
+                        copy_text=CopyTextButton(text=clean)
+                    ),
+                    InlineKeyboardButton("↩️", url=f"https://wa.me/{wa_number}")
+                ]
+            else:
+                row = [
+                    InlineKeyboardButton(f"📋  {clean}", callback_data=f"copy_num_{country_id}"),
+                    InlineKeyboardButton("↩️", url=f"https://wa.me/{wa_number}")
+                ]
+            btn_rows.append(row)
 
+    # --- OTP Group link ---
     group_link = get_otp_group_link()
     if group_link:
         btn_rows.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
+
+    # --- Toggle + prefix ---
+    if with_plus:
+        toggle_btn = InlineKeyboardButton("➖ Remove Country Code", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
+    else:
+        toggle_btn = InlineKeyboardButton("➕ Add Country Code", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
+    btn_rows.append([toggle_btn])
+
+    # --- Country | Change ---
+    btn_rows.append([
+        InlineKeyboardButton("🌍 Country", callback_data=country_cb),
+        InlineKeyboardButton("🔄 Change", callback_data=change_cb)
+    ])
+
     return InlineKeyboardMarkup(btn_rows)
 
 def get_user_quantity_keyboard(country_id: int, is_secret: bool = False) -> InlineKeyboardMarkup:
@@ -3714,11 +3775,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
                 if numbers:
                     pref_plus = get_user_plus_preference(user.id)
-                    msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                    msg = format_delivered_numbers_header(numbers, cname, with_plus=pref_plus)
                     await update.message.reply_text(
                         msg,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                     )
                     if gist_storage.enabled:
                         asyncio.create_task(gist_storage.export_and_sync())
@@ -4113,11 +4174,11 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
         if numbers:
             pref_plus = get_user_plus_preference(user.id)
-            clean_msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+            clean_msg = format_delivered_numbers_header(numbers, cname, with_plus=pref_plus)
             await update.message.reply_text(
                 clean_msg,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
             )
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
@@ -5038,11 +5099,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
             if numbers:
                 pref_plus = get_user_plus_preference(user.id)
-                clean_msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                clean_msg = format_delivered_numbers_header(numbers, cname, with_plus=pref_plus)
                 await update.message.reply_text(
                     clean_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                 )
                 if gist_storage.enabled:
                     asyncio.create_task(gist_storage.export_and_sync())
@@ -5619,8 +5680,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    # 1. Main Menu - dismiss inline, welcome shown via reply keyboard
-    if data == "btn_main_menu":
+    # 1. Copy number button callback (fallback for older clients)
+    if data.startswith("copy_num_"):
+        await query.answer("📋 Copied to clipboard!")
+        return
+
+    # 1b. Main Menu - dismiss inline, welcome shown via reply keyboard
+    elif data == "btn_main_menu":
         welcome_text = (
             f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
             f"⚡ <b>Ready to get numbers:</b> Tap <b>⚡ Get Number</b> below."
@@ -5630,6 +5696,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             await query.message.reply_text(welcome_text, parse_mode=ParseMode.HTML,
                                            reply_markup=get_user_reply_keyboard(user.id))
+        return
 
     # 2. Get Standard Numbers -> Choose Country
     elif data == "btn_get_number" or data.startswith("page_std_") or (data.startswith("page_") and not data.startswith("page_adm_") and not data.startswith("page_sec_") and not data.startswith("page_users_") and not data.startswith("page_rmfiles_") and not data.startswith("page_upfiles_")):
@@ -5659,11 +5726,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 if gist_storage.enabled:
                     asyncio.create_task(gist_storage.export_and_sync())
                 pref_plus = get_user_plus_preference(user.id)
-                response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                response_text = format_delivered_numbers_header(numbers, country_name, with_plus=pref_plus)
                 await query.edit_message_text(
                     response_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                 )
                 return
 
@@ -5732,11 +5799,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+        response_text = format_delivered_numbers_header(numbers, country_name, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
         )
 
     # 3b. Deliver Secret Numbers
@@ -5771,11 +5838,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+        response_text = format_delivered_numbers_header(numbers, country_name, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
         )
 
     # 3c. Interactive Instant '+' Toggle for Delivered Numbers
@@ -5791,12 +5858,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         limit, is_fixed = get_effective_quantity_for_user(user.id)
 
         current_text = query.message.text_html or query.message.text or ""
-        found_nums = re.findall(r"<code>([^<]+)</code>", current_text)
+        found_nums = []
+        if query.message and query.message.reply_markup:
+            for r in query.message.reply_markup.inline_keyboard:
+                for b in r:
+                    if b.text and "📋" in b.text:
+                        num = b.text.replace("📋", "").strip()
+                        if num:
+                            found_nums.append(num)
+
         if not found_nums:
             found_nums = re.findall(r"\+?\d{6,16}", current_text)
 
+        c_info = get_country_by_id(country_id)
+        cname = c_info["name"] if c_info else "Allocated"
+
         if found_nums:
-            new_text = format_delivered_numbers_clean(found_nums, with_plus=target_plus)
+            new_text = format_delivered_numbers_header(found_nums, cname, with_plus=target_plus)
         else:
             new_text = current_text
 
@@ -5806,7 +5884,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 new_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus, quantity=limit, is_fixed=is_fixed)
+                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus, quantity=limit, is_fixed=is_fixed, numbers=found_nums)
             )
         except Exception as e:
             logger.debug(f"Toggle plus message update notice: {e}")
@@ -5857,11 +5935,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+        response_text = format_delivered_numbers_header(numbers, country_name, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=pref_plus, quantity=chosen_qty, is_fixed=False)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=pref_plus, quantity=chosen_qty, is_fixed=False, numbers=numbers)
         )
 
     # 3f. Expand Full Received SMS Text

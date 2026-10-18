@@ -58,6 +58,7 @@ import logging
 import asyncio
 import time
 import argparse
+import io
 import unicodedata
 from typing import Set, Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -68,6 +69,8 @@ from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChat,
@@ -3284,6 +3287,39 @@ async def send_startup_announcement(application: Application):
 # ==========================================
 # 9. Keyboards & Views
 # ==========================================
+def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -> str:
+    """Delivers numbers with zero extra text: pure monospace numbers ready for one-tap copying."""
+    lines = []
+    for n in numbers:
+        raw = n.strip()
+        if with_plus:
+            clean = f"+{raw.lstrip('+')}"
+        else:
+            clean = raw.lstrip("+")
+        lines.append(f"<code>{clean}</code>")
+    return "\n".join(lines)
+
+def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
+    """
+    Builds the persistent mobile reply keyboard menu matching user specification:
+    Row 1: ⚡ Get Number
+    Row 2: 👤 My History
+    Row 3: 💳 Withdraw | 💬 Ws Checker
+    Row 4: 🎓 Language | 🎧 Help
+    Row 5: 📁 File Number
+    Row 6: 👑 Admin Panel (if admin)
+    """
+    keyboard = [
+        [KeyboardButton("⚡ Get Number")],
+        [KeyboardButton("👤 My History")],
+        [KeyboardButton("💳 Withdraw"), KeyboardButton("💬 Ws Checker")],
+        [KeyboardButton("🎓 Language"), KeyboardButton("🎧 Help")],
+        [KeyboardButton("📁 File Number")],
+    ]
+    if user_id and is_admin(user_id):
+        keyboard.append([KeyboardButton("👑 Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 def get_main_menu_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
     """Builds the main menu keyboard with standard and secret number options."""
     buttons = [
@@ -3366,27 +3402,26 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     return InlineKeyboardMarkup(buttons)
 
 def get_numbers_view_keyboard(country_id: int, is_secret: bool = False, with_plus: bool = True, quantity: int = 10, is_fixed: bool = False) -> InlineKeyboardMarkup:
-    """Builds number result keyboard with dynamic '+' toggle button, quantity selector, and OTP Group."""
+    """Builds clean, simple action keyboard for delivered numbers."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
     sec_tag = "sec" if is_secret else "std"
 
     if with_plus:
-        toggle_btn = InlineKeyboardButton("➖ Remove '+' Prefix", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
+        toggle_btn = InlineKeyboardButton("➖ Remove '+'", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
     else:
-        toggle_btn = InlineKeyboardButton("➕ Add '+' Prefix", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
+        toggle_btn = InlineKeyboardButton("➕ Add '+'", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
 
-    btn_rows = [[toggle_btn]]
+    btn_rows = [
+        [
+            InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
+            InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
+        ],
+        [toggle_btn]
+    ]
 
-    # If quantity is not fixed globally by admin, give user the button to change quantity (1-10)
     if not is_fixed:
-        qty_btn = InlineKeyboardButton(f"🔢 Quantity: {quantity} (Change 1-10)", callback_data=f"user_qty_menu_{country_id}_{sec_tag}")
-        btn_rows.append([qty_btn])
-
-    btn_rows.append([
-        InlineKeyboardButton(f"🔄 Get {quantity} More Numbers", callback_data=change_cb),
-        InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
-    ])
+        btn_rows[1].append(InlineKeyboardButton(f"🔢 Qty: {quantity}", callback_data=f"user_qty_menu_{country_id}_{sec_tag}"))
 
     group_link = get_otp_group_link()
     if group_link:
@@ -3464,7 +3499,218 @@ def get_admin_setup_apis_keyboard() -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 10. Command Handlers
+# 10. Reply Keyboard Views & Action Handlers
+# ==========================================
+async def show_user_history(update: Update, user_id: int, user_name: str):
+    """Displays user's assigned numbers and recent OTPs history."""
+    with get_main_db() as conn:
+        urow = conn.execute("SELECT numbers_consumed FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+        consumed = urow["numbers_consumed"] if urow and urow["numbers_consumed"] is not None else 0
+        try:
+            used_count = conn.execute("SELECT COUNT(*) FROM used_numbers WHERE user_id = ?;", (user_id,)).fetchone()[0]
+            if used_count > consumed:
+                consumed = used_count
+        except Exception:
+            pass
+
+        otp_count = 0
+        try:
+            otp_count = conn.execute("SELECT COUNT(*) FROM processed_otps WHERE user_id = ?;", (user_id,)).fetchone()[0]
+        except Exception:
+            pass
+
+        active_nums = []
+        try:
+            cur = conn.execute("SELECT number, country_name FROM active_user_numbers WHERE user_id = ? ORDER BY assigned_at DESC LIMIT 6;", (user_id,))
+            active_nums = cur.fetchall()
+        except Exception:
+            pass
+
+        recent_otps = []
+        try:
+            cur = conn.execute("SELECT number, otp_code, provider, received_at FROM processed_otps WHERE user_id = ? ORDER BY received_at DESC LIMIT 4;", (user_id,))
+            recent_otps = cur.fetchall()
+        except Exception:
+            pass
+
+    history_text = (
+        f"👤 <b>My Account History</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+        f"📱 <b>Total Numbers Taken:</b> <code>{consumed}</code>\n"
+        f"📩 <b>Total OTPs Received:</b> <code>{otp_count}</code>\n\n"
+    )
+
+    if active_nums:
+        history_text += "📋 <b>Active Numbers:</b>\n"
+        for r in active_nums:
+            c_tag = f" ({r['country_name']})" if r["country_name"] else ""
+            history_text += f"• <code>{r['number']}</code>{c_tag}\n"
+        history_text += "\n"
+    else:
+        history_text += "📋 <b>Active Numbers:</b> <i>No active numbers currently</i>\n\n"
+
+    if recent_otps:
+        history_text += "⚡ <b>Recent Received OTPs:</b>\n"
+        for o in recent_otps:
+            num_short = o["number"]
+            history_text += f"• <code>{num_short}</code> ➔ <b>{o['otp_code']}</b>\n"
+    else:
+        history_text += "⚡ <b>Recent OTPs:</b> <i>None received yet</i>\n"
+
+    buttons = [
+        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
+        [InlineKeyboardButton("🔄 Refresh History", callback_data="btn_refresh_history")]
+    ]
+    await update.message.reply_text(history_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_user_withdraw(update: Update, user_id: int):
+    """Displays user earnings, balance and withdrawal options."""
+    group_link = get_otp_group_link()
+    support_btn = [InlineKeyboardButton(get_otp_group_name(), url=group_link)] if group_link else []
+    admin_ids = get_all_admin_ids()
+    if not support_btn and admin_ids:
+        support_btn = [InlineKeyboardButton("💬 Contact Support", url=f"tg://user?id={admin_ids[0]}")]
+
+    buttons = []
+    if support_btn:
+        buttons.append(support_btn)
+    buttons.append([InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")])
+
+    text = (
+        f"💳 <b>Withdrawal & Balance</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Account ID:</b> <code>{user_id}</code>\n"
+        f"💵 <b>Available Balance:</b> <code>$0.00 USD</code>\n"
+        f"⏳ <b>Pending Balance:</b> <code>$0.00 USD</code>\n"
+        f"🔒 <b>Minimum Payout:</b> <code>$5.00 USD</code>\n\n"
+        f"🏦 <b>Supported Withdrawal Methods:</b>\n"
+        f"• USDT (TRC20 / BEP20)\n"
+        f"• Toncoin (TON)\n"
+        f"• Payeer / Crypto\n\n"
+        f"ℹ️ <i>Payouts are processed after reaching the minimum threshold. Contact support or admin to bind your payout wallet.</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_ws_checker_prompt(update: Update, user_id: int):
+    """Prompts user to send phone number for WhatsApp verification."""
+    USER_STATES[user_id] = {"awaiting_ws_check": True}
+    await update.message.reply_text(
+        "💬 <b>WhatsApp Number Checker</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Send or paste any phone number (with country code):\n\n"
+        "<i>Example:</i> <code>+62812345678</code> or <code>62812345678</code>\n\n"
+        "⚡ <i>Bot will generate instant one-tap WhatsApp direct chat links & checker actions.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def process_ws_check(update: Update, text: str):
+    """Generates direct WhatsApp link and status."""
+    digits = re.sub(r"\D", "", text)
+    if len(digits) < 7:
+        await update.message.reply_text("❌ Please enter a valid phone number with country code (e.g. <code>+62812345678</code>).", parse_mode=ParseMode.HTML)
+        return
+
+    wa_url = f"https://wa.me/{digits}"
+    await update.message.reply_text(
+        f"💬 <b>WhatsApp Link Generated</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Phone:</b> <code>+{digits}</code>\n"
+        f"🔗 <b>Direct Link:</b> <a href=\"{wa_url}\">{wa_url}</a>\n\n"
+        f"⚡ <i>Tap below to open chat in WhatsApp immediately:</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Open in WhatsApp", url=wa_url)],
+            [InlineKeyboardButton("⚡ Get Another Number", callback_data="btn_get_number")]
+        ])
+    )
+
+async def show_language_selector(update: Update, user_id: int):
+    """Shows user language selector interface."""
+    await update.message.reply_text(
+        "🎓 <b>Select Language / Choose Interface:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Select your preferred language:</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🇬🇧 English ✅", callback_data="ui_lang_en"),
+                InlineKeyboardButton("🇷🇺 Русский", callback_data="ui_lang_ru")
+            ],
+            [
+                InlineKeyboardButton("🇪🇸 Español", callback_data="ui_lang_es"),
+                InlineKeyboardButton("🇸🇦 العربية", callback_data="ui_lang_ar")
+            ],
+            [
+                InlineKeyboardButton("🇮🇩 Indonesia", callback_data="ui_lang_id"),
+                InlineKeyboardButton("🇧🇩 বাংলা", callback_data="ui_lang_bn")
+            ]
+        ])
+    )
+
+async def show_user_help(update: Update, user_id: int):
+    """Displays clean help guide."""
+    group_link = get_otp_group_link()
+    buttons = []
+    if group_link:
+        buttons.append([InlineKeyboardButton(get_otp_group_name(), url=group_link)])
+    buttons.append([InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")])
+
+    text = (
+        "🎧 <b>Help & Quick Instructions</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ <b>Get Number:</b> Click <b>⚡ Get Number</b> to receive an exclusive number.\n"
+        "2️⃣ <b>Instant Copy:</b> Tap the monospace number to copy it immediately.\n"
+        "3️⃣ <b>OTP Delivery:</b> When your service sends an SMS, your OTP will appear right here!\n"
+        "4️⃣ <b>Next Number:</b> Tap <b>🔄 Next Number</b> for the next one.\n"
+        "5️⃣ <b>WhatsApp Check:</b> Use <b>💬 Ws Checker</b> to verify numbers on WhatsApp.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Need assistance? Join our official support channel below.</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_file_number_menu(update: Update, user_id: int):
+    """Displays file number options & stock overview."""
+    stock_countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
+    if stock_countries:
+        lines = [f"• {c['name']}: <code>{c['available']} numbers</code>" for c in stock_countries[:8]]
+        if len(stock_countries) > 8:
+            lines.append(f"<i>...and {len(stock_countries) - 8} more countries</i>")
+        stock_summary = "\n".join(lines)
+    else:
+        stock_summary = "<i>No numbers in stock currently.</i>"
+
+    active_count = 0
+    with get_main_db() as conn:
+        try:
+            active_count = conn.execute("SELECT COUNT(*) FROM active_user_numbers WHERE user_id = ?;", (user_id,)).fetchone()[0]
+        except Exception:
+            pass
+        if active_count == 0:
+            try:
+                active_count = conn.execute("SELECT COUNT(*) FROM used_numbers WHERE user_id = ?;", (user_id,)).fetchone()[0]
+            except Exception:
+                pass
+
+    buttons = [
+        [InlineKeyboardButton("📊 View Full Inventory", callback_data="btn_inventory")],
+    ]
+    if active_count > 0:
+        buttons.append([InlineKeyboardButton(f"📥 Download My Numbers ({active_count}) .txt", callback_data="btn_download_my_numbers")])
+    buttons.append([InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")])
+
+    text = (
+        f"📁 <b>File Number & Stock Directory</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Current Available Stock:</b>\n"
+        f"{stock_summary}\n\n"
+        f"📱 <b>Your Active Numbers:</b> <code>{active_count} numbers</code>\n\n"
+        f"<i>Select an option below to view inventory or download your numbers file:</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+# ==========================================
+# 11. Command Handlers
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -3505,17 +3751,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
                 if numbers:
                     pref_plus = get_user_plus_preference(user.id)
-                    num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
-                    msg = (
-                        f"📱 <b>Your Exclusive Numbers — {cname}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚡ <i>Tap any number below to copy it:</i>\n\n"
-                        + "\n".join(num_lines) + "\n\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 <b>Remaining in Stock:</b> <code>{remaining} numbers</code>\n"
-                        f"🔒 <i>All {len(numbers)} numbers are reserved for you and removed from stock.</i>"
+                    msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                    await update.message.reply_text(
+                        msg,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
                     )
-                    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed))
                     if gist_storage.enabled:
                         asyncio.create_task(gist_storage.export_and_sync())
                     return
@@ -3523,11 +3764,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Error handling start deep link {arg}: {e}")
 
     welcome_text = (
-        f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-        f"Select an option below to get numbers:"
+        f"👋 <b>Welcome, {html.escape(user.first_name)}!</b>\n\n"
+        f"⚡ <b>Ready to get numbers:</b> Tap <b>⚡ Get Number</b> below."
     )
-    keyboard = get_main_menu_keyboard(user.id)
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_user_reply_keyboard(user.id)
+    )
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    await show_user_history(update, user.id, user.first_name)
 
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -3662,64 +3912,69 @@ async def languages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, markup = build_languages_menu(0)
     await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
+def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    stats = get_system_stats()
+    current_bot_name = get_bot_name()
+    fixed_qty = get_admin_fixed_quantity()
+    qty_label = f"Fixed ({fixed_qty})" if fixed_qty else "User Choice (1–10)"
+    sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
+    curr_link = get_otp_group_link()
+    link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
+
+    admin_text = (
+        f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Engine Status:</b> <code>Online & Delivering ✅</code>\n"
+        f"• <b>Quantity Mode:</b> <code>{qty_label}</code>\n"
+        f"• <b>SMS Forwarding:</b> <code>{'Active ✅' if sms_on else 'Disabled ❌'}</code>\n"
+        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Live Inventory:</b>\n"
+        f"• <b>Standard:</b> <code>{stats['total_std_available']} available</code>\n"
+        f"• <b>Secret Pool:</b> <code>{stats['total_sec_available']} available 🔒</code>\n"
+        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
+        f"• <b>Active Pools:</b> <code>{stats['active_countries']} pools</code>\n"
+        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
+        f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
+        f"• <b>OTP Channel:</b> {link_display}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <i>Select an option below to manage:</i>"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Add Numbers", callback_data="admin_upload_prompt"),
+            InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
+        ],
+        [
+            InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"),
+            InlineKeyboardButton(f"📡 SMS: {'ON ✅' if sms_on else 'OFF ❌'}", callback_data="admin_sms_menu")
+        ],
+        [
+            InlineKeyboardButton("👥 User Manager", callback_data="admin_users"),
+            InlineKeyboardButton("👑 Admins", callback_data="admin_manage_admins")
+        ],
+        [
+            InlineKeyboardButton("🔗 OTP Channel", callback_data="admin_set_group_prompt"),
+            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_files_menu"),
+            InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
+        ],
+        [
+            InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")
+        ]
+    ])
+    return admin_text, keyboard
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
         await update.message.reply_text("⛔ <b>Access Restricted.</b> This command is not available.", parse_mode=ParseMode.HTML)
         return
 
-    stats = get_system_stats()
-
-    uptime_secs = int(time.time() - bot_process_start_time)
-    hours, rem = divmod(uptime_secs, 3600)
-    mins, secs = divmod(rem, 60)
-    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
-
-    session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
-    if session_timeout > 0:
-        handover_secs = max(0, session_timeout - uptime_secs)
-        h_hours, h_rem = divmod(handover_secs, 3600)
-        h_mins, _ = divmod(h_rem, 60)
-        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
-    else:
-        handover_info = "<code>Always-Online (Continuous)</code>"
-
-    current_bot_name = get_bot_name()
-    fixed_qty = get_admin_fixed_quantity()
-    qty_label = f"Fixed ({fixed_qty})" if fixed_qty else "Default (1–10)"
-    sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
-
-    admin_text = (
-        f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Engine Status:</b> <code>100% Online & Delivering ✅</code>\n"
-        f"• <b>Bot Display Name:</b> <code>{current_bot_name}</code> (/setname)\n"
-        f"• <b>Quantity Mode:</b> <code>{qty_label}</code> (/setquantity)\n"
-        f"• <b>SMS Forwarding:</b> <code>{'✅ Active' if sms_on else '❌ Disabled'}</code>\n"
-        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
-        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
-        f"• <b>Next Handover:</b> {handover_info}\n"
-        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Real-time Live Inventory:</b>\n"
-        f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
-        f"• <b>Secret Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
-        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
-        f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
-        f"• <b>Total Users:</b> <code>{stats['total_users']} users</code>\n"
-        f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ <i>Configure number quantity, linked provider APIs, and bot display name below:</i>"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
-        [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
-        [InlineKeyboardButton("📡 Connected Services Status", callback_data="admin_api_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
-        [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
-        [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
-        [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
-        [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist"), InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
-    ])
+    admin_text, keyboard = build_admin_dashboard(user.id)
     await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3892,6 +4147,22 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return
+
+    if len(countries) == 1:
+        cid = countries[0]["id"]
+        limit, is_fixed = get_effective_quantity_for_user(user.id)
+        numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
+        if numbers:
+            pref_plus = get_user_plus_preference(user.id)
+            clean_msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+            await update.message.reply_text(
+                clean_msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+            )
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+            return
 
     await update.message.reply_text(
         "🌍 <b>Select a Country:</b>\n"
@@ -4759,6 +5030,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user or not text:
         return
 
+    register_user(user.id, user.username, user.first_name)
+
     # 1. Check if user is setting their quantity
     user_state = USER_STATES.get(user.id)
     if user_state and user_state.get("awaiting_user_quantity"):
@@ -4777,6 +5050,79 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("❌ Please enter a valid number between <b>1 and 10</b>.", parse_mode=ParseMode.HTML)
             return
+
+    # 2. Check if user was prompted for WhatsApp checker OR sent a phone number
+    is_phone_num = (text.startswith("+") and len(re.sub(r"\D", "", text)) >= 7) or (text.isdigit() and len(text) >= 9)
+    if (user_state and user_state.get("awaiting_ws_check")) or is_phone_num:
+        if user_state:
+            user_state.pop("awaiting_ws_check", None)
+        await process_ws_check(update, text)
+        return
+
+    # 3. Handle Persistent Reply Keyboard Menu Buttons
+    if text in ["⚡ Get Number", "/getnumber"]:
+        countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
+        if not countries:
+            await update.message.reply_text(
+                "⚠️ <b>No numbers are currently available in stock.</b>\n"
+                "Please check back soon or contact the admin.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_number")]
+                ])
+            )
+            return
+
+        if len(countries) == 1:
+            cid = countries[0]["id"]
+            limit, is_fixed = get_effective_quantity_for_user(user.id)
+            numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
+            if numbers:
+                pref_plus = get_user_plus_preference(user.id)
+                clean_msg = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                await update.message.reply_text(
+                    clean_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                )
+                if gist_storage.enabled:
+                    asyncio.create_task(gist_storage.export_and_sync())
+                return
+
+        await update.message.reply_text(
+            "🌍 <b>Select Country:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
+        )
+        return
+
+    if text in ["👤 My History", "/history", "My History"]:
+        await show_user_history(update, user.id, user.first_name)
+        return
+
+    if text in ["💳 Withdraw", "/withdraw", "Withdraw"]:
+        await show_user_withdraw(update, user.id)
+        return
+
+    if text in ["💬 Ws Checker", "/wschecker", "Ws Checker"]:
+        await show_ws_checker_prompt(update, user.id)
+        return
+
+    if text in ["🎓 Language", "/language", "Language"]:
+        await show_language_selector(update, user.id)
+        return
+
+    if text in ["🎧 Help", "/help", "Help"]:
+        await show_user_help(update, user.id)
+        return
+
+    if text in ["📁 File Number", "/filenumber", "File Number"]:
+        await show_file_number_menu(update, user.id)
+        return
+
+    if text in ["👑 Admin Panel", "/admin", "Admin Panel"] and is_admin(user.id):
+        await admin_command(update, context)
+        return
 
     if not is_user_authorized(user.id):
         return
@@ -5337,6 +5683,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+        if len(countries) == 1 and not data.startswith("page_"):
+            cid = countries[0]["id"]
+            limit, is_fixed = get_effective_quantity_for_user(user.id)
+            numbers, remaining_count, country_name = consume_numbers_for_user(
+                country_id=cid,
+                user_id=user.id,
+                limit=limit,
+                is_secret=False
+            )
+            if numbers:
+                if gist_storage.enabled:
+                    asyncio.create_task(gist_storage.export_and_sync())
+                pref_plus = get_user_plus_preference(user.id)
+                response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
+                await query.edit_message_text(
+                    response_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                )
+                return
+
         await query.edit_message_text(
             "🌍 <b>Select a Country:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -5402,22 +5769,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
-        numbers_formatted = "\n".join(num_lines)
-
-        group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
-
-        response_text = (
-            f"📱 <b>Your Exclusive Numbers — {country_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{numbers_formatted}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 <i>These {len(numbers)} numbers are reserved for you and removed from stock.</i>\n"
-            f"📊 <b>Remaining in Stock:</b> <code>{remaining_count}</code>\n"
-            f"💡 <b>Tap any number above to copy it instantly!</b>"
-            f"{group_notice}"
-        )
+        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
@@ -5456,22 +5808,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
-        numbers_formatted = "\n".join(num_lines)
-
-        group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
-
-        response_text = (
-            f"🔒 <b>Your SECRET Numbers — {country_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{numbers_formatted}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛡️ <i>Exclusive Secret Pool Numbers (100% single-user guaranteed).</i>\n"
-            f"📊 <b>Remaining Secret Stock:</b> <code>{remaining_count}</code>\n"
-            f"💡 <b>Tap any number to copy instantly!</b>"
-            f"{group_notice}"
-        )
+        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
@@ -5491,27 +5828,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         limit, is_fixed = get_effective_quantity_for_user(user.id)
 
         current_text = query.message.text_html or query.message.text or ""
+        found_nums = re.findall(r"<code>([^<]+)</code>", current_text)
+        if not found_nums:
+            found_nums = re.findall(r"\+?\d{6,16}", current_text)
 
-        if target_plus:
-            # Restore '+' prefix to all numbers
-            def _add_plus(m):
-                content = m.group(1).strip()
-                digits = re.sub(r"\D", "", content)
-                if len(digits) >= 5 and not content.startswith("+"):
-                    return f"<code>+{content}</code>"
-                return m.group(0)
-            new_text = re.sub(r"<code>([^<]+)</code>", _add_plus, current_text)
-            alert_msg = "➕ Added '+' prefix to all numbers!"
+        if found_nums:
+            new_text = format_delivered_numbers_clean(found_nums, with_plus=target_plus)
         else:
-            # Remove '+' prefix from all numbers
-            def _remove_plus(m):
-                content = m.group(1).strip()
-                if content.startswith("+"):
-                    return f"<code>{content[1:]}</code>"
-                return m.group(0)
-            new_text = re.sub(r"<code>([^<]+)</code>", _remove_plus, current_text)
-            alert_msg = "➖ Removed '+' prefix from all numbers!"
+            new_text = current_text
 
+        alert_msg = "➕ Added '+' prefix!" if target_plus else "➖ Removed '+' prefix!"
         await query.answer(alert_msg)
         try:
             await query.edit_message_text(
@@ -5568,23 +5894,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
 
         pref_plus = get_user_plus_preference(user.id)
-        num_lines = [f"  {idx}. <code>{n if pref_plus else n.lstrip('+')}</code>" for idx, n in enumerate(numbers, 1)]
-        numbers_formatted = "\n".join(num_lines)
-
-        group_link = get_otp_group_link()
-        group_notice = f"\n\n💬 <b>Need incoming messages? Click '{get_otp_group_name()}' below!</b>" if group_link else ""
-
-        title_prefix = "🔒 <b>Your SECRET Numbers" if is_secret else "📱 <b>Your Exclusive Numbers"
-        response_text = (
-            f"{title_prefix} — {country_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{numbers_formatted}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 <i>These {len(numbers)} numbers are reserved for you and removed from stock.</i>\n"
-            f"📊 <b>Remaining in Stock:</b> <code>{remaining_count}</code>\n"
-            f"💡 <b>Tap any number above to copy it instantly!</b>"
-            f"{group_notice}"
-        )
+        response_text = format_delivered_numbers_clean(numbers, with_plus=pref_plus)
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
@@ -5709,6 +6019,120 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
+    # 5b. Refresh User History Callback
+    elif data == "btn_refresh_history":
+        with get_main_db() as conn:
+            urow = conn.execute("SELECT numbers_consumed FROM users WHERE user_id = ?;", (user.id,)).fetchone()
+            consumed = urow["numbers_consumed"] if urow and urow["numbers_consumed"] is not None else 0
+            try:
+                used_count = conn.execute("SELECT COUNT(*) FROM used_numbers WHERE user_id = ?;", (user.id,)).fetchone()[0]
+                if used_count > consumed:
+                    consumed = used_count
+            except Exception:
+                pass
+
+            otp_count = 0
+            try:
+                otp_count = conn.execute("SELECT COUNT(*) FROM processed_otps WHERE user_id = ?;", (user.id,)).fetchone()[0]
+            except Exception:
+                pass
+
+            active_nums = []
+            try:
+                cur = conn.execute("SELECT number, country_name FROM active_user_numbers WHERE user_id = ? ORDER BY assigned_at DESC LIMIT 6;", (user.id,))
+                active_nums = cur.fetchall()
+            except Exception:
+                pass
+
+            recent_otps = []
+            try:
+                cur = conn.execute("SELECT number, otp_code, provider, received_at FROM processed_otps WHERE user_id = ? ORDER BY received_at DESC LIMIT 4;", (user.id,))
+                recent_otps = cur.fetchall()
+            except Exception:
+                pass
+
+        history_text = (
+            f"👤 <b>My Account History</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+            f"📱 <b>Total Numbers Taken:</b> <code>{consumed}</code>\n"
+            f"📩 <b>Total OTPs Received:</b> <code>{otp_count}</code>\n\n"
+        )
+        if active_nums:
+            history_text += "📋 <b>Active Numbers:</b>\n"
+            for r in active_nums:
+                c_tag = f" ({r['country_name']})" if r["country_name"] else ""
+                history_text += f"• <code>{r['number']}</code>{c_tag}\n"
+            history_text += "\n"
+        else:
+            history_text += "📋 <b>Active Numbers:</b> <i>No active numbers currently</i>\n\n"
+
+        if recent_otps:
+            history_text += "⚡ <b>Recent Received OTPs:</b>\n"
+            for o in recent_otps:
+                num_short = o["number"]
+                history_text += f"• <code>{num_short}</code> ➔ <b>{o['otp_code']}</b>\n"
+        else:
+            history_text += "⚡ <b>Recent OTPs:</b> <i>None received yet</i>\n"
+
+        buttons = [
+            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
+            [InlineKeyboardButton("🔄 Refresh History", callback_data="btn_refresh_history")]
+        ]
+        await query.answer("🔄 History refreshed!")
+        try:
+            await query.edit_message_text(history_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception:
+            pass
+
+    # 5c. Export Numbers as .txt Document
+    elif data == "btn_download_my_numbers":
+        with get_main_db() as conn:
+            user_nums = [r["number"] for r in conn.execute("SELECT number FROM active_user_numbers WHERE user_id = ? ORDER BY assigned_at DESC;", (user.id,)).fetchall()]
+            if not user_nums:
+                user_nums = [r["number"] for r in conn.execute("SELECT number FROM used_numbers WHERE user_id = ? ORDER BY id DESC LIMIT 500;", (user.id,)).fetchall()]
+
+        if not user_nums:
+            await query.answer("ℹ️ You have no active numbers to export.", show_alert=True)
+            return
+
+        await query.answer("📥 Preparing numbers file...")
+        content = "\n".join(user_nums).encode("utf-8")
+        bio = io.BytesIO(content)
+        bio.name = f"my_numbers_{user.id}.txt"
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=bio,
+            caption=f"📁 <b>Exported {len(user_nums)} active numbers.</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+    # 5d. Switch User UI Language
+    elif data.startswith("ui_lang_"):
+        lang_code = data.replace("ui_lang_", "")
+        lang_map = {
+            "en": "English 🇬🇧",
+            "ru": "Русский 🇷🇺",
+            "es": "Español 🇪🇸",
+            "ar": "العربية 🇸🇦",
+            "id": "Indonesia 🇮🇩",
+            "bn": "বাংলা 🇧🇩"
+        }
+        chosen = lang_map.get(lang_code, lang_code.upper())
+        await query.answer(f"✅ Language updated to {chosen}!", show_alert=True)
+        try:
+            await query.edit_message_text(
+                f"✅ <b>Language Updated:</b> <code>{chosen}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Bot interface language set successfully.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")]
+                ])
+            )
+        except Exception:
+            pass
+
     # Admin Set OTP Group Prompt
     elif data == "admin_set_group_prompt" and user_admin:
         ADMIN_STATES[user.id] = {"awaiting_otp_group_link": True}
@@ -5749,45 +6173,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 6. Admin Panel
     elif data == "admin_panel" and user_admin:
-        stats = get_system_stats()
-        current_bot_name = get_bot_name()
-        fixed_qty = get_admin_fixed_quantity()
-        qty_label = f"Fixed ({fixed_qty})" if fixed_qty else "Default (1–10)"
-        sms_on = (get_bot_setting("sms_receiving_enabled", "1") == "1")
-        view_mode = get_bot_setting("sms_view_mode", "default")
-        mode_label = "Default (Button 📜)" if view_mode == "default" else ("Fixed Full 📄" if view_mode == "full" else "Short 📦")
-        curr_link = get_otp_group_link()
-        curr_name = get_otp_group_name()
-        link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
-        admin_text = (
-            f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Bot Display Name:</b> <code>{current_bot_name}</code> (/setname)\n"
-            f"• <b>Quantity Mode:</b> <code>{qty_label}</code> (/setquantity)\n"
-            f"• <b>SMS Forwarding:</b> <code>{'✅ Active' if sms_on else '❌ Disabled'}</code>\n"
-            f"• <b>SMS View Format:</b> <code>{mode_label}</code>\n"
-            f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Real-time Live Inventory:</b>\n"
-            f"• <b>Standard Available:</b> <code>{stats['total_std_available']} numbers</code>\n"
-            f"• <b>Secret Available:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
-            f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
-            f"• <b>Active Countries:</b> <code>{stats['active_countries']} pools</code>\n"
-            f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
-            f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-            f"• <b>OTP Group Link:</b> {link_display}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Configure number quantities, linked provider APIs, and bot display name below:</i>"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt"), InlineKeyboardButton("📁 Uploaded Pools & Stock", callback_data="admin_uploaded_files")],
-            [InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '1–10'}", callback_data="admin_qty_menu"), InlineKeyboardButton(f"📡 SMS Controls: {'ON' if sms_on else 'OFF'}", callback_data="admin_sms_menu")],
-            [InlineKeyboardButton("📡 Connected Services Status", callback_data="admin_api_status"), InlineKeyboardButton("✏️ Change Bot Name", callback_data="admin_set_name_prompt")],
-            [InlineKeyboardButton("👥 User Management & Permissions", callback_data="admin_users"), InlineKeyboardButton("🗑️ Remove Numbers / Files", callback_data="admin_remove_files_menu")],
-            [InlineKeyboardButton("👑 Admin Management", callback_data="admin_manage_admins"), InlineKeyboardButton("⚡ Live Bot Status", callback_data="admin_live_status")],
-            [InlineKeyboardButton("🔗 Set OTP Group Link", callback_data="admin_set_group_prompt"), InlineKeyboardButton("🏷️ Set Button Name", callback_data="admin_set_group_name_prompt")],
-            [InlineKeyboardButton("☁️ Sync Cloud Backup", callback_data="admin_sync_gist"), InlineKeyboardButton("🏠 Exit Admin Panel", callback_data="btn_main_menu")]
-        ])
+        admin_text, keyboard = build_admin_dashboard(user.id)
         await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 6-a. Bot Display Name Prompt
@@ -6880,7 +7266,9 @@ def main():
 
     # Command & Message Handlers
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("menu", start_command))
     app.add_handler(CommandHandler("getnumber", getnumber_command))
+    app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("secretnumbers", secretnumbers_command))
     app.add_handler(CommandHandler("inventory", inventory_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -6926,44 +7314,24 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. Default user commands
+            # 1. Clean, minimal default user command menu (no duplicates/clutter)
             user_commands = [
-                BotCommand("start", "🚀 Start bot & open main menu"),
-                BotCommand("getnumber", "📱 Get numbers by country"),
-                BotCommand("quantity", "🔢 Set quantity preference (1–10)"),
-                BotCommand("inventory", "📊 View live number stock"),
-                BotCommand("help", "ℹ️ How to use the bot"),
-                BotCommand("stats", "📈 View live statistics"),
+                BotCommand("start", "🚀 Main Menu"),
+                BotCommand("getnumber", "⚡ Get Number"),
+                BotCommand("history", "👤 My History"),
+                BotCommand("help", "🎧 Help & Support"),
             ]
             await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
             await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-            # 2. Admin custom commands
+            # 2. Clean, focused admin command menu (all advanced settings accessible via /admin)
             admin_commands = [
                 BotCommand("start", "🚀 Main Menu"),
-                BotCommand("getnumber", "📱 Get Numbers"),
-                BotCommand("secretnumbers", "🔒 Secret Numbers Pool"),
-                BotCommand("status", "⚡ Live Zero-Restart Status"),
-                BotCommand("admin", "👑 Open Admin Management Panel"),
-                BotCommand("restart", "🔄 Reload Bot & Secrets"),
-                BotCommand("setquantity", "🔢 Set fixed quantity (1–1000)"),
-                BotCommand("seturl", "🌐 View / Update Provider URLs"),
-                BotCommand("setthirdwave", "🔑 Set Thirdwave Key / URL"),
-                BotCommand("setaugestel", "🔑 Set Augestel Key / URL"),
-                BotCommand("setotpman2", "🔑 Set KSI Service Key / URL"),
-                BotCommand("setname", "✏️ Change bot display name"),
-                BotCommand("resetname", "🔄 Reset bot display name"),
-                BotCommand("admins", "👥 View Active Administrators"),
-                BotCommand("addadmin", "➕ Promote user to Admin"),
-                BotCommand("removeadmin", "🗑️ Demote Admin to user"),
-                BotCommand("removeuser", "🗑️ Permanently purge user"),
-                BotCommand("grantsecret", "🔓 Grant Secret Access to user"),
-                BotCommand("revokesecret", "🔒 Revoke Secret Access from user"),
-                BotCommand("setgroup", "🔗 Set Channel link & name"),
-                BotCommand("setgroupname", "🏷️ Set Channel button label"),
-                BotCommand("user", "👤 Lookup user details & usage"),
-                BotCommand("stats", "📊 View live system statistics"),
-                BotCommand("help", "ℹ️ How to use the bot"),
+                BotCommand("getnumber", "⚡ Get Number"),
+                BotCommand("admin", "👑 Admin Management Panel"),
+                BotCommand("stats", "📊 Live Statistics"),
+                BotCommand("history", "👤 My History"),
+                BotCommand("help", "🎧 Help & Support"),
             ]
             for aid in get_all_admin_ids():
                 if aid:
@@ -6971,7 +7339,9 @@ def main():
                         await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(aid))
                     except Exception:
                         pass
-            logger.info("✅ Telegram Bot Command Menu & Menu Button configured.")
+            logger.info("✅ Telegram Bot Command Menu & Menu Button configured cleanly.")
+        except Exception as e:
+            logger.warning(f"Could not configure Bot Command Menu: {e}")
         except Exception as e:
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 

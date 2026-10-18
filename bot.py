@@ -3302,6 +3302,17 @@ def _get_prefix(numbers: List[str]) -> str:
     except Exception:
         return ""
 
+def get_country_by_id(country_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieves country record by ID."""
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT id, name FROM countries WHERE id = ?;", (country_id,)).fetchone()
+            if row:
+                return dict(row)
+    except Exception:
+        pass
+    return None
+
 def get_country_available_count(country_id: int, is_secret: bool = False) -> int:
     """Returns the current available number count for a country pool."""
     try:
@@ -3320,7 +3331,7 @@ def format_delivered_numbers(
     """Builds clean, professional delivery text with File name, Available numbers, and one-tap copy numbers."""
     flag, cname, _ = get_country_info_from_item({}, country_hint=country_name)
     display_cname = cname or country_name
-    flag_str = f"{flag} " if flag else ""
+    flag_str = f"{flag} " if (flag and flag != "🌐") else ""
 
     lines = [
         f"📁 <b>File:</b> {flag_str}<code>{html.escape(display_cname)}</code>",
@@ -3418,23 +3429,39 @@ def get_numbers_view_keyboard(
     is_fixed: bool = False,
     numbers: Optional[List[str]] = None
 ) -> InlineKeyboardMarkup:
-    """Builds clean, simple action keyboard for delivered numbers."""
+    """Builds clean, simple action keyboard for delivered numbers with one-tap copy buttons."""
     change_cb = f"sec_change_num_{country_id}" if is_secret else f"change_num_{country_id}"
     country_cb = "btn_get_secret_number" if is_secret else "btn_get_number"
     sec_tag = "sec" if is_secret else "std"
+
+    btn_rows = []
+
+    # One-tap copy button for each number
+    if numbers:
+        for n in numbers:
+            clean = _clean_number(n, with_plus)
+            if CopyTextButton is not None:
+                btn_rows.append([
+                    InlineKeyboardButton(
+                        f"📋  {clean}",
+                        copy_text=CopyTextButton(text=clean)
+                    )
+                ])
+            else:
+                btn_rows.append([
+                    InlineKeyboardButton(f"📋  {clean}", callback_data=f"copy_num_{country_id}")
+                ])
+
+    btn_rows.append([
+        InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
+        InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
+    ])
 
     if with_plus:
         toggle_btn = InlineKeyboardButton("➖ Remove '+'", callback_data=f"toggle_plus_0_{country_id}_{sec_tag}")
     else:
         toggle_btn = InlineKeyboardButton("➕ Add '+'", callback_data=f"toggle_plus_1_{country_id}_{sec_tag}")
-
-    btn_rows = [
-        [
-            InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
-            InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
-        ],
-        [toggle_btn],
-    ]
+    btn_rows.append([toggle_btn])
 
     group_link = get_otp_group_link()
     if group_link:
@@ -3767,7 +3794,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         msg,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                     )
                     if gist_storage.enabled:
                         asyncio.create_task(gist_storage.export_and_sync())
@@ -4165,7 +4192,7 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 clean_msg,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
             )
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
@@ -5090,7 +5117,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(
                     clean_msg,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                 )
                 if gist_storage.enabled:
                     asyncio.create_task(gist_storage.export_and_sync())
@@ -5717,7 +5744,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.edit_message_text(
                     response_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                 )
                 return
 
@@ -5790,7 +5817,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
         )
 
     # 3b. Deliver Secret Numbers
@@ -5829,7 +5856,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
         )
 
     # 3c. Interactive Instant '+' Toggle for Delivered Numbers
@@ -5844,9 +5871,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         set_user_plus_preference(user.id, target_plus)
         limit, is_fixed = get_effective_quantity_for_user(user.id)
 
-        current_text = query.message.text_html or query.message.text or ""
-        # Match only phone numbers (7 to 16 digits, with optional leading '+')
-        found_nums = re.findall(r"\+?\d{7,16}", current_text)
+        found_nums = []
+        if query.message and query.message.reply_markup:
+            for r in query.message.reply_markup.inline_keyboard:
+                for b in r:
+                    if b.text and "📋" in b.text:
+                        num = b.text.replace("📋", "").strip()
+                        if num:
+                            found_nums.append(num)
+
+        if not found_nums:
+            current_text = query.message.text_html or query.message.text or ""
+            found_nums = re.findall(r"\+?\d{7,16}", current_text)
 
         c_info = get_country_by_id(country_id)
         cname = c_info["name"] if c_info else "Allocated"
@@ -5855,7 +5891,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if found_nums:
             new_text = format_delivered_numbers(found_nums, country_name=cname, available_count=avail, with_plus=target_plus)
         else:
-            new_text = current_text
+            new_text = query.message.text_html or query.message.text or ""
+
+        new_keyboard = get_numbers_view_keyboard(
+            country_id=country_id,
+            is_secret=is_secret,
+            with_plus=target_plus,
+            quantity=limit,
+            is_fixed=is_fixed,
+            numbers=found_nums
+        )
 
         alert_msg = "➕ Added '+' prefix!" if target_plus else "➖ Removed '+' prefix!"
         await query.answer(alert_msg)
@@ -5863,10 +5908,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 new_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=target_plus, quantity=limit, is_fixed=is_fixed)
+                reply_markup=new_keyboard
             )
         except Exception as e:
-            logger.debug(f"Toggle plus message update notice: {e}")
+            logger.warning(f"Toggle plus message update notice: {e}")
 
     # 3d. User Quantity Selection Menu
     elif data.startswith("user_qty_menu_"):
@@ -5918,7 +5963,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=pref_plus, quantity=chosen_qty, is_fixed=False)
+            reply_markup=get_numbers_view_keyboard(country_id, is_secret=is_secret, with_plus=pref_plus, quantity=chosen_qty, is_fixed=False, numbers=numbers)
         )
 
     # 3f. Expand Full Received SMS Text
@@ -6638,7 +6683,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("➕ Add Numbers (.txt)", callback_data="admin_upload_prompt")])
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
 
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))

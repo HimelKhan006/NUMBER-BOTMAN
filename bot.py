@@ -1369,8 +1369,6 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
     ]
-    if user_id and (is_admin(user_id) or user_has_secret_access(user_id)):
-        keyboard.append([KeyboardButton("🔒 Secret Numbers")])
     if user_id and is_admin(user_id):
         keyboard.append([KeyboardButton("👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1673,30 +1671,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
     bot_name = get_bot_name()
-    stats = get_system_stats()
-    user_admin = is_admin(user.id)
-
 
     main_text = (
         f"⚡ <b>Welcome to {bot_name}!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Status:</b> <code>Online & Delivering ✅</code>\n"
-        f"• <b>Inventory:</b> <code>{stats['total_available']} numbers</code> ({stats['active_countries']} countries)\n"
-        f"• <b>Delivery Mode:</b> <code>100% Exclusive (Single-Use)</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Tap '⚡ Get Number' below to receive phone numbers instantly:</i>"
+        f"<i>Use the menu buttons below to get started:</i>"
     )
-
-    inline_rows = [
-        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-    ]
-    if user_admin:
-        inline_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
 
     await update.message.reply_text(
         main_text,
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_rows)
+        reply_markup=get_user_reply_keyboard(user.id)
     )
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4038,7 +4023,6 @@ def main():
         send_telegram_alert("❌ CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
         sys.exit(1)
 
-    send_telegram_alert(f"🚀 NUMBER BOTMAN initialized on GitHub Actions!\nToken: {token[:8]}...\nBot: Number Wave (@Number_Wave_bot)")
 
     req = HTTPXRequest(
         connect_timeout=15.0,

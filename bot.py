@@ -1675,7 +1675,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_name = get_bot_name()
     stats = get_system_stats()
     user_admin = is_admin(user.id)
-    secret_allowed = user_admin or user_has_secret_access(user.id)
+
 
     main_text = (
         f"⚡ <b>Welcome to {bot_name}!</b>\n"
@@ -1690,14 +1690,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inline_rows = [
         [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
     ]
-    if secret_allowed:
-        inline_rows.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
     if user_admin:
         inline_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-
-    channel_link = get_group_link()
-    if channel_link:
-        inline_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
 
     await update.message.reply_text(
         main_text,
@@ -2585,7 +2579,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "btn_main_menu":
         bot_name = get_bot_name()
         stats = get_system_stats()
-        secret_allowed = user_admin or user_has_secret_access(user.id)
         welcome_text = (
             f"⚡ <b>Welcome to {bot_name}!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -2597,13 +2590,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         menu_rows = [
             [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
         ]
-        if secret_allowed:
-            menu_rows.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
         if user_admin:
             menu_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        channel_link = get_group_link()
-        if channel_link:
-            menu_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
         try:
             await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML,
                                           reply_markup=InlineKeyboardMarkup(menu_rows))
@@ -2823,13 +2811,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         inline_rows_plus = [
             [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
         ]
-        if user_admin or user_has_secret_access(user.id):
-            inline_rows_plus.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
         if user_admin:
             inline_rows_plus.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        ch_link = get_group_link()
-        if ch_link:
-            inline_rows_plus.append([InlineKeyboardButton(get_group_name(), url=ch_link)])
         keyboard = InlineKeyboardMarkup(inline_rows_plus)
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
@@ -2868,8 +2851,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = [
             [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
         ]
-        if user_has_secret_access(user.id):
-            buttons.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
         buttons.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")])
 
         await query.edit_message_text(inv_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))

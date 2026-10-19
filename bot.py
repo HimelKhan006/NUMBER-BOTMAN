@@ -1642,13 +1642,26 @@ def get_admin_quantity_keyboard() -> InlineKeyboardMarkup:
 # ==========================================
 async def show_user_profile(update: Update, target_user_id: int, viewer_user_id: int = 0):
     """Professional account profile display for users and administrators."""
+    viewer_admin = is_admin(viewer_user_id)
     u = get_user_details(target_user_id)
     if not u:
         msg = f"⚠️ User <code>{target_user_id}</code> was not found in the database."
         if update.callback_query:
             await update.callback_query.answer(msg, show_alert=True)
         elif update.message:
-            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            if viewer_admin:
+                await update.message.reply_text(
+                    f"⚠️ <b>User Not Found:</b>\n"
+                    f"No account record found for ID: <code>{target_user_id}</code>.\n\n"
+                    f"<i>The user may have not started or joined the bot yet.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                )
+            else:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
     is_self = (viewer_user_id == target_user_id)
@@ -1666,7 +1679,7 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
     if u.get("is_banned"):
         status_badge = "⛔ BANNED / Suspended"
     else:
-        status_badge = "Active & Verified ✅"
+        status_badge = "Active ✅"
 
     # Secret numbers status
     secret_status = "🔓 Unlocked & Authorized" if (u.get("has_secret_access") or is_admin(target_user_id)) else "🔒 Restricted (Standard Only)"
@@ -1710,7 +1723,8 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
         buttons.append([InlineKeyboardButton(ban_toggle_label, callback_data=f"u_toggle_ban_{target_user_id}")])
         buttons.append([InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_user_id}")])
         buttons.append([InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_user_id}")])
-        buttons.append([InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")])
+        buttons.append([InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")])
+        buttons.append([InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")])
 
     keyboard = InlineKeyboardMarkup(buttons)
     if update.callback_query:
@@ -2648,7 +2662,51 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # 3. Handle Admin States
+    # 3. Handle Admin States & Search
+    if is_admin(user.id):
+        admin_state = ADMIN_STATES.get(user.id)
+        if admin_state and admin_state.get("awaiting_user_search"):
+            del admin_state["awaiting_user_search"]
+            clean_text = text.strip()
+            if not clean_text.isdigit():
+                await update.message.reply_text(
+                    "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                )
+                return
+
+            target_uid = int(clean_text)
+            u = get_user_details(target_uid)
+            if not u:
+                await update.message.reply_text(
+                    f"⚠️ <b>User Not Found:</b>\n"
+                    f"No account record found for ID: <code>{target_uid}</code>.\n\n"
+                    f"<i>The user has not joined or started the bot yet.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                    ])
+                )
+                return
+
+            await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+            return
+
+        # Direct User ID lookup if admin types an Account ID in chat
+        clean_txt = text.strip()
+        if not admin_state and clean_txt.isdigit() and 7 <= len(clean_txt) <= 13:
+            target_uid = int(clean_txt)
+            u_found = get_user_details(target_uid)
+            if u_found:
+                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+                return
+
     admin_state = ADMIN_STATES.get(user.id)
     if not admin_state or not is_admin(user.id):
         return
@@ -3731,9 +3789,51 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
-    # 9. Admin User Analytics & Management (Paginated User List)
-    elif (data == "admin_users" or data.startswith("page_users_")) and user_admin:
-        page = int(data.split("_")[2]) if data.startswith("page_users_") else 0
+    # 9. Admin User Analytics & Management (Clean Dashboard with Search)
+    elif data == "admin_users" and user_admin:
+        stats = get_system_stats()
+        users_text = (
+            f"👥 <b>User Management & Access Control</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
+            f"• <b>Total Numbers Consumed:</b> <code>{stats['total_consumed']}</code>\n"
+            f"• <b>Secret Whitelisted Users:</b> <code>{stats['total_secret_users']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔍 <b>Find & Manage User by Account ID:</b>\n"
+            f"Tap the button below or type an Account ID in chat to search, grant secret access, ban, message, or remove any user.\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>Tip: You can also search directly by typing <code>/user &lt;id&gt;</code> or simply sending the ID in chat.</i>"
+        )
+        buttons = [
+            [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
+            [InlineKeyboardButton("📋 Browse Users List", callback_data="page_users_0")],
+            [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
+        ]
+        await query.edit_message_text(users_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    # 9a. Search User by ID Prompt
+    elif data == "admin_search_user_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_user_search": True}
+        prompt_text = (
+            f"🔍 <b>Search User by Account ID:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Please type the numerical Telegram <b>Account ID</b> in chat:\n\n"
+            f"<i>Example: <code>8751050958</code></i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>You can also search directly anytime by typing <code>/user &lt;id&gt;</code></i>"
+        )
+        await query.edit_message_text(
+            prompt_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_users")]
+            ])
+        )
+        return
+
+    # 9-list. Paginated Browse Users List
+    elif data.startswith("page_users_") and user_admin:
+        page = int(data.split("_")[2])
         per_page = 5
         offset = page * per_page
         users_list, total_users = get_all_users_detailed(limit=per_page, offset=offset)
@@ -3763,18 +3863,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")])
+        buttons.append([InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")])
 
         users_text = (
-            f"👥 <b>User Management & Access Control</b>\n"
+            f"📋 <b>Browse Registered Users (Page {page + 1}):</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-            f"• <b>Total Numbers Consumed:</b> <code>{stats['total_consumed']}</code>\n"
-            f"• <b>Secret Whitelisted Users:</b> <code>{stats['total_secret_users']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             + "\n".join(u_lines) +
-            f"\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>Tip: Click any user button above or use <code>/user &lt;id&gt;</code> to grant/revoke Secret Access!</i>"
+            f"\n━━━━━━━━━━━━━━━━━━━━"
         )
         await query.edit_message_text(users_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -3813,7 +3911,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
             [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
             [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
-            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+            [InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")],
+            [InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -4769,6 +4868,9 @@ def main():
     app.add_handler(CommandHandler("grantsecret", grantsecret_command))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command))
     app.add_handler(CommandHandler("user", user_lookup_command))
+    app.add_handler(CommandHandler("find", user_lookup_command))
+    app.add_handler(CommandHandler("search", user_lookup_command))
+    app.add_handler(CommandHandler("finduser", user_lookup_command))
     app.add_handler(CommandHandler("users", admin_command))
     app.add_handler(CommandHandler("setname", setname_command))
     app.add_handler(CommandHandler("resetname", resetname_command))

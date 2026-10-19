@@ -1531,9 +1531,9 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
                 [InlineKeyboardButton("🔒 Upload Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
             ])
-        back_data = "btn_main_menu"
+        retry_cb = "btn_get_secret_number" if is_secret_mode else "btn_get_number"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data=back_data)]
+            [InlineKeyboardButton("🔄 Check Again", callback_data=retry_cb)]
         ])
 
     start = page * per_page
@@ -1569,8 +1569,10 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     if nav_row:
         buttons.append(nav_row)
 
-    back_cb = "admin_panel" if is_admin_mode else "btn_main_menu"
-    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+    # Only show Back button in Admin Mode to return to Admin Panel. Removed for users so no inline menu is opened.
+    if is_admin_mode:
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+
     return InlineKeyboardMarkup(buttons)
 
 def get_numbers_view_keyboard(
@@ -1678,32 +1680,28 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
     last_seen = (u.get("last_seen") or "N/A")[:19]
     consumed = u.get("numbers_consumed", 0)
 
-    profile_text = (
-        f"👤 <b>Account Profile & Information</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>Account ID:</b> <code>{target_user_id}</code>\n"
-        f"📛 <b>Name:</b> <code>{html.escape(name)}</code>\n"
-        f"🔗 <b>Username:</b> {uname}\n"
-        f"🔰 <b>Role & Tier:</b> <code>{role_badge}</code>\n"
-        f"🛡️ <b>Account Status:</b> <code>{status_badge}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Usage & Activity:</b>\n"
-        f"• <b>Numbers Received:</b> <code>{consumed} numbers</code>\n"
-        f"• <b>Secret Numbers Pool:</b> <code>{secret_status}</code>\n"
-        f"• <b>Format Preference:</b> <code>{plus_pref}</code>\n"
-        f"• <b>Member Since:</b> <code>{joined}</code>\n"
-        f"• <b>Last Active:</b> <code>{last_seen}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-    )
+    lines = [
+        f"👤 <b>Account Profile & Information</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🆔 <b>Account ID:</b> <code>{target_user_id}</code>",
+        f"📛 <b>Name:</b> <code>{html.escape(name)}</code>",
+        f"🔗 <b>Username:</b> {uname}",
+        f"📱 <b>Total Numbers Taken:</b> <code>{consumed}</code>",
+        f"🔰 <b>Role & Tier:</b> <code>{role_badge}</code>",
+        f"📅 <b>Registered:</b> <code>{joined}</code>",
+        f"🛡️ <b>Account Status:</b> <code>{status_badge}</code>",
+    ]
+
+    # Only shown if user is granted secret access by admin, or if user is an admin
+    if is_admin(target_user_id) or u.get("has_secret_access"):
+        lines.append(f"🔒 <b>Secret Numbers Pool:</b> <code>🔓 Unlocked & Authorized</code>")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    profile_text = "\n".join(lines)
 
     buttons = []
     if is_self:
-        profile_text += "💡 <i>Your account is active and connected to the number delivery engine.</i>"
-        buttons.append([InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")])
-        buttons.append([
-            InlineKeyboardButton("🔄 Refresh Profile", callback_data="btn_refresh_profile"),
-            InlineKeyboardButton("📜 History", callback_data="btn_refresh_history")
-        ])
+        buttons.append([InlineKeyboardButton("🔄 Refresh Profile", callback_data="btn_refresh_profile")])
     else:
         profile_text += "👑 <i>Administrator Control View:</i>"
         sec_toggle_label = "🔒 Revoke Secret Access" if u.get("has_secret_access") else "🔓 Grant Secret Access"
@@ -2574,11 +2572,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Check if user is registered in the database (unless admin)
     u_rec = get_user_details(user.id)
     if not u_rec and not is_admin(user.id):
-        await update.message.reply_text(
-            "👋 <b>Welcome!</b>\n\nPlease send /start to join and activate the bot menu.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove()
-        )
+        # Removed / unregistered users: silently clear keyboard without leaving visible messages
+        try:
+            m = await update.message.reply_text(".", reply_markup=ReplyKeyboardRemove())
+            await context.bot.delete_message(chat_id=user.id, message_id=m.message_id)
+        except Exception:
+            pass
         return
 
     user_state = USER_STATES.get(user.id)
@@ -2929,6 +2928,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     user_admin = is_admin(user.id)
+    if not user_admin and is_user_banned(user.id):
+        await query.answer("⛔ Your account has been banned.", show_alert=True)
+        return
     register_user(user.id, user.username, user.first_name)
 
     # Language Manager & SMS Language Callbacks
@@ -3033,8 +3035,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"All available numbers have been consumed. Please select another country.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🌍 Choose Another Country", callback_data="btn_get_number")],
-                    [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+                    [InlineKeyboardButton("🌍 Choose Another Country", callback_data="btn_get_number")]
                 ])
             )
             return
@@ -3072,8 +3073,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Please select another country from the Secret Pool.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔒 Choose Another Country", callback_data="btn_get_secret_number")],
-                    [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+                    [InlineKeyboardButton("🔒 Choose Another Country", callback_data="btn_get_secret_number")]
                 ])
             )
             return
@@ -4122,18 +4122,28 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
         consumed = u.get("numbers_consumed", 0) if u else 0
 
-        # Send goodbye notice removing reply keyboard from user screen
+        # 1. Erase any broadcast or direct messages sent to this user
         try:
-            await context.bot.send_message(
+            with get_main_db() as conn:
+                cur = conn.execute("SELECT message_id FROM broadcast_messages WHERE user_id = ?;", (target_id,))
+                for row in cur.fetchall():
+                    try:
+                        await context.bot.delete_message(chat_id=target_id, message_id=row["message_id"])
+                    except Exception:
+                        pass
+                conn.execute("DELETE FROM broadcast_messages WHERE user_id = ?;", (target_id,))
+                conn.commit()
+        except Exception:
+            pass
+
+        # 2. Silently clear bottom reply keyboard from user's screen without leaving a message
+        try:
+            rm_msg = await context.bot.send_message(
                 chat_id=target_id,
-                text=(
-                    "👋 <b>Your bot session has ended.</b>\n\n"
-                    "Your account record has been cleared by the administrator.\n"
-                    "To join and start using the bot again, please tap /start."
-                ),
-                parse_mode=ParseMode.HTML,
+                text=".",
                 reply_markup=ReplyKeyboardRemove()
             )
+            await context.bot.delete_message(chat_id=target_id, message_id=rm_msg.message_id)
         except Exception:
             pass
 

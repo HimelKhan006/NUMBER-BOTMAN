@@ -68,9 +68,11 @@ from telegram import (
     Update,
     Bot,
     InlineKeyboardButton,
+    ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardRemove,
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChat,
@@ -302,6 +304,32 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;")
         except Exception:
             pass
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_history (
+                broadcast_id TEXT PRIMARY KEY,
+                admin_id INTEGER,
+                target_type TEXT,
+                target_user_id INTEGER DEFAULT 0,
+                message_text TEXT,
+                total_sent INTEGER DEFAULT 0,
+                total_failed INTEGER DEFAULT 0,
+                is_deleted INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broadcast_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_admins (
                 user_id INTEGER PRIMARY KEY,
@@ -352,7 +380,7 @@ def get_all_user_ids() -> List[int]:
 def get_user_details(user_id: int) -> Optional[Dict[str, Any]]:
     with get_main_db() as conn:
         row = conn.execute("""
-            SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen
+            SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, is_banned, joined_at, last_seen
             FROM users WHERE user_id = ?;
         """, (user_id,)).fetchone()
         return dict(row) if row else None
@@ -364,7 +392,7 @@ def get_all_users_detailed(limit: int = 10, offset: int = 0) -> Tuple[List[Dict[
             cur_count = conn.execute("SELECT COUNT(*) FROM users;")
             total_users = cur_count.fetchone()[0]
             cur_users = conn.execute("""
-                SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen
+                SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, is_banned, joined_at, last_seen
                 FROM users
                 ORDER BY last_seen DESC
                 LIMIT ? OFFSET ?;
@@ -374,6 +402,100 @@ def get_all_users_detailed(limit: int = 10, offset: int = 0) -> Tuple[List[Dict[
     except Exception as e:
         logger.warning(f"Error fetching detailed users: {e}")
         return [], 0
+
+def is_user_banned(user_id: int) -> bool:
+    if not user_id or is_admin(user_id):
+        return False
+    try:
+        with get_main_db() as conn:
+            row = conn.execute("SELECT is_banned FROM users WHERE user_id = ?;", (user_id,)).fetchone()
+            if row and row["is_banned"] == 1:
+                return True
+    except Exception:
+        pass
+    return False
+
+def ban_user(user_id: int) -> bool:
+    if is_admin(user_id):
+        return False
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?;", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.warning(f"Error banning user {user_id}: {e}")
+        return False
+
+def unban_user(user_id: int) -> bool:
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?;", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.warning(f"Error unbanning user {user_id}: {e}")
+        return False
+
+def record_broadcast_history(broadcast_id: str, admin_id: int, target_type: str, target_user_id: int, message_text: str, total_sent: int, total_failed: int):
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO broadcast_history (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+                ON CONFLICT(broadcast_id) DO UPDATE SET
+                    total_sent = excluded.total_sent,
+                    total_failed = excluded.total_failed;
+            """, (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Error recording broadcast history: {e}")
+
+def record_broadcast_message(broadcast_id: str, user_id: int, message_id: int):
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT INTO broadcast_messages (broadcast_id, user_id, message_id)
+                VALUES (?, ?, ?);
+            """, (broadcast_id, user_id, message_id))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Error recording broadcast message: {e}")
+
+def get_recent_broadcasts(limit: int = 8) -> List[Dict[str, Any]]:
+    try:
+        with get_main_db() as conn:
+            cur = conn.execute("""
+                SELECT broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, created_at
+                FROM broadcast_history
+                WHERE is_deleted = 0
+                ORDER BY created_at DESC
+                LIMIT ?;
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning(f"Error fetching recent broadcasts: {e}")
+        return []
+
+def get_broadcast_messages(broadcast_id: str) -> List[Tuple[int, int]]:
+    try:
+        with get_main_db() as conn:
+            cur = conn.execute("""
+                SELECT user_id, message_id FROM broadcast_messages WHERE broadcast_id = ?;
+            """, (broadcast_id,))
+            return [(row["user_id"], row["message_id"]) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning(f"Error fetching broadcast messages for {broadcast_id}: {e}")
+        return []
+
+def mark_broadcast_deleted(broadcast_id: str):
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE broadcast_history SET is_deleted = 1 WHERE broadcast_id = ?;", (broadcast_id,))
+            conn.execute("DELETE FROM broadcast_messages WHERE broadcast_id = ?;", (broadcast_id,))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Error marking broadcast deleted: {e}")
 
 # ==========================================
 # Multi-Admin Engine & Number Format Preferences
@@ -1380,13 +1502,13 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
     Bottom reply keyboard:
-    Row 1: ⚡ Get Number  (all users)
-    Row 2: 🔒 Secret Numbers  (admins & whitelisted users)
-    Row 3: 👑 Admin Panel  (admins only)
-    Row 4: Channel Link Button  (all users, if configured by admin)
+    Row 1: ⚡ Get Number | 👤 My Account (all users)
+    Row 2: 🔒 Secret Numbers (admins & whitelisted users)
+    Row 3: 👑 Admin Panel (admins only)
+    Row 4: Channel Link Button (all users, if configured by admin)
     """
     keyboard = [
-        [KeyboardButton("⚡ Get Number")],
+        [KeyboardButton("⚡ Get Number"), KeyboardButton("👤 My Account")],
     ]
     if user_id and (is_admin(user_id) or user_has_secret_access(user_id)):
         keyboard.append([KeyboardButton("🔒 Secret Numbers")])
@@ -1516,39 +1638,94 @@ def get_admin_quantity_keyboard() -> InlineKeyboardMarkup:
 # ==========================================
 # 10. Reply Keyboard Views & Action Handlers
 # ==========================================
-async def show_user_history(update: Update, user_id: int, user_name: str):
-    """Displays user's account statistics and history."""
-    with get_main_db() as conn:
-        urow = conn.execute("SELECT numbers_consumed, joined_at, last_seen FROM users WHERE user_id = ?;", (user_id,)).fetchone()
-        consumed = urow["numbers_consumed"] if urow and urow["numbers_consumed"] is not None else 0
-        joined = urow["joined_at"][:19] if urow and urow["joined_at"] else "N/A"
+async def show_user_profile(update: Update, target_user_id: int, viewer_user_id: int = 0):
+    """Professional account profile display for users and administrators."""
+    u = get_user_details(target_user_id)
+    if not u:
+        msg = f"⚠️ User <code>{target_user_id}</code> was not found in the database."
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
 
-    history_text = (
-        f"👤 <b>My Account History</b>\n"
+    is_self = (viewer_user_id == target_user_id)
+    viewer_admin = is_admin(viewer_user_id)
+
+    # Role & Tier
+    if is_admin(target_user_id):
+        role_badge = "👑 Administrator"
+    elif u.get("has_secret_access"):
+        role_badge = "🔓 VIP / Whitelisted Member"
+    else:
+        role_badge = "⚡ Standard User"
+
+    # Status badge
+    if u.get("is_banned"):
+        status_badge = "⛔ BANNED / Suspended"
+    else:
+        status_badge = "Active & Verified ✅"
+
+    # Secret numbers status
+    secret_status = "🔓 Unlocked & Authorized" if (u.get("has_secret_access") or is_admin(target_user_id)) else "🔒 Restricted (Standard Only)"
+
+    # Plus format preference
+    plus_pref = "With Leading '+' (+123456789)" if u.get("prefer_plus", 1) else "Without '+' (123456789)"
+
+    name = u.get("first_name") or "User"
+    uname = f"@{u['username']}" if u.get("username") else "None"
+    joined = (u.get("joined_at") or "N/A")[:19]
+    last_seen = (u.get("last_seen") or "N/A")[:19]
+    consumed = u.get("numbers_consumed", 0)
+
+    profile_text = (
+        f"👤 <b>Account Profile & Information</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
-        f"📱 <b>Total Numbers Taken:</b> <code>{consumed}</code>\n"
-        f"📅 <b>Registered:</b> <code>{joined}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"🆔 <b>Account ID:</b> <code>{target_user_id}</code>\n"
+        f"📛 <b>Name:</b> <code>{html.escape(name)}</code>\n"
+        f"🔗 <b>Username:</b> {uname}\n"
+        f"🔰 <b>Role & Tier:</b> <code>{role_badge}</code>\n"
+        f"🛡️ <b>Account Status:</b> <code>{status_badge}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Usage & Activity:</b>\n"
+        f"• <b>Numbers Received:</b> <code>{consumed} numbers</code>\n"
+        f"• <b>Secret Numbers Pool:</b> <code>{secret_status}</code>\n"
+        f"• <b>Format Preference:</b> <code>{plus_pref}</code>\n"
+        f"• <b>Member Since:</b> <code>{joined}</code>\n"
+        f"• <b>Last Active:</b> <code>{last_seen}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
-    buttons = [
-        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-        [InlineKeyboardButton("🔄 Refresh History", callback_data="btn_refresh_history")]
-    ]
+    buttons = []
+    if is_self:
+        profile_text += "💡 <i>Your account is active and connected to the number delivery engine.</i>"
+        buttons.append([InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")])
+        buttons.append([
+            InlineKeyboardButton("🔄 Refresh Profile", callback_data="btn_refresh_profile"),
+            InlineKeyboardButton("📜 History", callback_data="btn_refresh_history")
+        ])
+    else:
+        profile_text += "👑 <i>Administrator Control View:</i>"
+        sec_toggle_label = "🔒 Revoke Secret Access" if u.get("has_secret_access") else "🔓 Grant Secret Access"
+        ban_toggle_label = "✅ Unban User" if u.get("is_banned") else "🚫 Ban User"
+        buttons.append([InlineKeyboardButton(sec_toggle_label, callback_data=f"u_toggle_sec_{target_user_id}")])
+        buttons.append([InlineKeyboardButton(ban_toggle_label, callback_data=f"u_toggle_ban_{target_user_id}")])
+        buttons.append([InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_user_id}")])
+        buttons.append([InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_user_id}")])
+        buttons.append([InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")])
 
+    keyboard = InlineKeyboardMarkup(buttons)
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            history_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        try:
+            await update.callback_query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception:
+            await update.callback_query.message.reply_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif update.message:
-        await update.message.reply_text(
-            history_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        await update.message.reply_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+async def show_user_history(update: Update, user_id: int, user_name: str):
+    """Displays user's account statistics and history."""
+    await show_user_profile(update, target_user_id=user_id, viewer_user_id=user_id)
 
 async def show_user_withdraw(update: Update, user_id: int):
     """Shows user information dialog."""
@@ -1672,6 +1849,14 @@ async def show_file_number_menu(update: Update, user_id: int):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
+        return
+
+    if is_user_banned(user.id):
+        await update.message.reply_text(
+            "⛔ <b>Access Restricted.</b>\nYour account has been banned from using this bot by the administrator.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
         return
 
     register_user(user.id, user.username, user.first_name)
@@ -1801,10 +1986,29 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     curr_link = get_group_link()
     link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
 
+    now = time.time()
+    uptime_secs = int(now - bot_process_start_time)
+    u_hours, u_rem = divmod(uptime_secs, 3600)
+    u_mins, u_secs = divmod(u_rem, 60)
+    uptime_str = f"{u_hours}h {u_mins}m {u_secs}s"
+
+    session_timeout = int(os.getenv("SESSION_TIMEOUT", "19500"))
+    if session_timeout > 0:
+        handover_secs = max(0, session_timeout - uptime_secs)
+        h_hours, h_rem = divmod(handover_secs, 3600)
+        h_mins, _ = divmod(h_rem, 60)
+        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+    else:
+        handover_info = "<code>Always-Online (Continuous)</code>"
+
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Engine Status:</b> <code>Online & Delivering ✅</code>\n"
+        f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
+        f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
+        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Next Handover:</b> {handover_info}\n"
         f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
         f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1833,8 +2037,11 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("👑 Admins", callback_data="admin_manage_admins")
         ],
         [
-            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
+            InlineKeyboardButton("📢 Broadcast SMS / Msg", callback_data="admin_broadcast_menu"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
+        ],
+        [
+            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
         ],
     ])
     return admin_text, keyboard
@@ -1973,21 +2180,7 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if len(countries) == 1:
-        cid = countries[0]["id"]
-        limit, is_fixed = get_effective_quantity_for_user(user.id)
-        numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
-        if numbers:
-            pref_plus = get_user_plus_preference(user.id)
-            clean_msg = format_delivered_numbers(numbers, cname, available_count=remaining, with_plus=pref_plus)
-            await update.message.reply_text(
-                clean_msg,
-                parse_mode=ParseMode.HTML,
-                reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
-            )
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
-            return
+
 
     await update.message.reply_text(
         "🌍 <b>Select a Country:</b>\n"
@@ -2113,39 +2306,14 @@ async def revokesecret_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def user_lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user or not is_admin(user.id):
+    if not user:
         return
-    args = update.message.text.replace("/user", "", 1).strip()
-    if not args or not args.isdigit():
-        await update.message.reply_text("Usage: <code>/user &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    target_id = int(args)
-    u = get_user_details(target_id)
-    if not u:
-        await update.message.reply_text(f"⚠️ User <code>{target_id}</code> not found.", parse_mode=ParseMode.HTML)
-        return
-
-    secret_badge = "✅ Authorized" if u.get("has_secret_access") else "❌ Restricted"
-    toggle_btn_text = "🔒 Revoke Secret Access" if u.get("has_secret_access") else "🔓 Grant Secret Access"
-
-    text = (
-        f"👤 <b>User Account Profile</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
-        f"📛 <b>First Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
-        f"🔗 <b>Username:</b> @{u.get('username') or 'None'}\n"
-        f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
-        f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
-        f"📅 <b>Registered At:</b> <code>{u.get('joined_at', 'N/A')[:19]}</code>\n"
-        f"⏱️ <b>Last Seen:</b> <code>{u.get('last_seen', 'N/A')[:19]}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_btn_text, callback_data=f"u_toggle_sec_{target_id}")],
-        [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
-        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-    ])
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    if context.args and context.args[0].isdigit():
+        target_id = int(context.args[0])
+        await show_user_profile(update, target_user_id=target_id, viewer_user_id=user.id)
+    else:
+        # Show own profile if no arg given
+        await show_user_profile(update, target_user_id=user.id, viewer_user_id=user.id)
 
 async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2241,22 +2409,46 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not is_admin(user.id):
         return
     stats = get_system_stats()
+    current_bot_name = get_bot_name()
     uptime_secs = int(time.time() - bot_process_start_time)
     hours, remainder = divmod(uptime_secs, 3600)
     mins, secs = divmod(remainder, 60)
-    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
+    uptime_str = f"{hours}h {mins}m {secs}s"
+
+    session_timeout = int(os.getenv("SESSION_TIMEOUT", "19500"))
+    if session_timeout > 0:
+        handover_secs = max(0, session_timeout - uptime_secs)
+        h_hours, h_rem = divmod(handover_secs, 3600)
+        h_mins, _ = divmod(h_rem, 60)
+        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+    else:
+        handover_info = "<code>Always-Online (Continuous)</code>"
+
+    admins = get_all_admin_ids()
     text = (
-        f"⚡ <b>NUMBER BOTMAN Live Engine Status</b>\n"
+        f"⚡ <b>{current_bot_name} — Live Engine Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Uptime:</b> <code>{uptime_str}</code>\n"
-        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
-        f"• <b>Standard In Stock:</b> <code>{stats['total_std_available']} numbers</code>\n"
-        f"• <b>Secret In Stock:</b> <code>{stats['total_sec_available']} numbers 🔒</code>\n"
-        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
-        f"• <b>Total Users:</b> <code>{stats['total_users']} registered</code>\n"
+        f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
+        f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
+        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Next Handover:</b> {handover_info}\n"
+        f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Inventory & Operations:</b>\n"
+        f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
+        f"• <b>Secret Numbers:</b> <code>{stats['total_sec_available']} in stock 🔒</code>\n"
+        f"• <b>Delivered Numbers:</b> <code>{stats['total_consumed']} total</code>\n"
+        f"• <b>Active Pools:</b> <code>{stats['active_countries']} countries</code>\n"
+        f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
+        f"• <b>Administrators:</b> <code>{len(admins)} active</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_live_status")],
+        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 # ==========================================
 # 11. Admin File (.txt) & Text Upload Handlers
 # ==========================================
@@ -2371,7 +2563,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user or not text:
         return
 
-    register_user(user.id, user.username, user.first_name)
+    if is_user_banned(user.id):
+        await update.message.reply_text(
+            "⛔ <b>Access Restricted.</b>\nYour account has been banned from using this bot by the administrator.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+
+    # Check if user is registered in the database (unless admin)
+    u_rec = get_user_details(user.id)
+    if not u_rec and not is_admin(user.id):
+        await update.message.reply_text(
+            "👋 <b>Welcome!</b>\n\nPlease send /start to join and activate the bot menu.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+
     user_state = USER_STATES.get(user.id)
 
     # 1. Check WhatsApp checker OR sent phone number
@@ -2396,27 +2605,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        if len(countries) == 1:
-            cid = countries[0]["id"]
-            limit, is_fixed = get_effective_quantity_for_user(user.id)
-            numbers, remaining, cname = consume_numbers_for_user(cid, user.id, limit=limit, is_secret=False)
-            if numbers:
-                pref_plus = get_user_plus_preference(user.id)
-                clean_msg = format_delivered_numbers(numbers, cname, available_count=remaining, with_plus=pref_plus)
-                await update.message.reply_text(
-                    clean_msg,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
-                )
-                if gist_storage.enabled:
-                    asyncio.create_task(gist_storage.export_and_sync())
-                return
+
 
         await update.message.reply_text(
             "🌍 <b>Select Country:</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
         )
+        return
+
+    if text in ["👤 My Account", "/account", "/me", "/profile", "/myaccount", "My Account"]:
+        await show_user_profile(update, target_user_id=user.id, viewer_user_id=user.id)
         return
 
     if text in ["👤 My History", "/history", "My History"]:
@@ -2552,6 +2751,125 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Invalid user ID. Please send digits only.", parse_mode=ParseMode.HTML)
         return
 
+    # Broadcast to All Users
+    if admin_state.get("awaiting_broadcast_all"):
+        del admin_state["awaiting_broadcast_all"]
+        bcast_id = f"bc_{int(time.time())}"
+        all_uids = get_all_user_ids()
+        total_sent = 0
+        total_failed = 0
+
+        broadcast_msg_text = (
+            f"📢 <b>Announcement:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        progress_msg = await update.message.reply_text("⏳ <i>Broadcasting message to all users...</i>", parse_mode=ParseMode.HTML)
+
+        for uid in all_uids:
+            if uid == user.id or is_user_banned(uid):
+                continue
+            try:
+                sent_m = await context.bot.send_message(
+                    chat_id=uid,
+                    text=broadcast_msg_text,
+                    parse_mode=ParseMode.HTML
+                )
+                record_broadcast_message(bcast_id, uid, sent_m.message_id)
+                total_sent += 1
+                await asyncio.sleep(0.04)  # Safe rate limit
+            except Exception:
+                total_failed += 1
+
+        record_broadcast_history(bcast_id, user.id, "all", 0, text, total_sent, total_failed)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+
+        report_text = (
+            f"✅ <b>Broadcast Completed!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
+            f"📤 <b>Successfully Delivered:</b> <code>{total_sent} users</code>\n"
+            f"⚠️ <b>Failed / Blocked:</b> <code>{total_failed} users</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>You can recall and delete this broadcast anytime from '🗑️ Recall / Delete Broadcast'.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Recall / Delete Broadcast Now", callback_data=f"bcast_del_{bcast_id}")],
+            [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await update.message.reply_text(report_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    # Broadcast Target User ID Prompt
+    if admin_state.get("awaiting_target_user_id"):
+        del admin_state["awaiting_target_user_id"]
+        if not text.isdigit():
+            await update.message.reply_text("❌ Invalid User ID. Please send digits only.", parse_mode=ParseMode.HTML)
+            return
+        target_uid = int(text)
+        admin_state["awaiting_broadcast_single"] = target_uid
+        target_info = get_user_details(target_uid)
+        t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
+        await update.message.reply_text(
+            f"👤 <b>Target User:</b> <code>{t_name}</code> (<code>{target_uid}</code>)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Please send the message you wish to deliver to this user in chat:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
+            ])
+        )
+        return
+
+    # Broadcast to Specific User
+    if admin_state.get("awaiting_broadcast_single"):
+        target_uid = admin_state.pop("awaiting_broadcast_single")
+        bcast_id = f"bc_u_{int(time.time())}"
+        single_msg_text = (
+            f"💬 <b>Direct Message from Administrator:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        try:
+            sent_m = await context.bot.send_message(
+                chat_id=target_uid,
+                text=single_msg_text,
+                parse_mode=ParseMode.HTML
+            )
+            record_broadcast_message(bcast_id, target_uid, sent_m.message_id)
+            record_broadcast_history(bcast_id, user.id, "single", target_uid, text, 1, 0)
+            if gist_storage.enabled:
+                asyncio.create_task(gist_storage.export_and_sync())
+
+            report_text = (
+                f"✅ <b>Message Delivered!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
+                f"👤 <b>Recipient:</b> <code>{target_uid}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <i>You can recall and delete this message anytime!</i>"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Recall / Delete Message", callback_data=f"bcast_del_{bcast_id}")],
+                [InlineKeyboardButton("👥 User Manager", callback_data=f"u_inspect_{target_uid}")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+            await update.message.reply_text(report_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception as e:
+            record_broadcast_history(bcast_id, user.id, "single", target_uid, text, 0, 1)
+            await update.message.reply_text(f"❌ Failed to deliver message to user <code>{target_uid}</code>: {e}", parse_mode=ParseMode.HTML)
+        return
+
     if admin_state.get("awaiting_country_name"):
         country_name = text.strip()
         numbers = admin_state["numbers"]
@@ -2658,26 +2976,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        if len(countries) == 1 and not data.startswith("page_"):
-            cid = countries[0]["id"]
-            limit, is_fixed = get_effective_quantity_for_user(user.id)
-            numbers, remaining_count, country_name = consume_numbers_for_user(
-                country_id=cid,
-                user_id=user.id,
-                limit=limit,
-                is_secret=False
-            )
-            if numbers:
-                if gist_storage.enabled:
-                    asyncio.create_task(gist_storage.export_and_sync())
-                pref_plus = get_user_plus_preference(user.id)
-                response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
-                await query.edit_message_text(
-                    response_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
-                )
-                return
+
 
         await query.edit_message_text(
             "🌍 <b>Select a Country:</b>\n"
@@ -3223,16 +3522,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             handover_secs = max(0, session_timeout - uptime_secs)
             h_hours, h_rem = divmod(handover_secs, 3600)
             h_mins, _ = divmod(h_rem, 60)
-            handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Zero-Restart 🔄)"
+            handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
         else:
             handover_info = "<code>Always-Online (Continuous)</code>"
 
         admins = get_all_admin_ids()
+        current_bot_name = get_bot_name()
         text = (
-            f"⚡ <b>NUMBER BOTMAN — Live Engine Status</b>\n"
+            f"⚡ <b>{current_bot_name} — Live Engine Status</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
-            f"• <b>Session Limit:</b> <code>5h 25min (19,500s)</code>\n"
+            f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
+            f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+            f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
             f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
             f"• <b>Next Handover:</b> {handover_info}\n"
             f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
@@ -3507,6 +3808,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         secret_badge = "✅ Authorized (Whitelisted)" if is_whitelisted else "❌ Restricted"
         toggle_label = "🔒 Revoke Secret Access" if is_whitelisted else "🔓 Grant Secret Access"
 
+        is_banned = bool(u.get("is_banned"))
+        ban_badge = "⛔ BANNED" if is_banned else "✅ Active (Not Banned)"
+        ban_btn_label = "✅ Unban User" if is_banned else "🚫 Ban User"
+
         profile_text = (
             f"👤 <b>User Account Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -3515,13 +3820,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔗 <b>Username:</b> @{u.get('username') or 'None'}\n"
             f"🔢 <b>Total Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code> numbers\n"
             f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
+            f"🚫 <b>Account Status:</b> <code>{ban_badge}</code>\n"
             f"📅 <b>Joined Date:</b> <code>{u.get('joined_at', 'N/A')[:19]}</code>\n"
             f"⏱️ <b>Last Activity:</b> <code>{u.get('last_seen', 'N/A')[:19]}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ <i>Click below to toggle Secret Numbers permission for this user:</i>"
+            f"⚡ <i>Manage permissions, status, or send a direct message below:</i>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
+            [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
             [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
@@ -3582,6 +3890,206 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
+    # 9b-2. User Ban / Unban Toggle
+    elif data.startswith("u_toggle_ban_") and user_admin:
+        target_id = int(data.split("_")[3])
+        u = get_user_details(target_id)
+        if not u:
+            await query.answer("⚠️ User not found.", show_alert=True)
+            return
+
+        is_currently_banned = bool(u.get("is_banned"))
+        new_ban_state = not is_currently_banned
+
+        if new_ban_state:
+            ban_user(target_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text="⛔ <b>Access Restricted.</b>\nYour account has been banned from using this bot by the administrator.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            except Exception:
+                pass
+            await query.answer("🚫 User banned and bottom menu removed!", show_alert=True)
+        else:
+            unban_user(target_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text="✅ <b>Account Restored!</b>\nYour account has been unbanned. Tap /start to begin.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_user_reply_keyboard(target_id)
+                )
+            except Exception:
+                pass
+            await query.answer("✅ User unbanned!", show_alert=True)
+
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        # Refresh profile
+        u_updated = get_user_details(target_id)
+        is_whitelisted = bool(u_updated.get("has_secret_access"))
+        secret_badge = "✅ Authorized (Whitelisted)" if is_whitelisted else "❌ Restricted"
+        toggle_label = "🔒 Revoke Secret Access" if is_whitelisted else "🔓 Grant Secret Access"
+        is_banned_now = bool(u_updated.get("is_banned"))
+        ban_badge = "⛔ BANNED" if is_banned_now else "✅ Active (Not Banned)"
+        ban_btn_label = "✅ Unban User" if is_banned_now else "🚫 Ban User"
+
+        profile_text = (
+            f"👤 <b>User Account Details</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>User Account ID:</b> <code>{u_updated['user_id']}</code>\n"
+            f"📛 <b>Name:</b> <code>{u_updated.get('first_name') or 'N/A'}</code>\n"
+            f"🔗 <b>Username:</b> @{u_updated.get('username') or 'None'}\n"
+            f"🔢 <b>Total Numbers Consumed:</b> <code>{u_updated.get('numbers_consumed', 0)}</code> numbers\n"
+            f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
+            f"🚫 <b>Account Status:</b> <code>{ban_badge}</code>\n"
+            f"📅 <b>Joined Date:</b> <code>{u_updated.get('joined_at', 'N/A')[:19]}</code>\n"
+            f"⏱️ <b>Last Activity:</b> <code>{u_updated.get('last_seen', 'N/A')[:19]}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <i>Manage permissions, status, or send a direct message below:</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
+            [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
+            [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
+            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
+            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # Broadcast Hub Menu
+    elif data == "admin_broadcast_menu" and user_admin:
+        recent_bcasts = get_recent_broadcasts(limit=5)
+        text = (
+            f"📢 <b>Broadcast & Messaging Hub</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Broadcast:</b> Send announcements to all registered bot users.\n"
+            f"• <b>Direct Message:</b> Send SMS / message to a specific user.\n"
+            f"• <b>Recall System:</b> Fully delete sent broadcasts from all users' chats!\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Active Broadcasts in memory: {len(recent_bcasts)}</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Broadcast to All Users", callback_data="bcast_start_all")],
+            [InlineKeyboardButton("👤 Message Specific User", callback_data="bcast_start_single")],
+            [InlineKeyboardButton("🗑️ Recall / Delete Broadcast", callback_data="bcast_recall_list")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "bcast_start_all" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_broadcast_all": True}
+        text = (
+            "📢 <b>Broadcast to All Users</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send the announcement message you wish to broadcast to all registered bot users in chat.\n\n"
+            "<i>Formatting supported: HTML (bold, italic, code, links).</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "bcast_start_single" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_target_user_id": True}
+        text = (
+            "👤 <b>Send Direct Message to User</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send the <b>Telegram User ID</b> of the recipient in chat:\n\n"
+            "💡 <i>Tip: You can find user IDs in '👥 User Manager'.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data.startswith("bcast_prompt_user_") and user_admin:
+        target_uid = int(data.split("_")[3])
+        ADMIN_STATES[user.id] = {"awaiting_broadcast_single": target_uid}
+        target_info = get_user_details(target_uid)
+        t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
+        text = (
+            f"💬 <b>Direct Message to:</b> <code>{t_name}</code> (<code>{target_uid}</code>)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Please send the message you wish to deliver to this user in chat:"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_uid}")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data == "bcast_recall_list" and user_admin:
+        bcasts = get_recent_broadcasts(limit=10)
+        if not bcasts:
+            await query.edit_message_text(
+                "🗑️ <b>Recall / Delete Broadcast</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No active broadcasts available to recall.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
+                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return
+
+        buttons = []
+        lines = []
+        for b in bcasts:
+            bid = b["broadcast_id"]
+            preview = (b["message_text"][:30] + "...") if len(b["message_text"]) > 30 else b["message_text"]
+            t_type = "All Users" if b["target_type"] == "all" else f"User {b['target_user_id']}"
+            lines.append(f"• <code>{bid}</code> ({t_type}): <i>{preview}</i> [{b['total_sent']} sent]")
+            buttons.append([InlineKeyboardButton(f"🗑️ Delete {bid} ({b['total_sent']} msgs)", callback_data=f"bcast_del_{bid}")])
+
+        buttons.append([InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")])
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+
+        text = (
+            "🗑️ <b>Recall / Delete Broadcasts from Users' Chats</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Tap any broadcast below to delete and erase it completely from all recipients' Telegram apps:\n\n"
+            + "\n".join(lines)
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("bcast_del_") and user_admin:
+        bcast_id = data.replace("bcast_del_", "")
+        msgs = get_broadcast_messages(bcast_id)
+        deleted_count = 0
+
+        for uid, mid in msgs:
+            try:
+                await context.bot.delete_message(chat_id=uid, message_id=mid)
+                deleted_count += 1
+                await asyncio.sleep(0.03)
+            except Exception:
+                pass
+
+        mark_broadcast_deleted(bcast_id)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        await query.answer("🗑️ Broadcast erased from users' chats!", show_alert=True)
+        text = (
+            f"✅ <b>Broadcast Successfully Recalled & Erased!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
+            f"🗑️ <b>Messages Deleted:</b> <code>{deleted_count} deleted</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>The announcement has been completely removed from user devices.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
     # 9d. Confirm User Removal
     elif data.startswith("u_del_confirm_") and user_admin:
         target_id = int(data.split("_")[3])
@@ -3613,6 +4121,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         u = get_user_details(target_id)
         uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
         consumed = u.get("numbers_consumed", 0) if u else 0
+
+        # Send goodbye notice removing reply keyboard from user screen
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    "👋 <b>Your bot session has ended.</b>\n\n"
+                    "Your account record has been cleared by the administrator.\n"
+                    "To join and start using the bot again, please tap /start."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=ReplyKeyboardRemove()
+            )
+        except Exception:
+            pass
 
         res = delete_user(target_id)
         if res and gist_storage.enabled:
@@ -3981,6 +4504,144 @@ async def run_diagnostics():
 # ==========================================
 # 14. Main Application Entry Point
 # ==========================================
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/ban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    target_id = int(context.args[0])
+    if is_admin(target_id):
+        await update.message.reply_text("❌ Cannot ban an administrator.", parse_mode=ParseMode.HTML)
+        return
+    ban_user(target_id)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="⛔ <b>Access Restricted.</b>\nYour account has been banned from using this bot by the administrator.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        pass
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+    await update.message.reply_text(f"✅ User <code>{target_id}</code> has been banned.", parse_mode=ParseMode.HTML)
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/unban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    target_id = int(context.args[0])
+    unban_user(target_id)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="✅ <b>Account Restored!</b>\nYour account has been unbanned. Tap /start to begin.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_user_reply_keyboard(target_id)
+        )
+    except Exception:
+        pass
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+    await update.message.reply_text(f"✅ User <code>{target_id}</code> has been unbanned.", parse_mode=ParseMode.HTML)
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+    msg_text = " ".join(context.args).strip() if context.args else ""
+    if not msg_text:
+        await update.message.reply_text("Usage: <code>/broadcast Your message text here</code>", parse_mode=ParseMode.HTML)
+        return
+
+    bcast_id = f"bc_{int(time.time())}"
+    all_uids = get_all_user_ids()
+    total_sent = 0
+    total_failed = 0
+
+    full_text = f"📢 <b>Announcement:</b>\n━━━━━━━━━━━━━━━━━━━━\n{msg_text}\n━━━━━━━━━━━━━━━━━━━━"
+    for uid in all_uids:
+        if uid == user.id or is_user_banned(uid):
+            continue
+        try:
+            sent_m = await context.bot.send_message(chat_id=uid, text=full_text, parse_mode=ParseMode.HTML)
+            record_broadcast_message(bcast_id, uid, sent_m.message_id)
+            total_sent += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            total_failed += 1
+
+    record_broadcast_history(bcast_id, user.id, "all", 0, msg_text, total_sent, total_failed)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    await update.message.reply_text(
+        f"✅ <b>Broadcast Completed!</b>\n• ID: <code>{bcast_id}</code>\n• Sent: <code>{total_sent}</code>\n• Failed: <code>{total_failed}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def sendto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: <code>/sendto &lt;user_id&gt; Your message text</code>", parse_mode=ParseMode.HTML)
+        return
+    target_uid = int(context.args[0])
+    msg_text = " ".join(context.args[1:]).strip()
+
+    bcast_id = f"bc_u_{int(time.time())}"
+    full_text = f"💬 <b>Direct Message from Administrator:</b>\n━━━━━━━━━━━━━━━━━━━━\n{msg_text}\n━━━━━━━━━━━━━━━━━━━━"
+    try:
+        sent_m = await context.bot.send_message(chat_id=target_uid, text=full_text, parse_mode=ParseMode.HTML)
+        record_broadcast_message(bcast_id, target_uid, sent_m.message_id)
+        record_broadcast_history(bcast_id, user.id, "single", target_uid, msg_text, 1, 0)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(f"✅ Message delivered to <code>{target_uid}</code>!", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        record_broadcast_history(bcast_id, user.id, "single", target_uid, msg_text, 0, 1)
+        await update.message.reply_text(f"❌ Failed to deliver message to <code>{target_uid}</code>: {e}", parse_mode=ParseMode.HTML)
+
+async def recall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/recall &lt;broadcast_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    bcast_id = context.args[0].strip()
+    msgs = get_broadcast_messages(bcast_id)
+    if not msgs:
+        await update.message.reply_text("❌ No broadcast messages found with that ID.", parse_mode=ParseMode.HTML)
+        return
+
+    deleted = 0
+    for uid, mid in msgs:
+        try:
+            await context.bot.delete_message(chat_id=uid, message_id=mid)
+            deleted += 1
+            await asyncio.sleep(0.03)
+        except Exception:
+            pass
+
+    mark_broadcast_deleted(bcast_id)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+    await update.message.reply_text(f"🗑️ Recalled broadcast <code>{bcast_id}</code>: Deleted <code>{deleted}</code> messages.", parse_mode=ParseMode.HTML)
+
 def resolve_telegram_bot_token() -> str:
     global TELEGRAM_BOT_TOKEN
     token = TELEGRAM_BOT_TOKEN
@@ -4124,6 +4785,16 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("reboot", restart_command))
+    app.add_handler(CommandHandler("account", user_lookup_command))
+    app.add_handler(CommandHandler("myaccount", user_lookup_command))
+    app.add_handler(CommandHandler("me", user_lookup_command))
+    app.add_handler(CommandHandler("profile", user_lookup_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("sendto", sendto_command))
+    app.add_handler(CommandHandler("recall", recall_command))
+    app.add_handler(CommandHandler("delbroadcast", recall_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))

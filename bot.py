@@ -357,6 +357,24 @@ def get_user_details(user_id: int) -> Optional[Dict[str, Any]]:
         """, (user_id,)).fetchone()
         return dict(row) if row else None
 
+def get_all_users_detailed(limit: int = 10, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+    """Returns paginated user records and the total user count from users table."""
+    try:
+        with get_main_db() as conn:
+            cur_count = conn.execute("SELECT COUNT(*) FROM users;")
+            total_users = cur_count.fetchone()[0]
+            cur_users = conn.execute("""
+                SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen
+                FROM users
+                ORDER BY last_seen DESC
+                LIMIT ? OFFSET ?;
+            """, (limit, offset))
+            users = [dict(row) for row in cur_users.fetchall()]
+            return users, total_users
+    except Exception as e:
+        logger.warning(f"Error fetching detailed users: {e}")
+        return [], 0
+
 # ==========================================
 # Multi-Admin Engine & Number Format Preferences
 # ==========================================
@@ -1363,15 +1381,23 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
     Bottom reply keyboard:
     Row 1: ⚡ Get Number  (all users)
-    Row 2: 🔒 Secret Numbers  (admins only)
+    Row 2: 🔒 Secret Numbers  (admins & whitelisted users)
     Row 3: 👑 Admin Panel  (admins only)
+    Row 4: Channel Link Button  (all users, if configured by admin)
     """
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
     ]
-    if user_id and is_admin(user_id):
+    if user_id and (is_admin(user_id) or user_has_secret_access(user_id)):
         keyboard.append([KeyboardButton("🔒 Secret Numbers")])
+    if user_id and is_admin(user_id):
         keyboard.append([KeyboardButton("👑 Admin Panel")])
+
+    channel_link = get_group_link()
+    if channel_link:
+        channel_name = get_group_name() or "📢 Official Channel"
+        keyboard.append([KeyboardButton(channel_name)])
+
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool = False, is_secret_mode: bool = False) -> InlineKeyboardMarkup:
@@ -2413,6 +2439,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await admin_command(update, context)
         return
 
+    # Handle Channel Link Button tapped from Bottom Reply Keyboard
+    channel_link = get_group_link()
+    channel_name = get_group_name() or "📢 Official Channel"
+    if channel_link and text in [channel_name, f"📢 {channel_name}", "📢 Official Channel", "Channel"]:
+        await update.message.reply_text(
+            f"📢 <b>{channel_name}</b>\n\nTap below to open the channel:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"👉 Open {channel_name}", url=channel_link)]
+            ])
+        )
+        return
+
     # 3. Handle Admin States
     admin_state = ADMIN_STATES.get(user.id)
     if not admin_state or not is_admin(user.id):
@@ -2439,8 +2478,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             asyncio.create_task(gist_storage.export_and_sync())
         return
 
-    if admin_state.get("awaiting_qty_val"):
-        del admin_state["awaiting_qty_val"]
+    if admin_state.get("awaiting_qty_val") or admin_state.get("awaiting_fixed_quantity"):
+        admin_state.pop("awaiting_qty_val", None)
+        admin_state.pop("awaiting_fixed_quantity", None)
         if text.isdigit() and 1 <= int(text) <= 1000:
             val = int(text)
             set_admin_fixed_quantity(str(val))
@@ -2457,11 +2497,26 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Please enter a valid number between 1 and 1000.", parse_mode=ParseMode.HTML)
         return
 
-    if admin_state.get("awaiting_group_link"):
-        del admin_state["awaiting_group_link"]
+    if admin_state.get("awaiting_group_link") or admin_state.get("awaiting_otp_group_link"):
+        admin_state.pop("awaiting_group_link", None)
+        admin_state.pop("awaiting_otp_group_link", None)
         if text.lower() in ("none", "remove", "clear"):
             set_group_link("")
             await update.message.reply_text("✅ Channel Link removed.", parse_mode=ParseMode.HTML)
+        elif "|" in text:
+            parts = text.split("|", 1)
+            bname = parts[0].strip()
+            blink = parts[1].strip()
+            if bname:
+                set_group_name(bname)
+            clean_l = blink if blink.startswith("http") else f"https://{blink}"
+            set_group_link(clean_l)
+            await update.message.reply_text(
+                f"✅ <b>Channel Link & Button Saved!</b>\n"
+                f"• <b>Button Name:</b> <code>{html.escape(bname)}</code>\n"
+                f"• <b>Link:</b> <code>{clean_l}</code>",
+                parse_mode=ParseMode.HTML
+            )
         elif text.startswith("http") or text.startswith("t.me"):
             clean_l = text if text.startswith("http") else f"https://{text}"
             set_group_link(clean_l)
@@ -2472,16 +2527,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             asyncio.create_task(gist_storage.export_and_sync())
         return
 
-    if admin_state.get("awaiting_group_name"):
-        del admin_state["awaiting_group_name"]
+    if admin_state.get("awaiting_group_name") or admin_state.get("awaiting_otp_group_name"):
+        admin_state.pop("awaiting_group_name", None)
+        admin_state.pop("awaiting_otp_group_name", None)
         set_group_name(text)
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(f"✅ Channel Button Name updated: <code>{html.escape(text)}</code>", parse_mode=ParseMode.HTML)
         return
 
-    if admin_state.get("awaiting_admin_id"):
-        del admin_state["awaiting_admin_id"]
+    if admin_state.get("awaiting_admin_id") or admin_state.get("awaiting_add_admin"):
+        admin_state.pop("awaiting_admin_id", None)
+        admin_state.pop("awaiting_add_admin", None)
         if text.isdigit():
             aid = int(text)
             success = add_admin(aid, added_by=user.id)
@@ -2568,16 +2625,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         welcome_text = (
             f"⚡ <b>Welcome to {bot_name}!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Status:</b> <code>Online &amp; Delivering ✅</code>\n"
-            f"• <b>Inventory:</b> <code>{stats['total_available']} numbers</code> ({stats['active_countries']} countries)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Tap '⚡ Get Number' below to receive phone numbers instantly:</i>"
+            f"<i>Use the menu buttons below to get started:</i>"
         )
         menu_rows = [
             [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
         ]
         if user_admin:
             menu_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+        channel_link = get_group_link()
+        if channel_link:
+            menu_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
         try:
             await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML,
                                           reply_markup=InlineKeyboardMarkup(menu_rows))

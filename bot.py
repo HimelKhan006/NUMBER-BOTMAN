@@ -2594,11 +2594,54 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_state = USER_STATES.get(user.id)
 
-    # 1. Check WhatsApp checker OR sent phone number
-    is_phone_num = (text.startswith("+") and len(re.sub(r"\D", "", text)) >= 7) or (text.isdigit() and len(text) >= 9)
-    if (user_state and user_state.get("awaiting_ws_check")) or is_phone_num:
-        if user_state:
-            user_state.pop("awaiting_ws_check", None)
+    # 1. Admin States & User ID Search (Top Priority)
+    if is_admin(user.id):
+        admin_state = ADMIN_STATES.get(user.id)
+        if admin_state and admin_state.get("awaiting_user_search"):
+            del admin_state["awaiting_user_search"]
+            clean_text = text.strip()
+            if not clean_text.isdigit():
+                await update.message.reply_text(
+                    "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                )
+                return
+
+            target_uid = int(clean_text)
+            u = get_user_details(target_uid)
+            if not u:
+                await update.message.reply_text(
+                    f"⚠️ <b>User Not Found:</b>\n"
+                    f"No account record found for ID: <code>{target_uid}</code>.\n\n"
+                    f"<i>The user has not joined or started the bot yet.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                    ])
+                )
+                return
+
+            await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+            return
+
+        # Direct User ID lookup if admin sends an Account ID directly in chat
+        clean_txt = text.strip()
+        if not admin_state and clean_txt.isdigit() and 7 <= len(clean_txt) <= 13:
+            target_uid = int(clean_txt)
+            u_found = get_user_details(target_uid)
+            if u_found:
+                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+                return
+
+    # 1b. WhatsApp verification tool (Only when explicitly awaiting_ws_check)
+    if user_state and user_state.get("awaiting_ws_check"):
+        user_state.pop("awaiting_ws_check", None)
         await process_ws_check(update, text)
         return
 
@@ -2662,51 +2705,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # 3. Handle Admin States & Search
-    if is_admin(user.id):
-        admin_state = ADMIN_STATES.get(user.id)
-        if admin_state and admin_state.get("awaiting_user_search"):
-            del admin_state["awaiting_user_search"]
-            clean_text = text.strip()
-            if not clean_text.isdigit():
-                await update.message.reply_text(
-                    "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
-                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
-                    ])
-                )
-                return
-
-            target_uid = int(clean_text)
-            u = get_user_details(target_uid)
-            if not u:
-                await update.message.reply_text(
-                    f"⚠️ <b>User Not Found:</b>\n"
-                    f"No account record found for ID: <code>{target_uid}</code>.\n\n"
-                    f"<i>The user has not joined or started the bot yet.</i>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
-                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
-                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                    ])
-                )
-                return
-
-            await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
-            return
-
-        # Direct User ID lookup if admin types an Account ID in chat
-        clean_txt = text.strip()
-        if not admin_state and clean_txt.isdigit() and 7 <= len(clean_txt) <= 13:
-            target_uid = int(clean_txt)
-            u_found = get_user_details(target_uid)
-            if u_found:
-                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
-                return
-
+    # 3. Handle Remaining Admin States
     admin_state = ADMIN_STATES.get(user.id)
     if not admin_state or not is_admin(user.id):
         return

@@ -1735,8 +1735,7 @@ async def show_user_withdraw(update: Update, user_id: int):
         "• For support or queries, contact the administrator."
     )
     buttons = [
-        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")]
     ]
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -1801,8 +1800,7 @@ async def show_user_help(update: Update, user_id: int):
         "• <code>/history</code> — View your account statistics"
     )
     buttons = [
-        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="btn_main_menu")]
+        [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")]
     ]
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -2938,29 +2936,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("📋 Copied to clipboard!")
         return
 
-    # 1b. Main Menu - show welcome with inline keyboard
+    # 1b. Main Menu callback - silently delete message
     elif data == "btn_main_menu":
-        bot_name = get_bot_name()
-        stats = get_system_stats()
-        welcome_text = (
-            f"⚡ <b>Welcome to {bot_name}!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Use the menu buttons below to get started:</i>"
-        )
-        menu_rows = [
-            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-        ]
-        if user_admin:
-            menu_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
-        channel_link = get_group_link()
-        if channel_link:
-            menu_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
         try:
-            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML,
-                                          reply_markup=InlineKeyboardMarkup(menu_rows))
+            await query.message.delete()
         except Exception:
-            await query.message.reply_text(welcome_text, parse_mode=ParseMode.HTML,
-                                           reply_markup=InlineKeyboardMarkup(menu_rows))
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         return
 
     # 2. Get Standard Numbers -> Choose Country
@@ -3193,7 +3177,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = [
             [InlineKeyboardButton("📱 Get Numbers Now", callback_data="btn_get_number")],
         ]
-        buttons.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")])
 
         await query.edit_message_text(inv_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -3215,8 +3198,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             help_text,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")],
-                [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu")]
+                [InlineKeyboardButton("📱 Get Numbers", callback_data="btn_get_number")]
             ])
         )
 

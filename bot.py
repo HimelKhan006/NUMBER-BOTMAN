@@ -1361,15 +1361,16 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
-    Minimal professional reply keyboard:
-    Row 1: ⚡ Get Number
-    Row 2: 🔒 Secret Numbers (admins only)
-    Row 3: 👑 Admin Panel (admins only)
+    Bottom reply keyboard:
+    Row 1: ⚡ Get Number  (all users)
+    Row 2: 🔒 Secret Numbers  (admins only)
+    Row 3: 👑 Admin Panel  (admins only)
     """
     keyboard = [
         [KeyboardButton("⚡ Get Number")],
     ]
     if user_id and is_admin(user_id):
+        keyboard.append([KeyboardButton("🔒 Secret Numbers")])
         keyboard.append([KeyboardButton("👑 Admin Panel")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 

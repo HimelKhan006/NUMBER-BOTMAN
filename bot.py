@@ -1699,14 +1699,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if channel_link:
         inline_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
 
-    reply_kb = get_user_reply_keyboard(user.id)
     await update.message.reply_text(
         main_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_kb
-    )
-    await update.message.reply_text(
-        "👇 <b>Select an Action:</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_rows)
     )
@@ -2587,17 +2581,35 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("📋 Copied to clipboard!")
         return
 
-    # 1b. Main Menu - dismiss inline, welcome shown via reply keyboard
+    # 1b. Main Menu - show welcome with inline keyboard
     elif data == "btn_main_menu":
+        bot_name = get_bot_name()
+        stats = get_system_stats()
+        secret_allowed = user_admin or user_has_secret_access(user.id)
         welcome_text = (
-            f"👋 <b>Welcome, {user.first_name}!</b>\n\n"
-            f"⚡ <b>Ready to get numbers:</b> Tap <b>⚡ Get Number</b> below."
+            f"⚡ <b>Welcome to {bot_name}!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Status:</b> <code>Online &amp; Delivering ✅</code>\n"
+            f"• <b>Inventory:</b> <code>{stats['total_available']} numbers</code> ({stats['active_countries']} countries)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Tap '⚡ Get Number' below to receive phone numbers instantly:</i>"
         )
+        menu_rows = [
+            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
+        ]
+        if secret_allowed:
+            menu_rows.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
+        if user_admin:
+            menu_rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+        channel_link = get_group_link()
+        if channel_link:
+            menu_rows.append([InlineKeyboardButton(get_group_name(), url=channel_link)])
         try:
-            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML)
+            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML,
+                                          reply_markup=InlineKeyboardMarkup(menu_rows))
         except Exception:
             await query.message.reply_text(welcome_text, parse_mode=ParseMode.HTML,
-                                           reply_markup=get_user_reply_keyboard(user.id))
+                                           reply_markup=InlineKeyboardMarkup(menu_rows))
         return
 
     # 2. Get Standard Numbers -> Choose Country
@@ -2808,7 +2820,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         set_user_plus_preference(user.id, new_val)
         status_str = "WITH '+' prefix (e.g. +1234567890)" if new_val else "WITHOUT '+' prefix (e.g. 1234567890)"
         await query.answer(f"✅ Number format set to: {status_str}", show_alert=True)
-        keyboard = get_main_menu_keyboard(user.id)
+        inline_rows_plus = [
+            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
+        ]
+        if user_admin or user_has_secret_access(user.id):
+            inline_rows_plus.append([InlineKeyboardButton("🔒 Secret Numbers Pool", callback_data="btn_get_secret_number")])
+        if user_admin:
+            inline_rows_plus.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+        ch_link = get_group_link()
+        if ch_link:
+            inline_rows_plus.append([InlineKeyboardButton(get_group_name(), url=ch_link)])
+        keyboard = InlineKeyboardMarkup(inline_rows_plus)
         try:
             await query.edit_message_reply_markup(reply_markup=keyboard)
         except Exception:
@@ -2986,7 +3008,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Current Button Name:</b> <code>{curr_name}</code>\n\n"
             f"Please send the desired button label in chat:\n"
             f"e.g. <code>💬 Join VIP Channel</code> or <code>📢 Official OTP Group</code>\n\n"
-            f"<i>(Send <code>default</code> to reset to '{DEFAULT_OTP_GROUP_NAME}')</i>",
+            f"<i>(Send <code>default</code> to reset to '📢 Official Channel')</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]

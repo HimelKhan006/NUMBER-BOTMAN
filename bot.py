@@ -1042,6 +1042,85 @@ def set_bot_setting(key: str, value: str) -> bool:
         logger.warning(f"Error saving setting {key}: {e}")
         return False
 
+def normalize_button_url(raw_url: str) -> Optional[str]:
+    """
+    Normalizes URLs, Telegram bot usernames (@bot / bot), and links to valid clickable URLs.
+    Supports:
+    - https://... or http://... or tg://...
+    - @bot_username or @channel -> https://t.me/bot_username
+    - t.me/bot_username -> https://t.me/bot_username
+    - bot_username -> https://t.me/bot_username
+    """
+    url = str(raw_url or "").strip()
+    if not url:
+        return None
+    if url.startswith("@"):
+        clean_user = url.lstrip("@").strip()
+        return f"https://t.me/{clean_user}" if clean_user else None
+    if url.startswith("t.me/"):
+        return f"https://{url}"
+    if url.startswith(("http://", "https://", "tg://")):
+        return url
+    if all(c.isalnum() or c == "_" for c in url):
+        return f"https://t.me/{url}"
+    return None
+
+def get_custom_link_buttons() -> List[Dict[str, str]]:
+    """
+    Returns list of custom buttons for Number Bot: [{"id": "1", "text": "...", "url": "..."}, ...]
+    Backwards compatible with legacy group_link / otp_group_link.
+    """
+    buttons = []
+    try:
+        raw_val = get_bot_setting("custom_link_buttons", "")
+        if raw_val:
+            parsed = json.loads(raw_val)
+            if isinstance(parsed, list):
+                for idx, item in enumerate(parsed):
+                    if isinstance(item, dict) and item.get("text") and item.get("url"):
+                        b_text = str(item["text"]).strip()
+                        b_url  = str(item["url"]).strip()
+                        b_id   = str(item.get("id") or (idx + 1))
+                        buttons.append({"id": b_id, "text": b_text, "url": b_url})
+    except Exception as e:
+        logger.warning(f"Error reading custom_link_buttons: {e}")
+
+    # Backwards compatibility with legacy single group link
+    if not buttons:
+        legacy_url = get_group_link()
+        legacy_name = get_group_name()
+        if legacy_url:
+            buttons.append({"id": "1", "text": legacy_name, "url": legacy_url})
+            save_custom_link_buttons(buttons)
+
+    return buttons
+
+def save_custom_link_buttons(buttons: List[Dict[str, str]]):
+    """Saves normalized buttons list and syncs legacy keys and cloud storage."""
+    normalized = []
+    for idx, b in enumerate(buttons):
+        normalized.append({
+            "id": str(idx + 1),
+            "text": str(b.get("text", "")).strip(),
+            "url": str(b.get("url", "")).strip(),
+        })
+    try:
+        set_bot_setting("custom_link_buttons", json.dumps(normalized))
+    except Exception as e:
+        logger.warning(f"Error saving custom_link_buttons: {e}")
+
+    if normalized:
+        set_group_link(normalized[0]["url"])
+        set_group_name(normalized[0]["text"])
+    else:
+        set_group_link("")
+
+    if "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            asyncio.create_task(gist_storage.export_and_sync())
+        except Exception:
+            pass
+
 DEFAULT_BOT_NAME = "NUMBER BOTMAN"
 
 def get_bot_name() -> str:
@@ -1518,10 +1597,10 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     if user_id and is_admin(user_id):
         keyboard.append([KeyboardButton("👑 Admin Panel")])
 
-    channel_link = get_group_link()
-    if channel_link:
-        channel_name = get_group_name() or "📢 Official Channel"
-        keyboard.append([KeyboardButton(channel_name)])
+    custom_buttons = get_custom_link_buttons()
+    if custom_buttons:
+        for cb in custom_buttons:
+            keyboard.append([KeyboardButton(cb["text"])])
 
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1609,10 +1688,23 @@ def get_numbers_view_keyboard(
                     InlineKeyboardButton(clean, callback_data=f"copy_num_{country_id}")
                 ])
 
-    # Channel link button placed at top of Next and Change buttons
-    group_link = get_group_link()
-    if group_link:
-        btn_rows.append([InlineKeyboardButton(get_group_name(), url=group_link)])
+    # Custom link buttons placed at top of Next and Change buttons (side-by-side)
+    custom_buttons = get_custom_link_buttons()
+    if custom_buttons:
+        c_row = []
+        for cb in custom_buttons:
+            b_text = str(cb.get("text", "")).strip()
+            b_url  = str(cb.get("url", "")).strip()
+            if b_text and b_url.startswith(("http://", "https://", "tg://")):
+                c_row.append(InlineKeyboardButton(b_text, url=b_url))
+
+        # Display multiple custom buttons side-by-side!
+        if len(c_row) <= 3:
+            if c_row:
+                btn_rows.append(c_row)
+        else:
+            for i in range(0, len(c_row), 2):
+                btn_rows.append(c_row[i:i+2])
 
     btn_rows.append([
         InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
@@ -1914,6 +2006,275 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user:
         await show_user_history(update, user.id, user.first_name)
 
+def build_buttons_list_view() -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds the main custom link buttons management menu view for Number Bot."""
+    buttons = get_custom_link_buttons()
+    if not buttons:
+        msg = (
+            "🗂️ <b>Custom Link Buttons Management</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ <i>No custom buttons are currently configured.</i>\n\n"
+            "Custom buttons appear side-by-side on all delivered number screens.\n\n"
+            "Tap <b>➕ Add New Button</b> below to create one, or use:\n"
+            "<code>/setlink Button Name | @bot_username</code>\n"
+            "<i>or:</i> <code>/setlink Button Name | https://yourlink.com</code>"
+        )
+        kb = [
+            [InlineKeyboardButton("➕ Add New Button", callback_data="link_add_prompt")],
+            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")],
+        ]
+        return msg, InlineKeyboardMarkup(kb)
+
+    msg = (
+        f"🗂️ <b>Custom Link Buttons Management</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code>\n"
+        f"• <b>Display Mode:</b> <code>Side-by-Side in Number Deliveries ⚡</code>\n\n"
+        f"Select a button below to edit its name, change link, or remove it:"
+    )
+    kb = []
+    for b in buttons:
+        kb.append([InlineKeyboardButton(f"🔗 {b['text']}", callback_data=f"link_view_{b['id']}")])
+
+    kb.append([
+        InlineKeyboardButton("➕ Add New Button", callback_data="link_add_prompt"),
+        InlineKeyboardButton("🗑️ Clear All", callback_data="link_clear_all_confirm"),
+    ])
+    kb.append([
+        InlineKeyboardButton("🔄 Refresh List", callback_data="link_list"),
+        InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel"),
+    ])
+    return msg, InlineKeyboardMarkup(kb)
+
+def build_button_detail_view(btn_id: str) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+    """Builds detail/edit view for a single custom link button."""
+    buttons = get_custom_link_buttons()
+    found = next((b for b in buttons if str(b["id"]) == str(btn_id)), None)
+    if not found:
+        return None, None
+
+    msg = (
+        f"⚙️ <b>Manage Custom Button #{found['id']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Button Label:</b> <code>{html.escape(found['text'])}</code>\n"
+        f"• <b>Target Link:</b> <code>{html.escape(found['url'])}</code>\n\n"
+        f"Choose an option below to modify or remove this button:"
+    )
+    kb = [
+        [
+            InlineKeyboardButton("✏️ Change Name", callback_data=f"link_rename_{found['id']}"),
+            InlineKeyboardButton("🔗 Change Link", callback_data=f"link_reurl_{found['id']}"),
+        ],
+        [
+            InlineKeyboardButton("🗑️ Remove Button", callback_data=f"link_del_confirm_{found['id']}"),
+        ],
+        [
+            InlineKeyboardButton("◀️ Back to Buttons List", callback_data="link_list"),
+        ]
+    ]
+    return msg, InlineKeyboardMarkup(kb)
+
+def build_button_delete_confirm_view(btn_id: str) -> Tuple[Optional[str], Optional[InlineKeyboardMarkup]]:
+    """Builds delete confirmation view for a single custom link button."""
+    buttons = get_custom_link_buttons()
+    found = next((b for b in buttons if str(b["id"]) == str(btn_id)), None)
+    if not found:
+        return None, None
+
+    msg = (
+        f"⚠️ <b>Confirm Button Removal</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Are you sure you want to remove this button?\n\n"
+        f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
+        f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
+        f"It will be removed immediately from all number delivery messages."
+    )
+    kb = [
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"link_del_execute_{found['id']}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"link_view_{found['id']}"),
+        ]
+    ]
+    return msg, InlineKeyboardMarkup(kb)
+
+def build_buttons_clear_all_confirm_view() -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds confirmation dialog for clearing all custom buttons."""
+    buttons = get_custom_link_buttons()
+    msg = (
+        f"⚠️ <b>Confirm Clear All Buttons</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Are you sure you want to remove <b>ALL ({len(buttons)})</b> custom buttons?\n\n"
+        f"This action cannot be undone."
+    )
+    kb = [
+        [
+            InlineKeyboardButton("⚠️ Yes, Clear All", callback_data="link_clear_all_execute"),
+            InlineKeyboardButton("❌ Cancel", callback_data="link_list"),
+        ]
+    ]
+    return msg, InlineKeyboardMarkup(kb)
+
+async def setlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id):
+        await msg_obj.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    raw_args = " ".join(context.args).strip() if context.args else ""
+    if not raw_args or "|" not in raw_args:
+        text, markup = build_buttons_list_view()
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    parts = raw_args.split("|", 1)
+    btn_text = parts[0].strip()
+    raw_url  = parts[1].strip()
+
+    if not btn_text:
+        await msg_obj.reply_text("❌ Button text cannot be empty.", parse_mode=ParseMode.HTML)
+        return
+    btn_url = normalize_button_url(raw_url)
+    if not btn_url:
+        await msg_obj.reply_text("❌ Invalid link or bot username. Use <code>https://...</code> or <code>@bot_username</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    buttons = get_custom_link_buttons()
+    existing = next((b for b in buttons if b["text"].lower() == btn_text.lower()), None)
+    if existing:
+        existing["url"] = btn_url
+        action_note = "Updated existing button URL"
+        active_id = existing["id"]
+    else:
+        new_id = str(len(buttons) + 1)
+        buttons.append({"id": new_id, "text": btn_text, "url": btn_url})
+        action_note = "Added new button"
+        active_id = new_id
+
+    save_custom_link_buttons(buttons)
+    _, detail_kb = build_button_detail_view(active_id)
+    await msg_obj.reply_text(
+        f"✅ <b>Custom Link Button Configured!</b> ({action_note})\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Button Label:</b> <code>{html.escape(btn_text)}</code>\n"
+        f"• <b>Target URL:</b> <code>{html.escape(btn_url)}</code>\n"
+        f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)\n"
+        f"• <b>Storage:</b> <code>Database & Cloud Gist ☁️</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=detail_kb
+    )
+
+async def removelink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id):
+        await msg_obj.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    raw_arg = (" ".join(context.args).strip() if context.args else "").lower()
+
+    if raw_arg in ("all", "clear", "reset"):
+        save_custom_link_buttons([])
+        await msg_obj.reply_text("✅ <b>All custom link buttons removed.</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if raw_arg:
+        buttons = get_custom_link_buttons()
+        matching = [b for b in buttons if str(b["id"]) == raw_arg or b["text"].lower() == raw_arg]
+        if matching:
+            target = matching[0]
+            new_list = [b for b in buttons if b["id"] != target["id"]]
+            save_custom_link_buttons(new_list)
+            await msg_obj.reply_text(
+                f"✅ <b>Removed button:</b> <code>{html.escape(target['text'])}</code>\n"
+                f"Remaining buttons: <code>{len(new_list)}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+    # No arguments: open interactive management dashboard
+    text, markup = build_buttons_list_view()
+    await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+async def setbtnname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id):
+        await msg_obj.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    if not context.args or len(context.args) < 2:
+        await msg_obj.reply_text(
+            "✏️ <b>Usage:</b> <code>/setbtnname &lt;Button ID&gt; &lt;New Button Name&gt;</code>\n"
+            "<i>Example:</i> <code>/setbtnname 1 📢 Official Updates</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = context.args[0].strip()
+    new_name = " ".join(context.args[1:]).strip()
+    buttons = get_custom_link_buttons()
+    found = next((b for b in buttons if str(b["id"]) == target_id), None)
+    if not found:
+        await msg_obj.reply_text(f"❌ Button ID <code>#{target_id}</code> was not found.", parse_mode=ParseMode.HTML)
+        return
+
+    old_name = found["text"]
+    found["text"] = new_name
+    save_custom_link_buttons(buttons)
+    _, detail_kb = build_button_detail_view(found["id"])
+    await msg_obj.reply_text(
+        f"✅ <b>Button Renamed!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Old Name:</b> <code>{html.escape(old_name)}</code>\n"
+        f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>\n"
+        f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=detail_kb
+    )
+
+async def setbtnurl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id):
+        await msg_obj.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    if not context.args or len(context.args) < 2:
+        await msg_obj.reply_text(
+            "🔗 <b>Usage:</b> <code>/setbtnurl &lt;Button ID&gt; &lt;New URL or @bot_username&gt;</code>\n"
+            "<i>Example:</i> <code>/setbtnurl 1 @my_otp_bot</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = context.args[0].strip()
+    raw_url = context.args[1].strip()
+    clean_url = normalize_button_url(raw_url)
+    if not clean_url:
+        await msg_obj.reply_text("❌ Invalid link or bot username. Use <code>https://...</code> or <code>@bot_username</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    buttons = get_custom_link_buttons()
+    found = next((b for b in buttons if str(b["id"]) == target_id), None)
+    if not found:
+        await msg_obj.reply_text(f"❌ Button ID <code>#{target_id}</code> was not found.", parse_mode=ParseMode.HTML)
+        return
+
+    old_url = found["url"]
+    found["url"] = clean_url
+    save_custom_link_buttons(buttons)
+    _, detail_kb = build_button_detail_view(found["id"])
+    await msg_obj.reply_text(
+        f"✅ <b>Button Link Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
+        f"• <b>Old URL:</b> <code>{html.escape(old_url)}</code>\n"
+        f"• <b>New URL:</b> <code>{html.escape(clean_url)}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=detail_kb
+    )
+
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
@@ -1996,8 +2357,12 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     current_bot_name = get_bot_name()
     fixed_qty = get_admin_fixed_quantity()
     qty_label = f"Fixed ({fixed_qty} numbers)" if fixed_qty else "Default (10 numbers)"
-    curr_link = get_group_link()
-    link_display = f"<code>{curr_link}</code>" if curr_link else "<i>Not Set</i>"
+    custom_buttons = get_custom_link_buttons()
+    if custom_buttons:
+        link_items = [f"<code>{html.escape(b['text'])}</code>" for b in custom_buttons]
+        link_display = f"<b>{len(custom_buttons)} Active:</b> " + ", ".join(link_items)
+    else:
+        link_display = "<i>None configured</i>"
 
     now = time.time()
     uptime_secs = int(now - bot_process_start_time)
@@ -2032,7 +2397,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Active Pools:</b> <code>{stats['active_countries']} pools</code>\n"
         f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
-        f"• <b>Channel Link:</b> {link_display}\n"
+        f"• <b>Custom Buttons:</b> {link_display}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -2043,7 +2408,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '10 (Default)'}", callback_data="admin_qty_menu"),
-            InlineKeyboardButton("📢 Channel Link", callback_data="admin_set_group_prompt")
+            InlineKeyboardButton(f"🔗 Custom Buttons ({len(custom_buttons)})", callback_data="link_list")
         ],
         [
             InlineKeyboardButton("👥 User Manager", callback_data="admin_users"),
@@ -2695,23 +3060,121 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await admin_command(update, context)
         return
 
-    # Handle Channel Link Button tapped from Bottom Reply Keyboard
-    channel_link = get_group_link()
-    channel_name = get_group_name() or "📢 Official Channel"
-    if channel_link and text in [channel_name, f"📢 {channel_name}", "📢 Official Channel", "Channel"]:
-        await update.message.reply_text(
-            f"📢 <b>{channel_name}</b>\n\nTap below to open the channel:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"👉 Open {channel_name}", url=channel_link)]
-            ])
-        )
-        return
+    # Handle Custom Button tapped from Bottom Reply Keyboard
+    custom_buttons = get_custom_link_buttons()
+    for cb in custom_buttons:
+        if text in [cb["text"], f"📢 {cb['text']}", f"🔗 {cb['text']}"]:
+            await update.message.reply_text(
+                f"🔗 <b>{cb['text']}</b>\n\nTap below to open link:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"👉 Open {cb['text']}", url=cb["url"])]
+                ])
+            )
+            return
 
     # 3. Handle Remaining Admin States
     admin_state = ADMIN_STATES.get(user.id)
     if not admin_state or not is_admin(user.id):
         return
+
+    btn_action = admin_state.get("awaiting_btn_action")
+    if btn_action and isinstance(btn_action, dict):
+        action = btn_action.get("action")
+        target_id = btn_action.get("id")
+        buttons = get_custom_link_buttons()
+
+        if action == "rename" and target_id:
+            del admin_state["awaiting_btn_action"]
+            found = next((b for b in buttons if str(b["id"]) == str(target_id)), None)
+            if found:
+                old_name = found["text"]
+                found["text"] = text
+                save_custom_link_buttons(buttons)
+                _, detail_kb = build_button_detail_view(found["id"])
+                await update.message.reply_text(
+                    f"✅ <b>Button Renamed!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>Old:</b> <code>{html.escape(old_name)}</code>\n"
+                    f"• <b>New:</b> <code>{html.escape(text)}</code>\n"
+                    f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=detail_kb
+                )
+                return
+
+        elif action == "reurl" and target_id:
+            found = next((b for b in buttons if str(b["id"]) == str(target_id)), None)
+            if found:
+                clean_url = normalize_button_url(text)
+                if not clean_url:
+                    await update.message.reply_text(
+                        "❌ <b>Invalid URL or Bot Username</b>\n"
+                        "Link must start with <code>https://</code>, <code>http://</code>, or be a bot username like <code>@bot_username</code>.\n"
+                        "Please send a valid link or click Cancel:",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ Cancel", callback_data=f"link_view_{found['id']}")]
+                        ])
+                    )
+                    return
+                del admin_state["awaiting_btn_action"]
+                old_url = found["url"]
+                found["url"] = clean_url
+                save_custom_link_buttons(buttons)
+                _, detail_kb = build_button_detail_view(found["id"])
+                await update.message.reply_text(
+                    f"✅ <b>Button URL Updated!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
+                    f"• <b>New URL:</b> <code>{html.escape(clean_url)}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=detail_kb
+                )
+                return
+
+        elif action == "add":
+            b_name, raw_url = "", ""
+            if "|" in text:
+                parts = text.split("|", 1)
+                b_name = parts[0].strip()
+                raw_url = parts[1].strip()
+            else:
+                parts = text.split()
+                if len(parts) >= 2:
+                    raw_url = parts[-1].strip()
+                    b_name = " ".join(parts[:-1]).strip()
+
+            clean_url = normalize_button_url(raw_url)
+            if not b_name or not clean_url:
+                await update.message.reply_text(
+                    "❌ <b>Invalid Format</b>\n"
+                    "Please provide button name and link or bot username separated by <code>|</code>:\n"
+                    "<code>Button Name | @bot_username</code>\n"
+                    "<i>or:</i> <code>Button Name | https://yourlink.com</code>\n\n"
+                    "<i>Example:</i> <code>🤖 OTP Bot | @my_otp_bot</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data="link_list")]
+                    ])
+                )
+                return
+
+            del admin_state["awaiting_btn_action"]
+            new_id = str(len(buttons) + 1)
+            buttons.append({"id": new_id, "text": b_name, "url": clean_url})
+            save_custom_link_buttons(buttons)
+            _, detail_kb = build_button_detail_view(new_id)
+            await update.message.reply_text(
+                f"✅ <b>New Custom Button Added!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Label:</b> <code>{html.escape(b_name)}</code>\n"
+                f"• <b>Link:</b> <code>{html.escape(clean_url)}</code>\n"
+                f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=detail_kb
+            )
+            return
 
     if admin_state.get("awaiting_bot_name"):
         del admin_state["awaiting_bot_name"]
@@ -3353,42 +3816,146 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-    # Admin Set OTP Group Prompt
-    elif data == "admin_set_group_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_otp_group_link": True}
-        curr = get_otp_group_link()
-        curr_name = get_otp_group_name()
-        curr_msg = f"• <b>Current Link:</b> <code>{curr}</code>\n• <b>Button Name:</b> <code>{curr_name}</code>\n\n" if curr else ""
+    # Custom Buttons Management
+    elif (data == "link_list" or data == "admin_set_group_prompt") and user_admin:
+        admin_state = ADMIN_STATES.setdefault(user.id, {})
+        admin_state.pop("awaiting_btn_action", None)
+        msg_text, markup = build_buttons_list_view()
+        try:
+            await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data.startswith("link_view_") and user_admin:
+        admin_state = ADMIN_STATES.setdefault(user.id, {})
+        admin_state.pop("awaiting_btn_action", None)
+        btn_id = data.replace("link_view_", "").strip()
+        msg_text, markup = build_button_detail_view(btn_id)
+        if msg_text and markup:
+            try:
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await query.answer("Button not found", show_alert=True)
+            msg_text, markup = build_buttons_list_view()
+            await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data.startswith("link_del_confirm_") and user_admin:
+        btn_id = data.replace("link_del_confirm_", "").strip()
+        msg_text, markup = build_button_delete_confirm_view(btn_id)
+        if msg_text and markup:
+            try:
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data.startswith("link_del_execute_") and user_admin:
+        btn_id = data.replace("link_del_execute_", "").strip()
+        buttons = get_custom_link_buttons()
+        found = next((b for b in buttons if str(b["id"]) == btn_id), None)
+        new_list = [b for b in buttons if str(b["id"]) != btn_id]
+        save_custom_link_buttons(new_list)
+        await query.answer("Button removed! 🗑️")
+        deleted_name = html.escape(found["text"]) if found else "Button"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Back to Buttons List", callback_data="link_list")]
+        ])
         await query.edit_message_text(
-            f"🔗 <b>Set / Update OTP Group Link & Name:</b>\n"
+            f"✅ <b>Button Removed!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{curr_msg}"
-            f"Please send your link OR <code>Button Name | Link</code> in chat:\n"
-            f"• Example 1: <code>https://t.me/your_otp_group</code>\n"
-            f"• Example 2: <code>💬 Join VIP Channel | https://t.me/your_otp_group</code>\n\n"
-            f"<i>(Users will see a '{curr_name}' button on their number delivery screen).</i>",
+            f"<code>{deleted_name}</code> has been removed.\n\n"
+            f"• <b>Remaining Active Buttons:</b> <code>{len(new_list)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏷️ Set Button Name Only", callback_data="admin_set_group_name_prompt")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
-            ])
+            reply_markup=kb
         )
 
-    # Admin Set OTP Group Name Prompt
-    elif data == "admin_set_group_name_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_otp_group_name": True}
-        curr_name = get_otp_group_name()
+    elif data == "link_clear_all_confirm" and user_admin:
+        msg_text, markup = build_buttons_clear_all_confirm_view()
+        try:
+            await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data == "link_clear_all_execute" and user_admin:
+        save_custom_link_buttons([])
+        await query.answer("All buttons cleared! 🗑️")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add New Button", callback_data="link_add_prompt")],
+            [InlineKeyboardButton("◀️ Back to List", callback_data="link_list")],
+        ])
         await query.edit_message_text(
-            f"🏷️ <b>Set OTP Group Button Name:</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Current Button Name:</b> <code>{curr_name}</code>\n\n"
-            f"Please send the desired button label in chat:\n"
-            f"e.g. <code>💬 Join VIP Channel</code> or <code>📢 Official OTP Group</code>\n\n"
-            f"<i>(Send <code>default</code> to reset to '📢 Official Channel')</i>",
+            "✅ <b>All Custom Buttons Cleared!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "All custom buttons have been removed from number delivery messages.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            reply_markup=kb
+        )
+
+    elif data.startswith("link_rename_") and user_admin:
+        btn_id = data.replace("link_rename_", "").strip()
+        buttons = get_custom_link_buttons()
+        found = next((b for b in buttons if str(b["id"]) == btn_id), None)
+        if found:
+            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "rename", "id": found["id"]}}
+            await query.answer("Send new name in chat 💬")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel / Back", callback_data=f"link_view_{found['id']}")]
             ])
+            await query.edit_message_text(
+                f"✏️ <b>Change Name for #{found['id']}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Current Name:</b> <code>{html.escape(found['text'])}</code>\n"
+                f"• <b>Target URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
+                f"💬 <b>Send the new button name</b> directly in this chat, or use:\n"
+                f"<code>/setbtnname {found['id']} &lt;New Name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb
+            )
+
+    elif data.startswith("link_reurl_") and user_admin:
+        btn_id = data.replace("link_reurl_", "").strip()
+        buttons = get_custom_link_buttons()
+        found = next((b for b in buttons if str(b["id"]) == btn_id), None)
+        if found:
+            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "reurl", "id": found["id"]}}
+            await query.answer("Send new URL or bot username 💬")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel / Back", callback_data=f"link_view_{found['id']}")]
+            ])
+            await query.edit_message_text(
+                f"🔗 <b>Change URL for #{found['id']}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
+                f"• <b>Current URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
+                f"💬 <b>Send the new link URL or bot username</b> directly in this chat:\n"
+                f"<code>https://...</code> or <code>@bot_username</code>\n\n"
+                f"<b>Or use command:</b>\n"
+                f"<code>/setbtnurl {found['id']} &lt;New URL or @bot_username&gt;</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb
+            )
+
+    elif data == "link_add_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "add"}}
+        await query.answer("Send new button details 💬")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Cancel / Back", callback_data="link_list")]
+        ])
+        await query.edit_message_text(
+            "➕ <b>Add New Custom Button</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Custom buttons appear side-by-side on number deliveries.\n\n"
+            "💬 <b>Send button name and link or bot username</b> in chat using this format:\n"
+            "<code>Button Name | @bot_username</code>\n"
+            "<i>or:</i> <code>Button Name | https://yourlink.com</code>\n\n"
+            "<b>Or run command:</b>\n"
+            "<code>/setlink Button Name | @bot_username</code>\n\n"
+            "<i>Examples:</i>\n"
+            "• <code>🤖 Thirdwave OTP Bot | @my_otp_bot</code>\n"
+            "• <code>📢 Join Channel | https://t.me/mychannel</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
         )
 
     # 6. Admin Panel
@@ -4875,9 +5442,12 @@ def main():
     app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("adduser", adduser_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removeuser", removeuser_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setlink", setlink_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("removelink", removelink_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setbtnurl", setbtnurl_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setgroup", setgroup_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setgroupname", setgroupname_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setbtnname", setgroupname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setbtnname", setbtnname_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("grantsecret", grantsecret_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("revokesecret", revokesecret_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("user", user_lookup_command, filters=filters.ChatType.PRIVATE))
@@ -4909,18 +5479,17 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. COMPLETELY WIPE commands from ALL groups
-            for sc in (BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
+            # 1. COMPLETELY WIPE commands from DEFAULT scope and ALL groups
+            for sc in (BotCommandScopeDefault(), BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
                 try:
                     await application.bot.delete_my_commands(scope=sc)
                 except Exception:
                     pass
 
-            # 2. Minimal command menu: ONLY /start across all private chats and admins
+            # 2. Minimal command menu: ONLY /start across all private chats
             start_only = [
                 BotCommand("start", "🚀 Main Menu"),
             ]
-            await application.bot.set_my_commands(start_only, scope=BotCommandScopeDefault())
             await application.bot.set_my_commands(start_only, scope=BotCommandScopeAllPrivateChats())
             await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 

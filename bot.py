@@ -83,7 +83,7 @@ try:
 except ImportError:
     CopyTextButton = None
 
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatType
 from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -2976,6 +2976,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
+
+    chat = update.effective_chat or (query.message.chat if query and query.message else None)
+    if chat and chat.type != ChatType.PRIVATE:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
     await query.answer()
     data = query.data
     user = update.effective_user
@@ -4848,50 +4859,50 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("getnumber", getnumber_command))
-    app.add_handler(CommandHandler("secretnumbers", secretnumbers_command))
-    app.add_handler(CommandHandler("inventory", inventory_command))
-    app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("admins", admins_command))
-    app.add_handler(CommandHandler("addadmin", addadmin_command))
-    app.add_handler(CommandHandler("removeadmin", removeadmin_command))
-    app.add_handler(CommandHandler("adduser", adduser_command))
-    app.add_handler(CommandHandler("removeuser", removeuser_command))
-    app.add_handler(CommandHandler("setgroup", setgroup_command))
-    app.add_handler(CommandHandler("setgroupname", setgroupname_command))
-    app.add_handler(CommandHandler("setbtnname", setgroupname_command))
-    app.add_handler(CommandHandler("grantsecret", grantsecret_command))
-    app.add_handler(CommandHandler("revokesecret", revokesecret_command))
-    app.add_handler(CommandHandler("user", user_lookup_command))
-    app.add_handler(CommandHandler("find", user_lookup_command))
-    app.add_handler(CommandHandler("search", user_lookup_command))
-    app.add_handler(CommandHandler("finduser", user_lookup_command))
-    app.add_handler(CommandHandler("users", admin_command))
-    app.add_handler(CommandHandler("setname", setname_command))
-    app.add_handler(CommandHandler("resetname", resetname_command))
-    app.add_handler(CommandHandler("setquantity", setquantity_command))
-    app.add_handler(CommandHandler("setqty", setquantity_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("restart", restart_command))
-    app.add_handler(CommandHandler("reboot", restart_command))
-    app.add_handler(CommandHandler("account", user_lookup_command))
-    app.add_handler(CommandHandler("myaccount", user_lookup_command))
-    app.add_handler(CommandHandler("me", user_lookup_command))
-    app.add_handler(CommandHandler("profile", user_lookup_command))
-    app.add_handler(CommandHandler("ban", ban_command))
-    app.add_handler(CommandHandler("unban", unban_command))
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
-    app.add_handler(CommandHandler("sendto", sendto_command))
-    app.add_handler(CommandHandler("recall", recall_command))
-    app.add_handler(CommandHandler("delbroadcast", recall_command))
+    app.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("getnumber", getnumber_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("secretnumbers", secretnumbers_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("inventory", inventory_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("history", history_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("stats", stats_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("admin", admin_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("admins", admins_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("addadmin", addadmin_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("adduser", adduser_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("removeuser", removeuser_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setgroup", setgroup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setgroupname", setgroupname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setbtnname", setgroupname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("grantsecret", grantsecret_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("revokesecret", revokesecret_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("user", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("find", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("search", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("finduser", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("users", admin_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setname", setname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("resetname", resetname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setquantity", setquantity_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setqty", setquantity_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("status", status_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("restart", restart_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("reboot", restart_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("account", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("myaccount", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("me", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("profile", user_lookup_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("ban", ban_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("unban", unban_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("broadcast", broadcast_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("sendto", sendto_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("recall", recall_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("delbroadcast", recall_command, filters=filters.ChatType.PRIVATE))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, handle_document_upload))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     async def setup_bot_commands(application: Application):
         try:

@@ -1123,15 +1123,25 @@ def save_custom_link_buttons(buttons: List[Dict[str, str]]):
 
 DEFAULT_BOT_NAME = "NUMBER BOTMAN"
 
+def get_default_bot_name() -> str:
+    val = get_bot_setting("default_bot_name", "")
+    if val and val.strip():
+        return val.strip()[:64]
+    return DEFAULT_BOT_NAME
+
 def get_bot_name() -> str:
-    val = get_bot_setting("bot_name", DEFAULT_BOT_NAME)
-    return val if val else DEFAULT_BOT_NAME
+    default_name = get_default_bot_name()
+    val = get_bot_setting("bot_name", default_name)
+    return val if val else default_name
 
 def set_bot_name(name: str) -> bool:
     clean = name.strip()[:64]
+    default_name = get_default_bot_name()
     if not clean or clean.lower() in ("default", "reset"):
-        clean = DEFAULT_BOT_NAME
-    return set_bot_setting("bot_name", clean)
+        clean = default_name
+    set_bot_setting("bot_name", clean)
+    set_bot_setting("default_bot_name", clean)
+    return True
 
 def get_admin_fixed_quantity() -> Optional[int]:
     """Returns fixed quantity if set by admin (1-1000), else None (default mode 10)."""
@@ -1495,8 +1505,9 @@ async def send_startup_announcement(application: Application):
     group_link = get_otp_group_link()
     group_info = f"\n• <b>OTP Group:</b> <code>{group_link}</code>" if group_link else ""
 
+    active_name = get_bot_name()
     admin_msg = (
-        "⚡ <b>NUMBER BOTMAN 24/7 ONLINE</b>\n"
+        f"⚡ <b>{html.escape(active_name)} 24/7 ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "• <b>Status:</b> <code>Online & Serving Live Numbers ✅</code>\n"
         "• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
@@ -1569,7 +1580,7 @@ def format_delivered_numbers(
     ]
     if available_count is not None:
         lines.append(f"<b>Available:</b> <code>{available_count} numbers</code>")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)
 
@@ -1581,21 +1592,41 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
         lines.append(f"<code>{clean}</code>")
     return "\n".join(lines)
 
+def get_select_country_text(secret_mode: bool = False) -> str:
+    """Builds professional full-width header for Select Country message."""
+    if secret_mode:
+        return (
+            "🔒 <b>Secret Numbers Pool:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    return (
+        "🌍 <b>Select Country:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
     Bottom reply keyboard:
-    Row 1: ⚡ Get Number | 👤 My Account (all users)
-    Row 2: 🔒 Secret Numbers (admins & whitelisted users)
-    Row 3: 👑 Admin Panel (admins only)
-    Row 4: Channel Link Button (all users, if configured by admin)
+    Row 1: ⚡ Get Number | 🔒 Secret Numbers (if secret access or admin)
+    Row 2: 👤 My Account | 👑 Admin Panel (if admin)
+    Row 3+: Custom buttons
     """
-    keyboard = [
-        [KeyboardButton("⚡ Get Number"), KeyboardButton("👤 My Account")],
-    ]
-    if user_id and (is_admin(user_id) or user_has_secret_access(user_id)):
-        keyboard.append([KeyboardButton("🔒 Secret Numbers")])
-    if user_id and is_admin(user_id):
-        keyboard.append([KeyboardButton("👑 Admin Panel")])
+    has_secret = bool(user_id and (is_admin(user_id) or user_has_secret_access(user_id)))
+    admin = bool(user_id and is_admin(user_id))
+
+    keyboard = []
+    if has_secret:
+        keyboard.append([KeyboardButton("⚡ Get Number"), KeyboardButton("🔒 Secret Numbers")])
+    else:
+        if admin:
+            keyboard.append([KeyboardButton("⚡ Get Number")])
+        else:
+            keyboard.append([KeyboardButton("⚡ Get Number"), KeyboardButton("👤 My Account")])
+
+    if admin:
+        keyboard.append([KeyboardButton("👤 My Account"), KeyboardButton("👑 Admin Panel")])
+    elif has_secret:
+        keyboard.append([KeyboardButton("👤 My Account")])
 
     custom_buttons = get_custom_link_buttons()
     if custom_buttons:
@@ -1817,7 +1848,6 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
         buttons.append([InlineKeyboardButton(sec_toggle_label, callback_data=f"u_toggle_sec_{target_user_id}")])
         buttons.append([InlineKeyboardButton(ban_toggle_label, callback_data=f"u_toggle_ban_{target_user_id}")])
         buttons.append([InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_user_id}")])
-        buttons.append([InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_user_id}")])
         buttons.append([InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")])
         buttons.append([InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")])
 
@@ -2420,7 +2450,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("👑 Admins", callback_data="admin_manage_admins")
         ],
         [
-            InlineKeyboardButton("📢 Broadcast SMS / Msg", callback_data="admin_broadcast_menu"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_menu"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
         [
@@ -2471,7 +2501,10 @@ async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ <b>Bot Name Successfully Updated!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>",
+        f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>\n"
+        f"• <b>Default Name:</b> <code>{html.escape(new_name)} (Saved as permanent default)</code>\n"
+        f"• <b>Telegram API:</b> <code>Applied Officially ✅</code>\n"
+        f"• <b>Database:</b> <code>Saved to Persistent Storage 🔒</code>",
         parse_mode=ParseMode.HTML
     )
 
@@ -2481,19 +2514,22 @@ async def resetname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ <b>Access Restricted.</b> Admins only.", parse_mode=ParseMode.HTML)
         return
 
+    default_name = get_default_bot_name()
     try:
-        await context.bot.set_my_name(name=DEFAULT_BOT_NAME)
+        await context.bot.set_my_name(name=default_name)
     except Exception as e:
         logger.warning(f"Could not reset Telegram bot name: {e}")
 
-    set_bot_name(DEFAULT_BOT_NAME)
+    set_bot_name(default_name)
     if gist_storage.enabled:
         asyncio.create_task(gist_storage.export_and_sync())
 
     await update.message.reply_text(
         f"✅ <b>Bot Name Reset to Default!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Active Name:</b> <code>{DEFAULT_BOT_NAME}</code>",
+        f"• <b>Active Name:</b> <code>{html.escape(default_name)}</code>\n"
+        f"• <b>Default Name:</b> <code>{html.escape(default_name)}</code>\n"
+        f"• <b>Database:</b> <code>Saved to Persistent Storage 🔒</code>",
         parse_mode=ParseMode.HTML
     )
 
@@ -2566,9 +2602,7 @@ async def getnumber_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     await update.message.reply_text(
-        "🌍 <b>Select a Country:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Choose the country you want numbers for:</i>",
+        get_select_country_text(secret_mode=False),
         parse_mode=ParseMode.HTML,
         reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
     )
@@ -2602,9 +2636,7 @@ async def secretnumbers_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await update.message.reply_text(
-        "🔒 <b>Secret Numbers Pool — Select Country:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Exclusive numbers reserved for authorized accounts:</i>",
+        get_select_country_text(secret_mode=True),
         parse_mode=ParseMode.HTML,
         reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=True)
     )
@@ -2757,28 +2789,11 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await addadmin_command(update, context)
 
-async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    args = update.message.text.replace("/removeuser", "", 1).strip()
-    if not args or not args.isdigit():
-        await update.message.reply_text("Usage: <code>/removeuser &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    target_id = int(args)
-    res = delete_user(target_id)
-    if res and gist_storage.enabled:
-        asyncio.create_task(gist_storage.export_and_sync())
-    if res:
-        await update.message.reply_text(f"✅ User <code>{target_id}</code> permanently deleted from database.", parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(f"⚠️ User <code>{target_id}</code> not found in database.", parse_mode=ParseMode.HTML)
-
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
         return
-    msg = await update.message.reply_text("🔄 <i>Restarting NUMBER BOTMAN engine...</i>", parse_mode=ParseMode.HTML)
+    msg = await update.message.reply_text(f"🔄 <i>Restarting {html.escape(get_bot_name())} engine...</i>", parse_mode=ParseMode.HTML)
     if gist_storage.enabled:
         try:
             await gist_storage.export_and_sync(is_handover=True)
@@ -2971,37 +2986,44 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_admin(user.id):
         admin_state = ADMIN_STATES.get(user.id)
         if admin_state and admin_state.get("awaiting_user_search"):
-            del admin_state["awaiting_user_search"]
             clean_text = text.strip()
-            if not clean_text.isdigit():
-                await update.message.reply_text(
-                    "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
-                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
-                    ])
-                )
-                return
+            custom_btn_texts = [cb["text"] for cb in get_custom_link_buttons()]
+            if clean_text.startswith("/") or clean_text in [
+                "⚡ Get Number", "🔒 Secret Numbers", "👤 My Account", "👑 Admin Panel",
+                "⚡ get number", "🔒 secret numbers", "👤 my account", "👑 admin panel"
+            ] or clean_text in custom_btn_texts:
+                del admin_state["awaiting_user_search"]
+            else:
+                del admin_state["awaiting_user_search"]
+                if not clean_text.isdigit():
+                    await update.message.reply_text(
+                        "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
+                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                        ])
+                    )
+                    return
 
-            target_uid = int(clean_text)
-            u = get_user_details(target_uid)
-            if not u:
-                await update.message.reply_text(
-                    f"⚠️ <b>User Not Found:</b>\n"
-                    f"No account record found for ID: <code>{target_uid}</code>.\n\n"
-                    f"<i>The user has not joined or started the bot yet.</i>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
-                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
-                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                    ])
-                )
-                return
+                target_uid = int(clean_text)
+                u = get_user_details(target_uid)
+                if not u:
+                    await update.message.reply_text(
+                        f"⚠️ <b>User Not Found:</b>\n"
+                        f"No account record found for ID: <code>{target_uid}</code>.\n\n"
+                        f"<i>The user has not joined or started the bot yet.</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
+                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                        ])
+                    )
+                    return
 
-            await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
-            return
+                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+                return
 
         # Direct User ID lookup if admin sends an Account ID directly in chat
         clean_txt = text.strip()
@@ -3032,10 +3054,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-
-
         await update.message.reply_text(
-            "🌍 <b>Select Country:</b>",
+            get_select_country_text(secret_mode=False),
             parse_mode=ParseMode.HTML,
             reply_markup=get_countries_keyboard(page=0, per_page=8, is_admin_mode=False, is_secret_mode=False)
         )
@@ -3183,21 +3203,29 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if admin_state.get("awaiting_bot_name"):
         del admin_state["awaiting_bot_name"]
-        new_name = text
+        new_name = text.strip()[:64]
+        default_name = get_default_bot_name()
         if new_name.lower() in ("default", "reset"):
-            set_bot_name(DEFAULT_BOT_NAME)
+            set_bot_name(default_name)
             try:
-                await context.bot.set_my_name(name=DEFAULT_BOT_NAME)
+                await context.bot.set_my_name(name=default_name)
             except Exception:
                 pass
-            await update.message.reply_text(f"✅ Bot display name reset to default: <code>{DEFAULT_BOT_NAME}</code>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"✅ Bot display name reset to default: <code>{html.escape(default_name)}</code>", parse_mode=ParseMode.HTML)
         else:
             set_bot_name(new_name)
             try:
                 await context.bot.set_my_name(name=new_name)
             except Exception:
                 pass
-            await update.message.reply_text(f"✅ Bot display name updated to: <code>{html.escape(new_name)}</code>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(
+                f"✅ <b>Bot Display Name Updated!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>\n"
+                f"• <b>Default Name:</b> <code>{html.escape(new_name)} (Saved as permanent default)</code>\n"
+                f"• <b>Database:</b> <code>Saved & Synced 🔒</code>",
+                parse_mode=ParseMode.HTML
+            )
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         return
@@ -3469,6 +3497,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("⛔ Your account has been banned.", show_alert=True)
         return
     register_user(user.id, user.username, user.first_name)
+    if data != "admin_search_user_prompt" and user.id in ADMIN_STATES:
+        ADMIN_STATES[user.id].pop("awaiting_user_search", None)
 
     # Language Manager & SMS Language Callbacks
     if data.startswith("copy_num_"):
@@ -3501,12 +3531,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-
-
         await query.edit_message_text(
-            "🌍 <b>Select a Country:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>Choose the country you want numbers for:</i>",
+            get_select_country_text(secret_mode=False),
             parse_mode=ParseMode.HTML,
             reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=False)
         )
@@ -3533,9 +3559,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         await query.edit_message_text(
-            "🔒 <b>Secret Numbers Pool — Select Country:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>Exclusive numbers reserved for authorized accounts:</i>",
+            get_select_country_text(secret_mode=True),
             parse_mode=ParseMode.HTML,
             reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=True)
         )
@@ -4539,7 +4563,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
             [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
             [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
-            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")],
             [InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
@@ -4594,7 +4617,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
-            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
@@ -4666,7 +4688,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
             [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
             [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
-            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
@@ -4800,93 +4821,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # 9d. Confirm User Removal
-    elif data.startswith("u_del_confirm_") and user_admin:
-        target_id = int(data.split("_")[3])
-        u = get_user_details(target_id)
-        if not u:
-            await query.answer("⚠️ User not found.", show_alert=True)
-            return
-        uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
-        confirm_text = (
-            f"⚠️ <b>Confirm User Removal</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
-            f"📛 <b>Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
-            f"🔗 <b>Username:</b> {uname}\n"
-            f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🗑️ <b>This will permanently delete this user and their delivery log from the database.</b>\n"
-            f"<i>This action cannot be undone!</i>"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Remove User", callback_data=f"u_del_do_{target_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_id}")]
-        ])
-        await query.edit_message_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    # 9e. Execute User Removal
-    elif data.startswith("u_del_do_") and user_admin:
-        target_id = int(data.split("_")[3])
-        u = get_user_details(target_id)
-        uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
-        consumed = u.get("numbers_consumed", 0) if u else 0
-
-        # 1. Erase any broadcast or direct messages sent to this user
-        try:
-            with get_main_db() as conn:
-                cur = conn.execute("SELECT message_id FROM broadcast_messages WHERE user_id = ?;", (target_id,))
-                for row in cur.fetchall():
-                    try:
-                        await context.bot.delete_message(chat_id=target_id, message_id=row["message_id"])
-                    except Exception:
-                        pass
-                conn.execute("DELETE FROM broadcast_messages WHERE user_id = ?;", (target_id,))
-                conn.commit()
-        except Exception:
-            pass
-
-        # 2. Silently clear bottom reply keyboard from user's screen without leaving a message
-        try:
-            rm_msg = await context.bot.send_message(
-                chat_id=target_id,
-                text=".",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            await context.bot.delete_message(chat_id=target_id, message_id=rm_msg.message_id)
-        except Exception:
-            pass
-
-        res = delete_user(target_id)
-        if res and gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-
-        if res:
-            await query.answer("🗑️ User permanently purged!", show_alert=True)
-            result_text = (
-                f"✅ <b>User Permanently Purged from Bot & Databases</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 <b>Target User ID:</b> <code>{target_id}</code>\n"
-                f"📛 <b>Name:</b> <code>{uname}</code>\n"
-                f"👤 <b>Account Record:</b> <code>Permanently Deleted 🗑️</code>\n"
-                f"📜 <b>Delivery Logs Cleared:</b> <code>{res['deleted_delivery_logs']}</code>\n"
-                f"📦 <b>Country Stock Records Purged:</b> <code>{res['deleted_stock_logs']}</code>\n"
-                f"☁️ <b>Cloud Sync:</b> <code>Purged from Gist ☁️</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🗑️ <i>All user data and database entries have been permanently removed.</i>"
-            )
-        else:
-            await query.answer("❌ User not found or already removed.", show_alert=True)
-            result_text = (
-                f"⚠️ <b>User Not Found</b>\n"
-                f"<i>User ID <code>{target_id}</code> was not found in the database.</i>"
-            )
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-        await query.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # 12. Admin Select Existing Country for Upload / Removal
     # 11b. Admin Use Uploaded File Name as Country Name
@@ -5490,7 +5425,6 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("adduser", adduser_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("removeuser", removeuser_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setlink", setlink_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removelink", removelink_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setbtnurl", setbtnurl_command, filters=filters.ChatType.PRIVATE))
@@ -5605,6 +5539,13 @@ def main():
                 await gist_storage.restore_from_gist()
             except Exception as e:
                 logger.warning(f"Gist startup sync notice: {e}")
+        # Restore active bot name from database to Telegram
+        current_name = get_bot_name()
+        try:
+            await application.bot.set_my_name(name=current_name)
+            logger.info(f"🤖 Applied active bot name from database: {current_name}")
+        except Exception as e:
+            logger.warning(f"Startup bot name restore notice: {e}")
         await setup_bot_commands(application)
         await send_startup_announcement(application)
 

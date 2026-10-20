@@ -75,6 +75,9 @@ from telegram import (
     ReplyKeyboardRemove,
     BotCommand,
     BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
     BotCommandScopeChat,
     MenuButtonCommands,
 )
@@ -4906,27 +4909,29 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. Minimal user command menu
-            user_commands = [
+            # 1. COMPLETELY WIPE commands from ALL groups
+            for sc in (BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
+                try:
+                    await application.bot.delete_my_commands(scope=sc)
+                except Exception:
+                    pass
+
+            # 2. Minimal command menu: ONLY /start across all private chats and admins
+            start_only = [
                 BotCommand("start", "🚀 Main Menu"),
             ]
-            await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+            await application.bot.set_my_commands(start_only, scope=BotCommandScopeDefault())
+            await application.bot.set_my_commands(start_only, scope=BotCommandScopeAllPrivateChats())
             await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-            # 2. Admin command menu
-            admin_commands = [
-                BotCommand("start", "🚀 Main Menu"),
-                BotCommand("admin", "👑 Admin Panel"),
-                BotCommand("stats", "📊 Live Statistics"),
-                BotCommand("setquantity", "🔢 Set Number Quantity"),
-            ]
             for aid in get_all_admin_ids():
                 if aid:
                     try:
-                        await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(aid))
+                        await application.bot.delete_my_commands(scope=BotCommandScopeChat(aid))
+                        await application.bot.set_my_commands(start_only, scope=BotCommandScopeChat(aid))
                     except Exception:
                         pass
-            logger.info("✅ Telegram Bot Command Menu & Menu Button configured cleanly.")
+            logger.info("✅ Telegram Bot Command Menu: ONLY /start in DM, 0 commands in groups.")
         except Exception as e:
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 

@@ -2416,15 +2416,15 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
-        f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+        f"• <b>Bot Name:</b> <code>{current_bot_name}</code>\n"
         f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
         f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
         f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
         f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Live Inventory:</b>\n"
         f"• <b>Standard:</b> <code>{stats['total_std_available']} available</code>\n"
         f"• <b>Secret Pool:</b> <code>{stats['total_sec_available']} available 🔒</code>\n"
@@ -2433,7 +2433,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
         f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
         f"• <b>Custom Buttons:</b> {link_display}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -2442,8 +2442,8 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
         ],
         [
-            InlineKeyboardButton(f"🔢 Quantity: {fixed_qty if fixed_qty else '10 (Default)'}", callback_data="admin_qty_menu"),
-            InlineKeyboardButton(f"🔗 Custom Buttons ({len(custom_buttons)})", callback_data="link_list")
+            InlineKeyboardButton(f"🔢 Qty: {fixed_qty if fixed_qty else '10'}", callback_data="admin_qty_menu"),
+            InlineKeyboardButton(f"🔗 Buttons ({len(custom_buttons)})", callback_data="link_list")
         ],
         [
             InlineKeyboardButton("👥 User Manager", callback_data="admin_users"),
@@ -2455,6 +2455,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="admin_refresh_dash")
         ],
     ])
     return admin_text, keyboard
@@ -4031,10 +4032,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=kb
         )
 
-    # 6. Admin Panel
-    elif data == "admin_panel" and user_admin:
+    # 6. Admin Panel / Refresh Dashboard
+    elif (data == "admin_panel" or data == "admin_refresh_dash") and user_admin:
         admin_text, keyboard = build_admin_dashboard(user.id)
-        await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        try:
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            if data == "admin_refresh_dash":
+                await query.answer("🔄 Dashboard Refreshed")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "message is not modified" in err_str or "not modified" in err_str:
+                await query.answer("✅ Already up to date")
+            else:
+                await query.answer("🔄 Dashboard Refreshed")
 
     # 6-a. Bot Display Name Prompt
     elif data == "admin_set_name_prompt" and user_admin:

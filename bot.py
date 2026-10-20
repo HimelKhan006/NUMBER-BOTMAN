@@ -1825,8 +1825,13 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        except Exception:
-            await update.callback_query.message.reply_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "message is not modified" not in err_str and "not modified" not in err_str:
+                try:
+                    await update.callback_query.message.reply_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                except Exception:
+                    pass
     elif update.message:
         await update.message.reply_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -3736,6 +3741,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
+    # 5a-2. Refresh User Profile Callback
+    elif data == "btn_refresh_profile":
+        await query.answer("🔄 Profile refreshed!")
+        await show_user_profile(update, target_user_id=user.id, viewer_user_id=user.id)
+
     # 5b. Refresh User History Callback
     elif data == "btn_refresh_history":
         with get_main_db() as conn:
@@ -3823,8 +3833,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         msg_text, markup = build_buttons_list_view()
         try:
             await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except Exception:
-            await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            await query.answer("✅ Refreshed")
+        except Exception as e:
+            err_str = str(e).lower()
+            if "message is not modified" in err_str or "not modified" in err_str:
+                await query.answer("✅ Already up to date")
+            else:
+                await query.answer()
+                try:
+                    await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                except Exception:
+                    pass
 
     elif data.startswith("link_view_") and user_admin:
         admin_state = ADMIN_STATES.setdefault(user.id, {})
@@ -3834,12 +3853,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if msg_text and markup:
             try:
                 await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-            except Exception:
-                await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await query.answer()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "message is not modified" in err_str or "not modified" in err_str:
+                    await query.answer()
+                else:
+                    await query.answer()
+                    try:
+                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                    except Exception:
+                        pass
         else:
             await query.answer("Button not found", show_alert=True)
             msg_text, markup = build_buttons_list_view()
-            await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            try:
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            except Exception:
+                pass
 
     elif data.startswith("link_del_confirm_") and user_admin:
         btn_id = data.replace("link_del_confirm_", "").strip()
@@ -3847,8 +3878,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if msg_text and markup:
             try:
                 await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-            except Exception:
-                await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await query.answer()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "message is not modified" in err_str or "not modified" in err_str:
+                    await query.answer()
+                else:
+                    await query.answer()
+                    try:
+                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                    except Exception:
+                        pass
 
     elif data.startswith("link_del_execute_") and user_admin:
         btn_id = data.replace("link_del_execute_", "").strip()
@@ -3874,8 +3914,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         msg_text, markup = build_buttons_clear_all_confirm_view()
         try:
             await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except Exception:
-            await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            await query.answer()
+        except Exception as e:
+            err_str = str(e).lower()
+            if "message is not modified" in err_str or "not modified" in err_str:
+                await query.answer()
+            else:
+                await query.answer()
+                try:
+                    await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                except Exception:
+                    pass
 
     elif data == "link_clear_all_execute" and user_admin:
         save_custom_link_buttons([])
@@ -5496,7 +5545,6 @@ def main():
             for aid in get_all_admin_ids():
                 if aid:
                     try:
-                        await application.bot.delete_my_commands(scope=BotCommandScopeChat(aid))
                         await application.bot.set_my_commands(start_only, scope=BotCommandScopeChat(aid))
                     except Exception:
                         pass

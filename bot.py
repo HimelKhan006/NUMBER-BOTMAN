@@ -2455,7 +2455,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
-            InlineKeyboardButton("🔄 Refresh", callback_data="admin_refresh_dash")
+            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt")
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash")
         ],
     ])
     return admin_text, keyboard
@@ -2790,18 +2793,80 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await addadmin_command(update, context)
 
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    msg = await update.message.reply_text(f"🔄 <i>Restarting {html.escape(get_bot_name())} engine...</i>", parse_mode=ParseMode.HTML)
+async def perform_zero_restart_handover(target_message):
+    """Executes the clean zero-restart session handover for Number Bot."""
+    try:
+        msg = await target_message.reply_text(
+            "🔄 <b>Zero-Restart Handover Triggered</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💾 <i>Flushing SQLite database checkpoints...</i>\n"
+            "☁️ <i>Syncing continuous state & stock pools to GitHub Gist...</i>\n"
+            "🚀 <i>Triggering clean session handover...</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        msg = target_message
+
+    try:
+        with get_main_db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        if os.path.exists(STOCKS_DIR):
+            for f in os.listdir(STOCKS_DIR):
+                if f.endswith(".db"):
+                    try:
+                        with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                            cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Handover PRAGMA notice: {e}")
+
     if gist_storage.enabled:
         try:
             await gist_storage.export_and_sync(is_handover=True)
-        except Exception:
-            pass
-    await msg.edit_text("✅ <b>Engine checkpoint saved. Restarting now...</b>", parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning(f"Handover Gist save notice: {e}")
+
+    try:
+        await msg.edit_text(
+            "✅ <b>Zero-Restart Handover State Committed!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🔄 <i>Session handover completed cleanly. Runner continuing seamlessly.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    logger.info("Admin triggered zero-restart handover. Exiting cleanly (code 0)...")
     os._exit(0)
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command with confirmation prompt to trigger clean zero-restart session handover."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    # Direct force restart if argument passed: /restart force
+    if context and context.args and context.args[0].lower() in ("force", "yes", "now"):
+        await perform_zero_restart_handover(update.effective_message)
+        return
+
+    confirm_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Confirm Restart", callback_data="confirm_restart"),
+            InlineKeyboardButton("❌ Cancel", callback_data="admin_panel"),
+        ]
+    ])
+    await update.effective_message.reply_text(
+        f"⚠️ <b>Confirm Bot Restart</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Are you sure you want to trigger a zero-restart session handover for <b>{html.escape(get_bot_name())}</b>?\n\n"
+        f"• Number stock databases will be safely checkpointed.\n"
+        f"• Continuous state will be synced to GitHub Gist Cloud Storage.\n"
+        f"• The runner will reboot and continue number distribution seamlessly.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_kb,
+    )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -4062,6 +4127,36 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
             ])
         )
+
+    # 6-a2. Admin Manual Restart Handover Prompt & Confirm
+    elif data == "admin_restart_prompt" and user_admin:
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm Restart", callback_data="confirm_restart"),
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_panel"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ <b>Confirm Bot Restart</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Are you sure you want to trigger a zero-restart session handover for <b>{html.escape(get_bot_name())}</b>?\n\n"
+            f"• Number stock databases will be safely checkpointed.\n"
+            f"• Continuous state will be synced to GitHub Gist Cloud Storage.\n"
+            f"• The runner will reboot and continue number distribution seamlessly.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=confirm_kb
+        )
+
+    elif data == "confirm_restart" and user_admin:
+        await query.answer("Restarting engine 🔄")
+        try:
+            await query.edit_message_text(
+                "⏳ <i>Zero-restart session handover initiated...</i>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        await perform_zero_restart_handover(query.message)
 
     # 6-b. Admin Quantity Management Menu
     elif data == "admin_qty_menu" and user_admin:

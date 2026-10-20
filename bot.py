@@ -226,13 +226,11 @@ def get_main_db():
     conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
-def get_country_db(country_id: int):
-    c_db_path = os.path.join(STOCKS_DIR, f"country_{country_id}.db")
-    conn = sqlite3.connect(c_db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
+# Track which country DBs have already had their schema set up this process run
+_INITIALIZED_COUNTRY_DBS: Set[int] = set()
+
+def _ensure_country_db_schema(conn: sqlite3.Connection) -> None:
+    """Run DDL + migrations + index creation ONCE per connection (guarded by _INITIALIZED_COUNTRY_DBS)."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS available_numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,7 +248,7 @@ def get_country_db(country_id: int):
             delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # Auto-migrations for existing databases
+    # Auto-migrations for existing databases (silently ignored if columns already exist)
     try:
         conn.execute("ALTER TABLE available_numbers ADD COLUMN is_secret INTEGER DEFAULT 0;")
     except Exception:
@@ -259,7 +257,22 @@ def get_country_db(country_id: int):
         conn.execute("ALTER TABLE used_numbers ADD COLUMN is_secret INTEGER DEFAULT 0;")
     except Exception:
         pass
+    # Performance indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_avail_secret_id ON available_numbers (is_secret, id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_used_secret ON used_numbers (is_secret);")
     conn.commit()
+
+def get_country_db(country_id: int):
+    c_db_path = os.path.join(STOCKS_DIR, f"country_{country_id}.db")
+    conn = sqlite3.connect(c_db_path, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA cache_size = -2000;")  # 2 MB in-process page cache
+    if country_id not in _INITIALIZED_COUNTRY_DBS:
+        _ensure_country_db_schema(conn)
+        _INITIALIZED_COUNTRY_DBS.add(country_id)
     return conn
 
 def init_db():
@@ -755,7 +768,26 @@ def get_or_create_country(country_name: str) -> int:
         get_country_db(cid).close()
         return cid
 
+# Short in-memory cache for the user-facing country list (populated by get_all_countries_with_stock)
+_COUNTRIES_STOCK_CACHE: Optional[List[Dict[str, Any]]] = None
+_COUNTRIES_STOCK_CACHE_TS: float = 0.0
+_COUNTRIES_STOCK_CACHE_TTL: float = 3.0  # seconds
+
+def invalidate_countries_cache() -> None:
+    global _COUNTRIES_STOCK_CACHE, _COUNTRIES_STOCK_CACHE_TS
+    _COUNTRIES_STOCK_CACHE = None
+    _COUNTRIES_STOCK_CACHE_TS = 0.0
+
 def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = False) -> List[Dict[str, Any]]:
+    global _COUNTRIES_STOCK_CACHE, _COUNTRIES_STOCK_CACHE_TS
+    import time as _time
+
+    # Return cached result for ultra-fast repeated calls (user list browsing)
+    if only_active and not secret_mode:
+        now_ts = _time.monotonic()
+        if _COUNTRIES_STOCK_CACHE is not None and (now_ts - _COUNTRIES_STOCK_CACHE_TS) < _COUNTRIES_STOCK_CACHE_TTL:
+            return _COUNTRIES_STOCK_CACHE
+
     results = []
     with get_main_db() as conn:
         cur = conn.execute("SELECT id, name FROM countries ORDER BY name ASC;")
@@ -768,8 +800,12 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
             with get_country_db(cid) as cconn:
                 avail_std = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 0;").fetchone()[0]
                 avail_sec = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 1;").fetchone()[0]
-                used_std  = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 0;").fetchone()[0]
-                used_sec  = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 1;").fetchone()[0]
+                # Only query used_numbers when we need admin stats (only_active=False)
+                if not only_active:
+                    used_std = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 0;").fetchone()[0]
+                    used_sec = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 1;").fetchone()[0]
+                else:
+                    used_std, used_sec = 0, 0
         except Exception:
             avail_std, avail_sec, used_std, used_sec = 0, 0, 0, 0
 
@@ -790,6 +826,11 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
             "used_sec": used_sec,
             "total_used": used_std + used_sec,
         })
+
+    if only_active and not secret_mode:
+        _COUNTRIES_STOCK_CACHE = results
+        _COUNTRIES_STOCK_CACHE_TS = _time.monotonic()
+
     return results
 
 def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool = False) -> Tuple[int, int]:
@@ -815,6 +856,7 @@ def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool 
             except sqlite3.IntegrityError:
                 duplicates += 1
         conn.commit()
+    invalidate_countries_cache()  # stock changed — invalidate cache
     return added, duplicates
 
 def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
@@ -876,8 +918,8 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
             cconn.execute("INSERT INTO used_numbers (number, user_id, is_secret) VALUES (?, ?, ?);", (num, user_id, secret_val))
             CONSUMED_NUMBERS_CACHE.add(num)
         cconn.commit()
-
         remaining = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = ?;", (secret_val,)).fetchone()[0]
+    invalidate_countries_cache()  # stock changed
 
     try:
         with get_main_db() as mconn:
@@ -1191,6 +1233,17 @@ class GistStorage:
         self.bot_name = "NUMBER_BOTMAN"
         self.enabled = bool(token)
         self.api_url = f"https://api.github.com/gists/{self.gist_id}" if self.gist_id else ""
+        # Debounce / throttle state
+        self._lock: Optional[asyncio.Lock] = None  # created lazily after event loop starts
+        self._dirty: bool = False
+        self._last_sync_time: float = 0.0
+        self._MIN_SYNC_INTERVAL: float = 15.0  # seconds between non-handover syncs
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazily create the asyncio.Lock after the event loop is running."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def _auth_headers(self) -> Dict[str, str]:
         return {**GIST_HEADERS, "Authorization": f"Bearer {self.token}"}
@@ -1257,80 +1310,106 @@ class GistStorage:
         return False
 
     async def export_and_sync(self, is_handover: bool = False) -> bool:
-        """Exports main DB + all dedicated country databases to GitHub Gist."""
+        """Exports main DB + all country databases to GitHub Gist.
+
+        Debounced: non-handover calls that arrive while a sync is running
+        (or sooner than _MIN_SYNC_INTERVAL seconds after the last sync)
+        set a dirty flag and return immediately without blocking the bot.
+        A background loop (periodic_gist_sync_loop) flushes dirty state.
+        Handover / manual syncs always run immediately and wait for completion.
+        """
         if not self.enabled:
             return False
-        if not self.gist_id:
-            ok = await self.ensure_gist()
-            if not ok:
-                return False
 
-        try:
-            countries_data: Dict[str, Any] = {}
-            used_data: Dict[str, List[str]] = {}
+        import time as _time
+        now = _time.monotonic()
+        lock = self._get_lock()
 
-            with get_main_db() as conn:
-                cur = conn.execute("SELECT id, name FROM countries;")
-                all_countries = cur.fetchall()
+        # --- Throttle non-critical syncs ---
+        if not is_handover:
+            if lock.locked():
+                self._dirty = True
+                return True  # another sync is already running; come back later
+            if (now - self._last_sync_time) < self._MIN_SYNC_INTERVAL:
+                self._dirty = True
+                return True  # synced recently; defer
 
-                for c in all_countries:
-                    cid = c["id"]
-                    cname = c["name"]
-                    with get_country_db(cid) as cconn:
-                        std_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 0 ORDER BY id ASC;").fetchall()]
-                        sec_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 1 ORDER BY id ASC;").fetchall()]
-                        if std_nums or sec_nums:
-                            countries_data[cname] = {
-                                "standard": std_nums,
-                                "secret": sec_nums,
-                            }
-                        u_list = [r[0] for r in cconn.execute("SELECT number FROM used_numbers ORDER BY id ASC;").fetchall()]
-                        if u_list:
-                            used_data[cname] = u_list
+        # --- Acquire lock before hitting GitHub ---
+        async with lock:
+            if not self.gist_id:
+                ok = await self.ensure_gist()
+                if not ok:
+                    return False
 
-                users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at FROM users;")
-                users_data = [dict(r) for r in users_cur.fetchall()]
+            self._dirty = False  # reset before network call so any in-flight changes get picked up next cycle
 
-                admins_cur = conn.execute("SELECT user_id, added_by, username, first_name FROM bot_admins;")
-                admins_data = [dict(r) for r in admins_cur.fetchall()]
+            try:
+                countries_data: Dict[str, Any] = {}
+                used_data: Dict[str, List[str]] = {}
 
-                settings_cur = conn.execute("SELECT key, value FROM bot_settings;")
-                settings_data = {r["key"]: r["value"] for r in settings_cur.fetchall()}
+                with get_main_db() as conn:
+                    cur = conn.execute("SELECT id, name FROM countries;")
+                    all_countries = cur.fetchall()
 
-                current_group_link = get_group_link()
-                current_group_name = get_group_name()
+                    for c in all_countries:
+                        cid = c["id"]
+                        cname = c["name"]
+                        with get_country_db(cid) as cconn:
+                            std_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 0 ORDER BY id ASC;").fetchall()]
+                            sec_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 1 ORDER BY id ASC;").fetchall()]
+                            if std_nums or sec_nums:
+                                countries_data[cname] = {
+                                    "standard": std_nums,
+                                    "secret": sec_nums,
+                                }
+                            u_list = [r[0] for r in cconn.execute("SELECT number FROM used_numbers ORDER BY id ASC;").fetchall()]
+                            if u_list:
+                                used_data[cname] = u_list
 
-            payload = {
-                "description": self.description,
-                "files": {
-                    self.filename: {
-                        "content": json.dumps({
-                            "bot": self.bot_name,
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                            "bot_settings": settings_data,
-                            "group_link": current_group_link,
-                            "group_name": current_group_name,
-                            "total_countries": len(countries_data),
-                            "countries": countries_data,
-                            "used_countries": used_data,
-                            "users": users_data,
-                            "admins": admins_data,
-                            "handover": is_handover,
-                            "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
-                        }, indent=2)
+                    users_cur = conn.execute("SELECT user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at FROM users;")
+                    users_data = [dict(r) for r in users_cur.fetchall()]
+
+                    admins_cur = conn.execute("SELECT user_id, added_by, username, first_name FROM bot_admins;")
+                    admins_data = [dict(r) for r in admins_cur.fetchall()]
+
+                    settings_cur = conn.execute("SELECT key, value FROM bot_settings;")
+                    settings_data = {r["key"]: r["value"] for r in settings_cur.fetchall()}
+
+                    current_group_link = get_group_link()
+                    current_group_name = get_group_name()
+
+                payload = {
+                    "description": self.description,
+                    "files": {
+                        self.filename: {
+                            "content": json.dumps({
+                                "bot": self.bot_name,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "bot_settings": settings_data,
+                                "group_link": current_group_link,
+                                "group_name": current_group_name,
+                                "total_countries": len(countries_data),
+                                "countries": countries_data,
+                                "used_countries": used_data,
+                                "users": users_data,
+                                "admins": admins_data,
+                                "handover": is_handover,
+                                "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
+                            }, indent=2)
+                        }
                     }
                 }
-            }
 
-            async with httpx.AsyncClient(timeout=20.0) as http:
-                res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
-                if res.is_success:
-                    logger.info(f"☁️ Successfully backed up to GitHub Gist ({len(countries_data)} pools, {len(users_data)} users).")
-                    return True
-                else:
-                    logger.warning(f"Gist sync error: HTTP {res.status_code}")
-        except Exception as e:
-            logger.error(f"Gist export error: {e}")
+                async with httpx.AsyncClient(timeout=20.0) as http:
+                    res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
+                    if res.is_success:
+                        self._last_sync_time = _time.monotonic()
+                        logger.info(f"☁️ Successfully backed up to GitHub Gist ({len(countries_data)} pools, {len(users_data)} users).")
+                        return True
+                    else:
+                        logger.warning(f"Gist sync error: HTTP {res.status_code}")
+            except Exception as e:
+                logger.error(f"Gist export error: {e}")
         return False
 
     async def restore_from_gist(self) -> bool:
@@ -5637,6 +5716,16 @@ def main():
         except Exception as e:
             logger.warning(f"Notice calling stop_running: {e}")
 
+    async def periodic_gist_sync_loop():
+        """Background task: flush dirty Gist state every 15 seconds."""
+        while True:
+            await asyncio.sleep(15.0)
+            if gist_storage._dirty and gist_storage.enabled:
+                try:
+                    await gist_storage.export_and_sync(is_handover=False)
+                except Exception as e:
+                    logger.warning(f"Periodic Gist sync error: {e}")
+
     async def post_init(application: Application):
         if gist_storage.enabled:
             try:
@@ -5658,6 +5747,9 @@ def main():
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
         if session_timeout > 0:
             asyncio.create_task(auto_session_handover(application, session_timeout))
+
+        # Start background Gist sync debounce loop
+        asyncio.create_task(periodic_gist_sync_loop())
 
     app.post_init = post_init
 

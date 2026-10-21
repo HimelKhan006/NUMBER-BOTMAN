@@ -1885,6 +1885,10 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
         f"{preview_box}"
     )
 
+    active_bcast = get_country_active_broadcast(cid)
+    del_cb = f"bcast_del_{active_bcast['broadcast_id']}" if active_bcast else "bcast_recall_list"
+    del_text = f"🗑️ Recall Broadcast ({active_bcast['broadcast_id']})" if active_bcast else "🗑️ Recall Broadcasts From All Users"
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"👉 Button Preview: [{btn_label}]", callback_data="noop")],
         [InlineKeyboardButton("🚀 Send Broadcast to All Users", callback_data=f"bcast_c_send_{cid}")],
@@ -1896,6 +1900,7 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
             InlineKeyboardButton("📱 Change Service", callback_data=f"bcast_c_edit_srv_{cid}"),
             InlineKeyboardButton("🔄 Refresh Stock Qty", callback_data=f"bcast_c_refresh_{cid}")
         ],
+        [InlineKeyboardButton(del_text, callback_data=del_cb)],
         [InlineKeyboardButton("❌ Cancel & Return", callback_data=f"adm_country_{cid}")]
     ])
     return overview, kb
@@ -3859,6 +3864,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # Language Manager & SMS Language Callbacks
     if data.startswith("copy_num_"):
         await query.answer("📋 Copied to clipboard!")
+        return
+
+    # Noop: display-only buttons that should not trigger any action
+    if data == "noop":
+        await query.answer()
         return
 
     # 1b. Main Menu callback - silently delete message

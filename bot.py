@@ -483,7 +483,24 @@ def unban_user(user_id: int) -> bool:
         logger.warning(f"Error unbanning user {user_id}: {e}")
         return False
 
-def record_broadcast_history(broadcast_id: str, admin_id: int, target_type: str, target_user_id: int, message_text: str, total_sent: int, total_failed: int, country_id: int = 0, button_label: str = '', service_name: str = '', quantity: int = 0):
+def record_broadcast_history(
+    broadcast_id: str = "",
+    admin_id: int = 0,
+    target_type: str = "all",
+    target_user_id: int = 0,
+    message_text: str = "",
+    total_sent: int = 0,
+    total_failed: int = 0,
+    country_id: int = 0,
+    button_label: str = '',
+    service_name: str = '',
+    quantity: int = 0,
+    bcast_id: str = "",
+    **kwargs
+):
+    bid = broadcast_id or bcast_id
+    if not bid:
+        return
     try:
         with get_main_db() as conn:
             conn.execute("""
@@ -492,7 +509,7 @@ def record_broadcast_history(broadcast_id: str, admin_id: int, target_type: str,
                 ON CONFLICT(broadcast_id) DO UPDATE SET
                     total_sent = excluded.total_sent,
                     total_failed = excluded.total_failed;
-            """, (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, country_id, button_label, service_name, quantity))
+            """, (bid, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, country_id, button_label, service_name, quantity))
             conn.commit()
     except Exception as e:
         logger.warning(f"Error recording broadcast history: {e}")
@@ -525,10 +542,10 @@ def get_country_active_broadcast(country_id: int) -> Optional[Dict[str, Any]]:
             cur = conn.execute("""
                 SELECT broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, country_id, button_label, service_name, quantity, created_at
                 FROM broadcast_history
-                WHERE country_id = ? AND is_deleted = 0
+                WHERE (country_id = ? OR broadcast_id LIKE ?) AND is_deleted = 0
                 ORDER BY created_at DESC
                 LIMIT 1;
-            """, (country_id,))
+            """, (country_id, f"bc_c_{country_id}_%"))
             row = cur.fetchone()
             if row:
                 return dict(row)
@@ -547,11 +564,42 @@ def record_broadcast_message(broadcast_id: str, user_id: int, message_id: int):
     except Exception as e:
         logger.warning(f"Error recording broadcast message: {e}")
 
-def get_recent_broadcasts(limit: int = 8) -> List[Dict[str, Any]]:
+def get_recent_broadcasts(limit: int = 15) -> List[Dict[str, Any]]:
     try:
         with get_main_db() as conn:
+            # Auto-recover any broadcasts whose messages were sent but history insert crashed
+            try:
+                conn.execute("""
+                    INSERT OR IGNORE INTO broadcast_history (
+                        broadcast_id, admin_id, target_type, target_user_id, message_text,
+                        total_sent, total_failed, is_deleted, country_id, button_label,
+                        service_name, quantity, created_at
+                    )
+                    SELECT 
+                        bm.broadcast_id,
+                        0,
+                        CASE WHEN bm.broadcast_id LIKE 'bc_c_%' THEN 'country' ELSE 'all' END,
+                        0,
+                        '📢 Stock Broadcast',
+                        COUNT(*),
+                        0,
+                        0,
+                        0,
+                        '',
+                        '',
+                        0,
+                        CURRENT_TIMESTAMP
+                    FROM broadcast_messages bm
+                    LEFT JOIN broadcast_history bh ON bm.broadcast_id = bh.broadcast_id
+                    WHERE bh.broadcast_id IS NULL
+                    GROUP BY bm.broadcast_id;
+                """)
+                conn.commit()
+            except Exception:
+                pass
+
             cur = conn.execute("""
-                SELECT broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, created_at
+                SELECT broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, created_at, country_id, button_label, service_name, quantity
                 FROM broadcast_history
                 WHERE is_deleted = 0
                 ORDER BY created_at DESC
@@ -5160,7 +5208,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     elif data == "bcast_recall_list" and user_admin:
-        bcasts = get_recent_broadcasts(limit=10)
+        await query.answer()
+        bcasts = get_recent_broadcasts(limit=15)
         if not bcasts:
             await query.edit_message_text(
                 "🗑️ <b>Recall / Delete Broadcast</b>\n"
@@ -5174,14 +5223,36 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+        all_countries = get_all_countries_with_stock(only_active=False)
+        c_map = {c["id"]: c.get("name") for c in all_countries}
+
         buttons = []
         lines = []
         for b in bcasts:
             bid = b["broadcast_id"]
-            preview = (b["message_text"][:30] + "...") if len(b["message_text"]) > 30 else b["message_text"]
-            t_type = "All Users" if b["target_type"] == "all" else f"User {b['target_user_id']}"
-            lines.append(f"• <code>{bid}</code> ({t_type}): <i>{preview}</i> [{b['total_sent']} sent]")
-            buttons.append([InlineKeyboardButton(f"🗑️ Delete {bid} ({b['total_sent']} msgs)", callback_data=f"bcast_del_{bid}")])
+            raw_msg = b.get("message_text") or ""
+            # Strip HTML tags so unclosed tags never cause parse errors
+            clean_txt = re.sub(r'<[^>]+>', ' ', raw_msg)
+            clean_txt = " ".join(clean_txt.split())
+            preview = html.escape((clean_txt[:28] + "...") if len(clean_txt) > 28 else (clean_txt or "Stock Announcement"))
+
+            if b.get("target_type") == "country" or bid.startswith("bc_c_"):
+                cid = b.get("country_id") or 0
+                if not cid and bid.startswith("bc_c_"):
+                    try:
+                        cid = int(bid.split("_")[2])
+                    except Exception:
+                        cid = 0
+                c_name = c_map.get(cid) or (f"Country #{cid}" if cid else "Country Stock")
+                t_type = f"🌍 {c_name}"
+            elif b.get("target_type") == "all":
+                t_type = "👥 All Users"
+            else:
+                t_type = f"👤 User {b.get('target_user_id', 0)}"
+
+            sent_cnt = b.get("total_sent", 0)
+            lines.append(f"• <code>{bid}</code> ({t_type}): <i>{preview}</i> [{sent_cnt} sent]")
+            buttons.append([InlineKeyboardButton(f"🗑️ Delete {bid} ({sent_cnt} msgs)", callback_data=f"bcast_del_{bid}")])
 
         buttons.append([InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")])
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
@@ -5196,6 +5267,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data.startswith("bcast_del_") and user_admin:
         bcast_id = data.replace("bcast_del_", "")
+        await query.answer("🗑️ Recalling broadcast...", show_alert=False)
+        
+        try:
+            await query.edit_message_text(
+                f"⏳ <b>Recalling Broadcast <code>{bcast_id}</code>...</b>\n"
+                f"Erasing announcement from all recipients' Telegram chats in real-time...",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
         msgs = get_broadcast_messages(bcast_id)
         deleted_count = 0
 
@@ -5203,7 +5285,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await context.bot.delete_message(chat_id=uid, message_id=mid)
                 deleted_count += 1
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.02)
             except Exception:
                 pass
 
@@ -5211,20 +5293,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        await query.answer("🗑️ Broadcast erased from users' chats!", show_alert=True)
         text = (
             f"✅ <b>Broadcast Successfully Recalled & Erased!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
             f"🗑️ <b>Messages Deleted:</b> <code>{deleted_count} deleted</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>The announcement has been completely removed from user devices.</i>"
+            f"<i>The announcement has been completely removed from recipient devices.</i>"
         )
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Recall Another Broadcast", callback_data="bcast_recall_list")],
             [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception:
+            await context.bot.send_message(chat_id=user.id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 
@@ -5665,6 +5750,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 16j. Execute Country Broadcast to All Users
     elif data.startswith("bcast_c_send_") and user_admin:
         cid = int(data.split("_")[3])
+        await query.answer("🚀 Broadcasting to all users...", show_alert=False)
         pending = ADMIN_STATES.get(user.id, {}).get("country_bcast")
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
@@ -5694,31 +5780,38 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(btn_label, callback_data=f"bcast_getnum_{cid}")]
         ])
 
-        await query.edit_message_text(
-            f"⏳ <b>Broadcasting to all registered users...</b>\n"
-            f"🌍 Country: <code>{c_name}</code>\n"
-            f"🏷️ Button: <code>{btn_label}</code>",
-            parse_mode=ParseMode.HTML
-        )
+        try:
+            await query.edit_message_text(
+                f"⏳ <b>Broadcasting to all registered users...</b>\n"
+                f"🌍 Country: <code>{c_name}</code>\n"
+                f"🏷️ Button: <code>{btn_label}</code>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
-        for uid in all_uids:
-            if uid == user.id or is_user_banned(uid):
-                continue
-            try:
-                sent_m = await context.bot.send_message(
-                    chat_id=uid,
-                    text=broadcast_msg,
-                    reply_markup=user_kb,
-                    parse_mode=ParseMode.HTML
-                )
-                record_broadcast_message(bcast_id, uid, sent_m.message_id)
-                total_sent += 1
-                await asyncio.sleep(0.04)
-            except Exception:
-                total_failed += 1
+        try:
+            for uid in all_uids:
+                if uid == user.id or is_user_banned(uid):
+                    continue
+                try:
+                    sent_m = await context.bot.send_message(
+                        chat_id=uid,
+                        text=broadcast_msg,
+                        reply_markup=user_kb,
+                        parse_mode=ParseMode.HTML
+                    )
+                    record_broadcast_message(bcast_id, uid, sent_m.message_id)
+                    total_sent += 1
+                    await asyncio.sleep(0.04)
+                except Exception as send_err:
+                    logger.debug(f"Broadcast send failed for user {uid}: {send_err}")
+                    total_failed += 1
+        except Exception as loop_err:
+            logger.error(f"Error during broadcast delivery loop: {loop_err}")
 
         record_broadcast_history(
-            bcast_id=bcast_id,
+            broadcast_id=bcast_id,
             admin_id=user.id,
             target_type="country",
             target_user_id=0,
@@ -5752,7 +5845,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
-        await query.edit_message_text(report_text, parse_mode=ParseMode.HTML, reply_markup=report_kb)
+        try:
+            await query.edit_message_text(report_text, parse_mode=ParseMode.HTML, reply_markup=report_kb)
+        except Exception as edit_err:
+            logger.warning(f"Failed to edit message for broadcast report: {edit_err}")
+            try:
+                await context.bot.send_message(chat_id=user.id, text=report_text, parse_mode=ParseMode.HTML, reply_markup=report_kb)
+            except Exception:
+                pass
+
         if user.id in ADMIN_STATES:
             del ADMIN_STATES[user.id]
         return

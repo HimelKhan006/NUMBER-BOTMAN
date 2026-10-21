@@ -1909,7 +1909,7 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
     custom_text = bcast_data.get("custom_text", "")
 
     preview_box = (
-        f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b> 🔥\n"
+        f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
         f"📱 <b>Service:</b> <code>{srv}</code>\n"
@@ -5766,7 +5766,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         total_failed = 0
 
         broadcast_msg = (
-            f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b> 🔥\n"
+            f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
             f"📱 <b>Service:</b> <code>{srv}</code>\n"

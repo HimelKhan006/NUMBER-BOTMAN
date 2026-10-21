@@ -287,6 +287,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS countries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
+                button_name TEXT DEFAULT '',
+                service_name TEXT DEFAULT 'WhatsApp',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -324,6 +326,14 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0;")
         except Exception:
             pass
+        try:
+            conn.execute("ALTER TABLE countries ADD COLUMN button_name TEXT DEFAULT '';")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE countries ADD COLUMN service_name TEXT DEFAULT 'WhatsApp';")
+        except Exception:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS broadcast_history (
                 broadcast_id TEXT PRIMARY KEY,
@@ -334,6 +344,10 @@ def init_db():
                 total_sent INTEGER DEFAULT 0,
                 total_failed INTEGER DEFAULT 0,
                 is_deleted INTEGER DEFAULT 0,
+                country_id INTEGER DEFAULT 0,
+                button_label TEXT DEFAULT '',
+                service_name TEXT DEFAULT '',
+                quantity INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -367,6 +381,22 @@ def init_db():
         """)
         try:
             conn.execute("ALTER TABLE delivery_log ADD COLUMN is_secret INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE broadcast_history ADD COLUMN country_id INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE broadcast_history ADD COLUMN button_label TEXT DEFAULT '';")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE broadcast_history ADD COLUMN service_name TEXT DEFAULT '';")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE broadcast_history ADD COLUMN quantity INTEGER DEFAULT 0;")
         except Exception:
             pass
         conn.commit()
@@ -453,19 +483,58 @@ def unban_user(user_id: int) -> bool:
         logger.warning(f"Error unbanning user {user_id}: {e}")
         return False
 
-def record_broadcast_history(broadcast_id: str, admin_id: int, target_type: str, target_user_id: int, message_text: str, total_sent: int, total_failed: int):
+def record_broadcast_history(broadcast_id: str, admin_id: int, target_type: str, target_user_id: int, message_text: str, total_sent: int, total_failed: int, country_id: int = 0, button_label: str = '', service_name: str = '', quantity: int = 0):
     try:
         with get_main_db() as conn:
             conn.execute("""
-                INSERT INTO broadcast_history (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+                INSERT INTO broadcast_history (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, is_deleted, country_id, button_label, service_name, quantity, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(broadcast_id) DO UPDATE SET
                     total_sent = excluded.total_sent,
                     total_failed = excluded.total_failed;
-            """, (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed))
+            """, (broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, country_id, button_label, service_name, quantity))
             conn.commit()
     except Exception as e:
         logger.warning(f"Error recording broadcast history: {e}")
+
+def update_country_button_name(country_id: int, button_name: str) -> bool:
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE countries SET button_name = ? WHERE id = ?;", (button_name, country_id))
+            conn.commit()
+        invalidate_countries_cache()
+        return True
+    except Exception as e:
+        logger.warning(f"Error updating country button name: {e}")
+        return False
+
+def update_country_service_name(country_id: int, service_name: str) -> bool:
+    try:
+        with get_main_db() as conn:
+            conn.execute("UPDATE countries SET service_name = ? WHERE id = ?;", (service_name, country_id))
+            conn.commit()
+        invalidate_countries_cache()
+        return True
+    except Exception as e:
+        logger.warning(f"Error updating country service name: {e}")
+        return False
+
+def get_country_active_broadcast(country_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        with get_main_db() as conn:
+            cur = conn.execute("""
+                SELECT broadcast_id, admin_id, target_type, target_user_id, message_text, total_sent, total_failed, country_id, button_label, service_name, quantity, created_at
+                FROM broadcast_history
+                WHERE country_id = ? AND is_deleted = 0
+                ORDER BY created_at DESC
+                LIMIT 1;
+            """, (country_id,))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+    except Exception as e:
+        logger.warning(f"Error checking active country broadcast: {e}")
+    return None
 
 def record_broadcast_message(broadcast_id: str, user_id: int, message_id: int):
     try:
@@ -790,7 +859,7 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
 
     results = []
     with get_main_db() as conn:
-        cur = conn.execute("SELECT id, name FROM countries ORDER BY name ASC;")
+        cur = conn.execute("SELECT id, name, button_name, service_name FROM countries ORDER BY name ASC;")
         countries = cur.fetchall()
 
     for c in countries:
@@ -815,9 +884,13 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
         if only_active and target_avail == 0:
             continue
 
+        btn_val = c["button_name"] if ("button_name" in c.keys() and c["button_name"]) else cname
+        srv_val = c["service_name"] if ("service_name" in c.keys() and c["service_name"]) else "WhatsApp"
         results.append({
             "id": cid,
             "name": cname,
+            "button_name": btn_val,
+            "service_name": srv_val,
             "available": target_avail,
             "available_std": avail_std,
             "available_sec": avail_sec,
@@ -1735,15 +1808,25 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons = []
     row = []
     for c in current_page_countries:
+        btn_disp = c.get("button_name") or c["name"]
+
         if is_admin_mode:
+
             prefix = "adm_country_"
-            label = f"{c['name']} (S:{c['available_std']} | 🔒:{c['available_sec']})"
+
+            label = f"{btn_disp} (S:{c['available_std']} | 🔒:{c['available_sec']})"
+
         elif is_secret_mode:
+
             prefix = "sec_c_"
-            label = f"🔒 {c['name']} ({c['available']})"
+
+            label = f"🔒 {btn_disp} ({c['available']})"
+
         else:
+
             prefix = "c_"
-            label = f"{c['name']} ({c['available']})"
+
+            label = f"{btn_disp} ({c['available']})"
 
         row.append(InlineKeyboardButton(label, callback_data=f"{prefix}{c['id']}"))
         if len(row) == 2:
@@ -1766,6 +1849,56 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
         buttons.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
 
     return InlineKeyboardMarkup(buttons)
+
+
+def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds professional preview and controls for country stock broadcast."""
+    cid = bcast_data["country_id"]
+    c_name = bcast_data["country_name"]
+    srv = bcast_data["service"]
+    qty = bcast_data["quantity"]
+    btn_label = bcast_data["button_label"]
+    custom_text = bcast_data.get("custom_text", "")
+
+    preview_box = (
+        f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b> 🔥\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+        f"📱 <b>Service:</b> <code>{srv}</code>\n"
+        f"📦 <b>Available:</b> <code>{qty} Numbers</code> <i>(In Stock)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{custom_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Tap the button below to get your number directly:</i>"
+    )
+
+    overview = (
+        f"📢 <b>Stock Broadcast Setup & Live Preview</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 <b>Target Country:</b> <code>{c_name}</code>\n"
+        f"📱 <b>Service:</b> <code>{srv}</code>\n"
+        f"📦 <b>Stock Quantity:</b> <code>{qty} numbers</code> <i>(Auto-Filled)</i>\n"
+        f"🏷️ <b>Action Button Name:</b> <code>[{btn_label}]</code>\n"
+        f"👥 <b>Target Audience:</b> <code>All Registered Users</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👀 <b>USER BROADCAST PREVIEW:</b>\n\n"
+        f"{preview_box}"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👉 Button Preview: [{btn_label}]", callback_data="noop")],
+        [InlineKeyboardButton("🚀 Send Broadcast to All Users", callback_data=f"bcast_c_send_{cid}")],
+        [
+            InlineKeyboardButton("✏️ Custom Text", callback_data=f"bcast_c_edit_text_{cid}"),
+            InlineKeyboardButton("🏷️ Rename Button", callback_data=f"bcast_c_edit_btn_{cid}")
+        ],
+        [
+            InlineKeyboardButton("📱 Change Service", callback_data=f"bcast_c_edit_srv_{cid}"),
+            InlineKeyboardButton("🔄 Refresh Stock Qty", callback_data=f"bcast_c_refresh_{cid}")
+        ],
+        [InlineKeyboardButton("❌ Cancel & Return", callback_data=f"adm_country_{cid}")]
+    ])
+    return overview, kb
 
 def get_numbers_view_keyboard(
     country_id: int,
@@ -3568,6 +3701,84 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"❌ Failed to deliver message to user <code>{target_uid}</code>: {e}", parse_mode=ParseMode.HTML)
         return
 
+    # Rename Country Button Name
+    if admin_state.get("awaiting_rename_country_btn"):
+        cid = admin_state.pop("awaiting_rename_country_btn")
+        new_name = text.strip()
+        update_country_button_name(cid, new_name)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        await update.message.reply_text(
+            f"✅ <b>Button Name Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 Country: <code>{c_name}</code>\n"
+            f"🏷️ New Button Name: <code>{new_name}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>This custom label will now be displayed on country buttons and broadcasts!</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")],
+                [InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")]
+            ])
+        )
+        return
+
+    # Set Country Service Name
+    if admin_state.get("awaiting_country_service"):
+        cid = admin_state.pop("awaiting_country_service")
+        new_srv = text.strip()
+        update_country_service_name(cid, new_srv)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        await update.message.reply_text(
+            f"✅ <b>Service Name Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 Country: <code>{c_name}</code>\n"
+            f"📱 Service: <code>{new_srv}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")]
+            ])
+        )
+        return
+
+    # Country Broadcast Custom Text Edit
+    if admin_state.get("awaiting_bcast_custom_text"):
+        cid = admin_state.pop("awaiting_bcast_custom_text")
+        bcast_data = admin_state.get("country_bcast")
+        if bcast_data:
+            bcast_data["custom_text"] = text.strip()
+            ov_text, kb = render_country_broadcast_panel(bcast_data)
+            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    # Country Broadcast Button Label Edit
+    if admin_state.get("awaiting_bcast_btn_label"):
+        cid = admin_state.pop("awaiting_bcast_btn_label")
+        bcast_data = admin_state.get("country_bcast")
+        if bcast_data:
+            bcast_data["button_label"] = text.strip()
+            ov_text, kb = render_country_broadcast_panel(bcast_data)
+            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    # Country Broadcast Service Edit
+    if admin_state.get("awaiting_bcast_srv"):
+        cid = admin_state.pop("awaiting_bcast_srv")
+        bcast_data = admin_state.get("country_bcast")
+        if bcast_data:
+            bcast_data["service"] = text.strip()
+            ov_text, kb = render_country_broadcast_panel(bcast_data)
+            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
     if admin_state.get("awaiting_country_name"):
         country_name = text.strip()
         numbers = admin_state["numbers"]
@@ -5209,15 +5420,36 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=True)
         )
 
-    # 16. Admin View Country Details
+    # 16. Admin View Country Details & Management Hub
     elif data.startswith("adm_country_") and user_admin:
         cid = int(data.split("_")[2])
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
+        btn_label = c_info.get("button_name") or c_name
+        srv_name = c_info.get("service_name") or "WhatsApp"
+        active_bcast = get_country_active_broadcast(cid)
+
+        menu_buttons = [
+            [InlineKeyboardButton("📢 Send Stock Broadcast", callback_data=f"adm_bcast_c_{cid}")],
+            [
+                InlineKeyboardButton("✏️ Rename Button Name", callback_data=f"adm_rename_btn_{cid}"),
+                InlineKeyboardButton("📱 Set Service", callback_data=f"adm_set_service_{cid}")
+            ]
+        ]
+        if active_bcast:
+            bid = active_bcast["broadcast_id"]
+            menu_buttons.append([InlineKeyboardButton(f"🗑️ Recall Broadcast ({bid})", callback_data=f"bcast_del_{bid}")])
+
+        menu_buttons.extend([
+            [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
+            [InlineKeyboardButton("🔙 Back to Stock Pools", callback_data="admin_uploaded_files")]
+        ])
 
         await query.edit_message_text(
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🏷️ <b>Button Label:</b> <code>{btn_label}</code>\n"
+            f"📱 <b>Service:</b> <code>{srv_name}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
             f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
@@ -5225,11 +5457,325 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔒 <b>Delivered / Used:</b> <code>{c_info.get('total_used', 0)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(menu_buttons)
+        )
+
+    # 16a. Rename Country Button Name Prompt
+    elif data.startswith("adm_rename_btn_") and user_admin:
+        cid = int(data.split("_")[3])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        current_btn = c_info.get("button_name") or c_name
+
+        ADMIN_STATES[user.id] = {"awaiting_rename_country_btn": cid}
+        await query.edit_message_text(
+            f"✏️ <b>Rename Button Name for {c_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Current Button Name: <code>{current_btn}</code>\n\n"
+            f"Please enter the new button name to display in the bot\n"
+            f"(e.g. <code>🇳🇵 Nepal WhatsApp</code> or <code>WhatsApp Nepal</code>):",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_uploaded_files")]
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_country_{cid}")]
             ])
         )
+
+    # 16b. Set Country Service Prompt & Presets
+    elif data.startswith("adm_set_service_") and user_admin:
+        cid = int(data.split("_")[3])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        current_srv = c_info.get("service_name") or "WhatsApp"
+
+        ADMIN_STATES[user.id] = {"awaiting_country_service": cid}
+        await query.edit_message_text(
+            f"📱 <b>Set Service for {c_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Current Service: <code>{current_srv}</code>\n\n"
+            f"Choose a quick preset below or type any custom service in chat:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("WhatsApp", callback_data=f"adm_srv_set_{cid}_WhatsApp"),
+                    InlineKeyboardButton("Telegram", callback_data=f"adm_srv_set_{cid}_Telegram")
+                ],
+                [
+                    InlineKeyboardButton("Google", callback_data=f"adm_srv_set_{cid}_Google"),
+                    InlineKeyboardButton("Facebook", callback_data=f"adm_srv_set_{cid}_Facebook")
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_country_{cid}")]
+            ])
+        )
+
+    # 16c. Save Service Preset
+    elif data.startswith("adm_srv_set_") and user_admin:
+        parts = data.split("_")
+        cid = int(parts[3])
+        srv_choice = "_".join(parts[4:])
+        update_country_service_name(cid, srv_choice)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        if user.id in ADMIN_STATES:
+            del ADMIN_STATES[user.id]
+        await query.answer(f"✅ Service updated to {srv_choice}!", show_alert=True)
+        # Re-display country menu
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        btn_label = c_info.get("button_name") or c_name
+        active_bcast = get_country_active_broadcast(cid)
+        menu_buttons = [
+            [InlineKeyboardButton("📢 Send Stock Broadcast", callback_data=f"adm_bcast_c_{cid}")],
+            [
+                InlineKeyboardButton("✏️ Rename Button Name", callback_data=f"adm_rename_btn_{cid}"),
+                InlineKeyboardButton("📱 Set Service", callback_data=f"adm_set_service_{cid}")
+            ]
+        ]
+        if active_bcast:
+            bid = active_bcast["broadcast_id"]
+            menu_buttons.append([InlineKeyboardButton(f"🗑️ Recall Broadcast ({bid})", callback_data=f"bcast_del_{bid}")])
+        menu_buttons.extend([
+            [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
+            [InlineKeyboardButton("🔙 Back to Stock Pools", callback_data="admin_uploaded_files")]
+        ])
+        await query.edit_message_text(
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🏷️ <b>Button Label:</b> <code>{btn_label}</code>\n"
+            f"📱 <b>Service:</b> <code>{srv_choice}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
+            f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
+            f"📊 <b>Total Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
+            f"🔒 <b>Delivered / Used:</b> <code>{c_info.get('total_used', 0)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(menu_buttons)
+        )
+
+    # 16d. Launch Country Broadcast Setup with Auto-Filled Details
+    elif data.startswith("adm_bcast_c_") and user_admin:
+        cid = int(data.split("_")[3])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        btn_name = c_info.get("button_name") or c_name
+        srv = c_info.get("service_name") or "WhatsApp"
+        qty = c_info.get("total_available", 0)
+        action_btn_label = f"📥 Get {btn_name} Number"
+
+        bcast_data = {
+            "country_id": cid,
+            "country_name": c_name,
+            "service": srv,
+            "quantity": qty,
+            "button_label": action_btn_label,
+            "custom_text": f"🔥 New fresh {c_name} numbers are now loaded and ready! Tap the button below to get your numbers instantly."
+        }
+        ADMIN_STATES[user.id] = {"country_bcast": bcast_data}
+        ov_text, kb = render_country_broadcast_panel(bcast_data)
+        await query.edit_message_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    # 16e. Edit Broadcast Custom Text
+    elif data.startswith("bcast_c_edit_text_") and user_admin:
+        cid = int(data.split("_")[4])
+        ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_custom_text"] = cid
+        await query.edit_message_text(
+            "✏️ <b>Enter Custom Broadcast Message Text:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send your announcement text in chat (HTML formatting supported):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_bcast_c_{cid}")]
+            ])
+        )
+
+    # 16f. Edit Broadcast Button Label
+    elif data.startswith("bcast_c_edit_btn_") and user_admin:
+        cid = int(data.split("_")[4])
+        ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_btn_label"] = cid
+        await query.edit_message_text(
+            "🏷️ <b>Enter Broadcast Action Button Label:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send the exact text you want to appear on the bottom button (e.g. <code>🇳🇵 Get Nepal Number</code>):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_bcast_c_{cid}")]
+            ])
+        )
+
+    # 16g. Change Broadcast Service Name
+    elif data.startswith("bcast_c_edit_srv_") and user_admin:
+        cid = int(data.split("_")[4])
+        ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_srv"] = cid
+        await query.edit_message_text(
+            "📱 <b>Change Service for Broadcast:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose a preset or type any custom service name in chat:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("WhatsApp", callback_data=f"bcast_srv_set_{cid}_WhatsApp"),
+                    InlineKeyboardButton("Telegram", callback_data=f"bcast_srv_set_{cid}_Telegram")
+                ],
+                [
+                    InlineKeyboardButton("Google", callback_data=f"bcast_srv_set_{cid}_Google"),
+                    InlineKeyboardButton("Facebook", callback_data=f"bcast_srv_set_{cid}_Facebook")
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_bcast_c_{cid}")]
+            ])
+        )
+
+    # 16h. Set Broadcast Service Preset
+    elif data.startswith("bcast_srv_set_") and user_admin:
+        parts = data.split("_")
+        cid = int(parts[3])
+        srv_choice = "_".join(parts[4:])
+        bcast_data = ADMIN_STATES.get(user.id, {}).get("country_bcast")
+        if bcast_data:
+            bcast_data["service"] = srv_choice
+            ov_text, kb = render_country_broadcast_panel(bcast_data)
+            await query.edit_message_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await query.answer("Session expired", show_alert=True)
+
+    # 16i. Refresh Broadcast Stock Quantity
+    elif data.startswith("bcast_c_refresh_") and user_admin:
+        cid = int(data.split("_")[3])
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        bcast_data = ADMIN_STATES.get(user.id, {}).get("country_bcast")
+        if bcast_data:
+            bcast_data["quantity"] = c_info.get("total_available", 0)
+            await query.answer(f"🔄 Stock refreshed: {bcast_data['quantity']} available!", show_alert=True)
+            ov_text, kb = render_country_broadcast_panel(bcast_data)
+            await query.edit_message_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    # 16j. Execute Country Broadcast to All Users
+    elif data.startswith("bcast_c_send_") and user_admin:
+        cid = int(data.split("_")[3])
+        pending = ADMIN_STATES.get(user.id, {}).get("country_bcast")
+        all_c = get_all_countries_with_stock(only_active=False)
+        c_info = next((x for x in all_c if x["id"] == cid), {})
+        c_name = c_info.get("name", "Unknown")
+        srv = pending.get("service") if pending else (c_info.get("service_name") or "WhatsApp")
+        btn_label = pending.get("button_label") if pending else (c_info.get("button_name") or f"📥 Get {c_name} Number")
+        custom_text = pending.get("custom_text") if pending else f"🔥 New fresh {c_name} numbers are now loaded and ready! Tap the button below to get your numbers instantly."
+        qty = c_info.get("total_available", 0)
+
+        bcast_id = f"bc_c_{cid}_{int(time.time())}"
+        all_uids = get_all_user_ids()
+        total_sent = 0
+        total_failed = 0
+
+        broadcast_msg = (
+            f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b> 🔥\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"📱 <b>Service:</b> <code>{srv}</code>\n"
+            f"📦 <b>Available:</b> <code>{qty} Numbers</code> <i>(In Stock)</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{custom_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <i>Tap the button below to get your number directly:</i>"
+        )
+        user_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(btn_label, callback_data=f"bcast_getnum_{cid}")]
+        ])
+
+        await query.edit_message_text(
+            f"⏳ <b>Broadcasting to all registered users...</b>\n"
+            f"🌍 Country: <code>{c_name}</code>\n"
+            f"🏷️ Button: <code>{btn_label}</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+        for uid in all_uids:
+            if uid == user.id or is_user_banned(uid):
+                continue
+            try:
+                sent_m = await context.bot.send_message(
+                    chat_id=uid,
+                    text=broadcast_msg,
+                    reply_markup=user_kb,
+                    parse_mode=ParseMode.HTML
+                )
+                record_broadcast_message(bcast_id, uid, sent_m.message_id)
+                total_sent += 1
+                await asyncio.sleep(0.04)
+            except Exception:
+                total_failed += 1
+
+        record_broadcast_history(
+            bcast_id=bcast_id,
+            admin_id=user.id,
+            target_type="country",
+            target_user_id=0,
+            message_text=broadcast_msg,
+            total_sent=total_sent,
+            total_failed=total_failed,
+            country_id=cid,
+            button_label=btn_label,
+            service_name=srv,
+            quantity=qty
+        )
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        report_text = (
+            f"✅ <b>Stock Broadcast Successfully Sent!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
+            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"📱 <b>Service:</b> <code>{srv}</code>\n"
+            f"📦 <b>Advertised Stock:</b> <code>{qty} numbers</code>\n"
+            f"🏷️ <b>Action Button:</b> <code>[{btn_label}]</code>\n"
+            f"📤 <b>Delivered To:</b> <code>{total_sent} users</code>\n"
+            f"⚠️ <b>Failed / Blocked:</b> <code>{total_failed} users</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>You can recall and delete this broadcast completely from all users' chats at any time!</i>"
+        )
+        report_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Recall / Delete Broadcast From All Users", callback_data=f"bcast_del_{bcast_id}")],
+            [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")],
+            [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(report_text, parse_mode=ParseMode.HTML, reply_markup=report_kb)
+        if user.id in ADMIN_STATES:
+            del ADMIN_STATES[user.id]
+        return
+
+    # 16k. User One-Tap Number Delivery from Broadcast Button
+    elif data.startswith("bcast_getnum_"):
+        cid = int(data.split("_")[2])
+        register_user(user.id, user.username, user.first_name)
+        limit, is_fixed = get_effective_quantity_for_user(user.id)
+        numbers, remaining_count, country_name = consume_numbers_for_user(
+            country_id=cid,
+            user_id=user.id,
+            limit=limit,
+            is_secret=False
+        )
+
+        if not numbers:
+            await query.answer("⚠️ Out of Stock! All available numbers for this country have been consumed.", show_alert=True)
+            return
+
+        await query.answer("⚡ Number delivered successfully!")
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        pref_plus = get_user_plus_preference(user.id)
+        response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=response_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
+        )
+        return
 
     # 17. Admin Delete Country Confirmation
     elif data.startswith("adm_del_confirm_") and user_admin:

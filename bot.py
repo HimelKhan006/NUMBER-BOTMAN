@@ -63,6 +63,44 @@ import unicodedata
 from typing import Set, Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 
+# Bangladesh Standard Time (BST = UTC+6)
+BANGLADESH_TZ = timezone(timedelta(hours=6))
+
+def get_bangladesh_now() -> datetime:
+    """Returns the current datetime in Bangladesh Standard Time (BST, UTC+6)."""
+    return datetime.now(timezone.utc).astimezone(BANGLADESH_TZ)
+
+def format_bangladesh_12h(dt: Optional[datetime] = None) -> Tuple[str, str]:
+    """Formats datetime in Bangladesh 12-hour format with AM/PM returning (time_str, date_str)."""
+    if dt is None:
+        dt = get_bangladesh_now()
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(BANGLADESH_TZ)
+    else:
+        dt = dt.astimezone(BANGLADESH_TZ)
+    time_str = dt.strftime("%I:%M:%S %p")
+    date_str = dt.strftime("%d-%m-%Y")
+    return time_str, date_str
+
+def get_current_commit() -> str:
+    """Returns the current git commit SHA (short) from env or git."""
+    sha = os.getenv("GITHUB_SHA", "").strip()
+    if sha:
+        return sha[:7]
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
 import httpx
 from telegram import (
     Update,
@@ -1869,44 +1907,65 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
 # 8. Startup Announcement System
 # ==========================================
 async def send_startup_announcement(application: Application):
+    """
+    Sends startup notification to Admin private chat only on new update pushed,
+    initial deployment, or manual admin restart. Matching OTP bot format.
+    COMPLETELY SILENT on routine 24/7 handover sessions (zero spam).
+    """
     global _is_handover
-    # Completely suppress restart notification on handover sessions or silent mode
     silent_env = os.getenv("SILENT_STARTUP", "").strip().lower() in ("true", "1", "yes")
-    if _is_handover or silent_env:
-        logger.info("🤫 Automated session handover continuation: restart notification suppressed (zero-restart mode).")
+    if silent_env:
+        logger.info("🤫 SILENT_STARTUP set: startup notification suppressed.")
         return
 
+    current_commit = get_current_commit()
+    last_notified_commit = get_bot_setting("last_notified_commit", "")
+    manual_restart = get_bot_setting("manual_restart", "0") == "1"
     admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
-    if not admin_alert_enabled and STARTUP_TYPE != "push":
-        logger.info("ℹ️ NUMBER BOTMAN started in silent 24/7 background mode (no admin spam).")
+
+    # A new update is detected if the git commit changed, STARTUP_TYPE is "push", or manual restart
+    is_new_update = bool(
+        (current_commit and current_commit != last_notified_commit)
+        or (STARTUP_TYPE == "push")
+    )
+
+    # Completely suppress on routine automated handover sessions unless an actual new update was pushed or admin manually restarted
+    if _is_handover and not is_new_update and not manual_restart:
+        logger.info(f"🤫 Automated session handover continuation (commit: {current_commit or 'unknown'}): restart notification suppressed (zero-restart mode).")
         return
 
-    stats = get_system_stats()
-    group_link = get_otp_group_link()
-    group_info = f"\n• <b>OTP Group:</b> <code>{group_link}</code>" if group_link else ""
+    if not is_new_update and not manual_restart and not admin_alert_enabled:
+        logger.info("ℹ️ NUMBER BOTMAN started cleanly in background (no new update to alert).")
+        return
 
-    active_name = get_bot_name()
+    # Clear manual restart flag once handled
+    if manual_restart:
+        set_bot_setting("manual_restart", "0")
+
+    bot_name = get_bot_name()
+    time_str, date_str = format_bangladesh_12h()
+
     admin_msg = (
-        f"⚡ <b>{html.escape(active_name)} 24/7 ONLINE</b>\n"
+        f"✅ <b>{html.escape(bot_name)}</b> is now <b>LIVE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "• <b>Status:</b> <code>Online & Serving Live Numbers ✅</code>\n"
-        "• <b>Engine:</b> <code>Zero-Restart Handover Engine 🔄</code>\n"
-        "• <b>Storage:</b> <code>SQLite WAL + Gist Cloud Backup ☁️</code>\n"
-        f"• <b>Standard Stock:</b> <code>{stats['total_std_available']} Numbers</code>\n"
-        f"• <b>Secret Stock:</b> <code>{stats['total_sec_available']} Numbers 🔒</code>\n"
-        f"• <b>Total Delivered:</b> <code>{stats['total_consumed']} Numbers</code>\n"
-        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>"
-        f"{group_info}\n"
+        f"⏰ <b>Start Time:</b> <code>{time_str}</code>\n"
+        f"📅 <b>Date:</b>       <code>{date_str}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 <i>Send /admin or /stats anytime to view live dashboard.</i>"
+        "<i>👑 Use /start anytime to open the admin dashboard.</i>"
     )
-    for aid in get_all_admin_ids():
+
+    admin_ids = get_all_admin_ids()
+    for aid in admin_ids:
         if aid:
             try:
-                await send_with_retry(application.bot, aid, admin_msg)
-                logger.info(f"✅ Initial alert sent to admin {aid}")
+                await send_with_retry(application.bot, aid, admin_msg, reply_markup=get_user_reply_keyboard(aid))
+                logger.info(f"✅ Initial alert sent to admin private chat {aid}")
             except Exception as e:
                 logger.warning(f"Initial alert failed for admin {aid}: {e}")
+
+    # Record this commit in database so subsequent routine 24/7 handover sessions remain silent
+    if current_commit:
+        set_bot_setting("last_notified_commit", current_commit)
 
 # ==========================================
 # 9. Keyboards & Views
@@ -1952,11 +2011,11 @@ def format_delivered_numbers(
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery text with Country and Available numbers."""
+    """Builds clean, professional delivery text with country and available numbers."""
     display_cname = country_name.strip()
 
     lines = [
-        f"<b>Country:</b> {html.escape(display_cname)}",
+        f"<b>{html.escape(display_cname)}</b>",
     ]
     if available_count is not None:
         lines.append(f"<b>Available:</b> {available_count} numbers")
@@ -2451,7 +2510,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
                     )
                     if gist_storage.enabled:
-                        asyncio.create_task(gist_storage.export_and_sync())
+                        gist_storage.mark_dirty()
                     return
 
     bot_name = get_bot_name()
@@ -3227,6 +3286,11 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def perform_zero_restart_handover(target_message):
     """Executes the clean zero-restart session handover for Number Bot."""
+    try:
+        set_bot_setting("manual_restart", "1")
+    except Exception:
+        pass
+
     try:
         msg = await target_message.reply_text(
             "🔄 <b>Zero-Restart Handover Triggered</b>\n"
@@ -6508,7 +6572,7 @@ def main():
         except Exception as e:
             logger.warning(f"Startup bot name restore notice: {e}")
         await setup_bot_commands(application)
-        await send_startup_announcement(application)
+        asyncio.create_task(send_startup_announcement(application))
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))
         session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))

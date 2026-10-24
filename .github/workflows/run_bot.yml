@@ -153,7 +153,6 @@ jobs:
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
           GITHUB_SHA: ${{ github.sha }}
-          ADMIN_STARTUP_ALERT: "true"
           IS_HANDOVER: ${{ github.event.inputs.is_handover || 'false' }}
           SESSION_TIMEOUT: "19500"
           PYTHONUNBUFFERED: "1"

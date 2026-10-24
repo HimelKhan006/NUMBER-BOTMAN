@@ -33,41 +33,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Cancel Any Other Running Instances
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=20" \
-            | python3 -c "
-          import sys, json
-          runs = json.load(sys.stdin).get('workflow_runs', [])
-          for r in runs:
-              if str(r['id']) != '${{ github.run_id }}':
-                  print(r['id'])
-          " | while read r_id; do
-            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id/cancel" || true
-          done
-          echo "✅ Old runs cancelled."
-
-      - name: Clear Old Completed Workflow History
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=completed&per_page=20" \
-            | python3 -c "
-          import sys, json
-          runs = json.load(sys.stdin).get('workflow_runs', [])
-          for r in runs:
-              print(r['id'])
-          " | while read r_id; do
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id" || true
-          done
-          echo "✅ History cleaned."
-
+      # ─────────────────────────────────────────────────────────────────
+      # Restore the database & stock pools from cache FIRST
+      # BEFORE any cancellation or history cleanup!
+      # ─────────────────────────────────────────────────────────────────
       - name: Restore Persistent Database from Cache
         uses: actions/cache/restore@v4
         with:
@@ -77,10 +46,64 @@ jobs:
             bot4_database.db-shm
             country_stocks/
             otp_group_link.txt
-          key: bot4-database-persistent-${{ github.run_id }}
+          key: bot4-database-persistent-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             bot4-database-persistent-
             bot4-database-
+
+      - name: Cancel Any Other Running Instances
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALT_TOKEN: ${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}
+        run: |
+          for st in in_progress queued; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=$st&per_page=30" \
+              | python3 -c "
+            import sys, json
+            runs = json.load(sys.stdin).get('workflow_runs', [])
+            for r in runs:
+                if str(r.get('id')) != '${{ github.run_id }}':
+                    print(r['id'])
+            " | while read r_id; do
+              echo "🛑 Cancelling older run #$r_id ($st)..."
+              curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id/cancel" || true
+            done
+          done
+          echo "✅ Old runs cancelled."
+
+      - name: Clear Old Completed Workflow History
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALT_TOKEN: ${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}
+        run: |
+          echo "🧹 Deleting old completed workflow run history..."
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=50" \
+            | python3 -c "
+          import sys, json
+          runs = [r for r in json.load(sys.stdin).get('workflow_runs', []) if r.get('status') == 'completed' and str(r.get('id')) != '${{ github.run_id }}']
+          for r in runs:
+              print(r['id'])
+          " | while read r_id; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id")
+            if [ "$HTTP_CODE" = "204" ]; then
+              echo "  🗑️ Purged old completed run #$r_id"
+            elif [ -n "$ALT_TOKEN" ]; then
+              curl -s -X DELETE \
+                -H "Authorization: Bearer $ALT_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id" || true
+            fi
+          done
+          echo "✅ History cleaned."
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -177,6 +200,26 @@ jobs:
 
           echo "⏱️ Session complete. Handing off to save & next-run trigger..."
 
+      - name: Pre-Save Database Checkpoint
+        if: always()
+        run: |
+          python3 -c "
+          import sqlite3, os
+          dbs = ['bot4_database.db']
+          if os.path.exists('country_stocks'):
+              for f in os.listdir('country_stocks'):
+                  if f.endswith('.db'):
+                      dbs.append(os.path.join('country_stocks', f))
+          for f in dbs:
+              if os.path.exists(f):
+                  try:
+                      with sqlite3.connect(f) as conn:
+                          conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+                  except Exception as e:
+                      pass
+          print('✅ WAL checkpointed successfully before cache save.')
+          " || true
+
       - name: Save Persistent Database to Cache
         if: always()
         uses: actions/cache/save@v4
@@ -187,7 +230,7 @@ jobs:
             bot4_database.db-shm
             country_stocks/
             otp_group_link.txt
-          key: bot4-database-persistent-${{ github.run_id }}
+          key: bot4-database-persistent-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Self-Trigger Next Run (Zero Downtime Restart)
         if: always()

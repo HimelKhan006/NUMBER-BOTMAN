@@ -167,42 +167,191 @@ logging.basicConfig(
 logger = logging.getLogger("NUMBER_BOTMAN")
 
 
-COUNTRY_FLAGS = {
-    "usa": "🇺🇸", "united states": "🇺🇸", "us": "🇺🇸",
-    "uk": "🇬🇧", "united kingdom": "🇬🇧", "england": "🇬🇧", "great britain": "🇬🇧",
+COUNTRY_FLAGS: Dict[str, str] = {
+    # North America
+    "usa": "🇺🇸", "united states": "🇺🇸", "us": "🇺🇸", "america": "🇺🇸",
     "canada": "🇨🇦", "ca": "🇨🇦",
-    "russia": "🇷🇺", "ru": "🇷🇺",
-    "india": "🇮🇳", "in": "🇮🇳",
-    "bangladesh": "🇧🇩", "bd": "🇧🇩",
-    "pakistan": "🇵🇰", "pk": "🇵🇰",
-    "germany": "🇩🇪", "de": "🇩🇪",
+    "mexico": "🇲🇽", "mx": "🇲🇽",
+    # Europe
+    "uk": "🇬🇧", "united kingdom": "🇬🇧", "england": "🇬🇧", "great britain": "🇬🇧", "gb": "🇬🇧",
+    "germany": "🇩🇪", "de": "🇩🇪", "deutschland": "🇩🇪",
     "france": "🇫🇷", "fr": "🇫🇷",
     "italy": "🇮🇹", "it": "🇮🇹",
     "spain": "🇪🇸", "es": "🇪🇸",
-    "brazil": "🇧🇷", "br": "🇧🇷",
-    "australia": "🇦🇺", "au": "🇦🇺",
-    "indonesia": "🇮🇩", "id": "🇮🇩",
-    "nigeria": "🇳🇬", "ng": "🇳🇬",
-    "netherlands": "🇳🇱", "nl": "🇳🇱",
+    "netherlands": "🇳🇱", "nl": "🇳🇱", "holland": "🇳🇱",
     "sweden": "🇸🇪", "se": "🇸🇪",
     "poland": "🇵🇱", "pl": "🇵🇱",
-    "turkey": "🇹🇷", "tr": "🇹🇷",
+    "turkey": "🇹🇷", "tr": "🇹🇷", "turkiye": "🇹🇷",
     "ukraine": "🇺🇦", "ua": "🇺🇦",
-    "vietnam": "🇻🇳", "vn": "🇻🇳",
-    "philippines": "🇵🇭", "ph": "🇵🇭",
-    "egypt": "🇪🇬", "eg": "🇪🇬",
-    "south africa": "🇿🇦", "za": "🇿🇦",
+    "russia": "🇷🇺", "ru": "🇷🇺",
+    "austria": "🇦🇹", "at": "🇦🇹",
+    "switzerland": "🇨🇭", "ch": "🇨🇭",
+    "belgium": "🇧🇪", "be": "🇧🇪",
+    "norway": "🇳🇴", "no": "🇳🇴",
+    "denmark": "🇩🇰", "dk": "🇩🇰",
+    "finland": "🇫🇮", "fi": "🇫🇮",
+    "portugal": "🇵🇹", "pt": "🇵🇹",
+    "ireland": "🇮🇪", "ie": "🇮🇪",
+    "greece": "🇬🇷", "gr": "🇬🇷",
+    "czech republic": "🇨🇿", "czechia": "🇨🇿", "cz": "🇨🇿",
+    "romania": "🇷🇴", "ro": "🇷🇴",
+    "hungary": "🇭🇺", "hu": "🇭🇺",
+    "slovakia": "🇸🇰", "sk": "🇸🇰",
+    "bulgaria": "🇧🇬", "bg": "🇧🇬",
+    "croatia": "🇭🇷", "hr": "🇭🇷",
+    "serbia": "🇷🇸", "rs": "🇷🇸",
+    "lithuania": "🇱🇹", "lt": "🇱🇹",
+    "latvia": "🇱🇻", "lv": "🇱🇻",
+    "estonia": "🇪🇪", "ee": "🇪🇪",
+    "slovenia": "🇸🇮", "si": "🇸🇮",
+    "cyprus": "🇨🇾", "cy": "🇨🇾",
+    "luxembourg": "🇱🇺", "lu": "🇱🇺",
+    "malta": "🇲🇹", "mt": "🇲🇹",
+    "iceland": "🇮🇸", "is": "🇮🇸",
+    "albania": "🇦🇱", "al": "🇦🇱",
+    "bosnia": "🇧🇦", "ba": "🇧🇦",
+    "north macedonia": "🇲🇰", "mk": "🇲🇰",
+    "moldova": "🇲🇩", "md": "🇲🇩",
+    "belarus": "🇧🇾", "by": "🇧🇾",
+    "georgia": "🇬🇪", "ge": "🇬🇪",
+    "armenia": "🇦🇲", "am": "🇦🇲",
+    "azerbaijan": "🇦🇿", "az": "🇦🇿",
+    # Asia
+    "india": "🇮🇳", "in": "🇮🇳",
+    "bangladesh": "🇧🇩", "bd": "🇧🇩",
+    "pakistan": "🇵🇰", "pk": "🇵🇰",
+    "nepal": "🇳🇵", "np": "🇳🇵",
+    "sri lanka": "🇱🇰", "lk": "🇱🇰",
     "china": "🇨🇳", "cn": "🇨🇳",
     "japan": "🇯🇵", "jp": "🇯🇵",
+    "south korea": "🇰🇷", "korea": "🇰🇷", "kr": "🇰🇷",
+    "indonesia": "🇮🇩", "id": "🇮🇩",
+    "philippines": "🇵🇭", "ph": "🇵🇭",
+    "vietnam": "🇻🇳", "vn": "🇻🇳",
+    "malaysia": "🇲🇾", "my": "🇲🇾",
+    "thailand": "🇹🇭", "th": "🇹🇭",
+    "singapore": "🇸🇬", "sg": "🇸🇬",
+    "myanmar": "🇲🇲", "mm": "🇲🇲",
+    "cambodia": "🇰🇭", "kh": "🇰🇭",
+    "laos": "🇱🇦", "la": "🇱🇦",
+    "taiwan": "🇹🇼", "tw": "🇹🇼",
+    "hong kong": "🇭🇰", "hk": "🇭🇰",
+    "kazakhstan": "🇰🇿", "kz": "🇰🇿",
+    "uzbekistan": "🇺🇿", "uz": "🇺🇿",
+    "kyrgyzstan": "🇰🇬", "kg": "🇰🇬",
+    "tajikistan": "🇹🇯", "tj": "🇹🇯",
+    "turkmenistan": "🇹🇲", "tm": "🇹🇲",
+    "afghanistan": "🇦🇫", "af": "🇦🇫",
+    "mongolia": "🇲🇳", "mn": "🇲🇳",
+    # Middle East
+    "saudi arabia": "🇸🇦", "sa": "🇸🇦",
+    "uae": "🇦🇪", "united arab emirates": "🇦🇪", "ae": "🇦🇪", "dubai": "🇦🇪",
+    "qatar": "🇶🇦", "qa": "🇶🇦",
+    "kuwait": "🇰🇼", "kw": "🇰🇼",
+    "oman": "🇴🇲", "om": "🇴🇲",
+    "bahrain": "🇧🇭", "bh": "🇧🇭",
+    "iraq": "🇮🇶", "iq": "🇮🇶",
+    "iran": "🇮🇷", "ir": "🇮🇷",
+    "israel": "🇮🇱", "il": "🇮🇱",
+    "jordan": "🇯🇴", "jo": "🇯🇴",
+    "lebanon": "🇱🇧", "lb": "🇱🇧",
+    "syria": "🇸🇾", "sy": "🇸🇾",
+    "yemen": "🇾🇪", "ye": "🇾🇪",
+    # South & Central America
+    "brazil": "🇧🇷", "br": "🇧🇷",
+    "colombia": "🇨🇴", "co": "🇨🇴",
+    "argentina": "🇦🇷", "ar": "🇦🇷",
+    "chile": "🇨🇱", "cl": "🇨🇱",
+    "peru": "🇵🇪", "pe": "🇵🇪",
+    "venezuela": "🇻🇪", "ve": "🇻🇪",
+    "ecuador": "🇪🇨", "ec": "🇪🇨",
+    "bolivia": "🇧🇴", "bo": "🇧🇴",
+    "paraguay": "🇵🇾", "py": "🇵🇾",
+    "uruguay": "🇺🇾", "uy": "🇺🇾",
+    "panama": "🇵🇦", "pa": "🇵🇦",
+    "costa rica": "🇨🇷", "cr": "🇨🇷",
+    "guatemala": "🇬🇹", "gt": "🇬🇹",
+    "honduras": "🇭🇳", "hn": "🇭🇳",
+    "el salvador": "🇸🇻", "sv": "🇸🇻",
+    "nicaragua": "🇳🇮", "ni": "🇳🇮",
+    "dominican republic": "🇩🇴", "do": "🇩🇴",
+    "cuba": "🇨🇺", "cu": "🇨🇺",
+    "jamaica": "🇯🇲", "jm": "🇯🇲",
+    "haiti": "🇭🇹", "ht": "🇭🇹",
+    # Africa
+    "nigeria": "🇳🇬", "ng": "🇳🇬",
+    "egypt": "🇪🇬", "eg": "🇪🇬",
+    "south africa": "🇿🇦", "za": "🇿🇦",
+    "kenya": "🇰🇪", "ke": "🇰🇪",
+    "ghana": "🇬🇭", "gh": "🇬🇭",
+    "morocco": "🇲🇦", "ma": "🇲🇦",
+    "ethiopia": "🇪🇹", "et": "🇪🇹",
+    "tanzania": "🇹🇿", "tz": "🇹🇿",
+    "uganda": "🇺🇬", "ug": "🇺🇬",
+    "algeria": "🇩🇿", "dz": "🇩🇿",
+    "tunisia": "🇹🇳", "tn": "🇹🇳",
+    "sudan": "🇸🇩", "sd": "🇸🇩",
+    "angola": "🇦🇴", "ao": "🇦🇴",
+    "mozambique": "🇲🇿", "mz": "🇲🇿",
+    "ivory coast": "🇨🇮", "cote d'ivoire": "🇨🇮", "ci": "🇨🇮",
+    "cameroon": "🇨🇲", "cm": "🇨🇲",
+    "madagascar": "🇲🇬", "mg": "🇲🇬",
+    "zambia": "🇿🇲", "zm": "🇿🇲",
+    "senegal": "🇸🇳", "sn": "🇸🇳",
+    "zimbabwe": "🇿🇼", "zw": "🇿🇼",
+    "rwanda": "🇷🇼", "rw": "🇷🇼",
+    "somalia": "🇸🇴", "so": "🇸🇴",
+    "libya": "🇱🇾", "ly": "🇱🇾",
+    # Oceania
+    "australia": "🇦🇺", "au": "🇦🇺",
+    "new zealand": "🇳🇿", "nz": "🇳🇿",
+    "fiji": "🇫🇯", "fj": "🇫🇯",
+    "papua new guinea": "🇵🇬", "pg": "🇵🇬",
 }
+
+def get_country_flag(name: str) -> Optional[str]:
+    """Finds or resolves the flag emoji for any country name, code, or composite label."""
+    cleaned = name.strip()
+    if not cleaned:
+        return None
+    # Check if text already contains a regional indicator flag symbol
+    for ch in cleaned:
+        if 127462 <= ord(ch) <= 127487:
+            return None
+
+    lower = cleaned.lower()
+    # 1. Direct match in dictionary
+    if lower in COUNTRY_FLAGS:
+        return COUNTRY_FLAGS[lower]
+
+    # 2. Check 2-letter ISO code conversion
+    if len(lower) == 2 and lower.isalpha():
+        try:
+            return "".join(chr(127397 + ord(c)) for c in lower.upper())
+        except Exception:
+            pass
+
+    # 3. Strip auxiliary descriptor words like "new", "fresh", "stock", "whatsapp", etc.
+    tokens = re.findall(r"[a-zA-Z]+", lower)
+    stop_words = {"new", "fresh", "stock", "stocks", "numbers", "number", "pool", "vip", "line", "whatsapp", "telegram", "sms", "fast", "server"}
+    sub_tokens = [t for t in tokens if t not in stop_words]
+
+    for cand in [" ".join(sub_tokens), *sub_tokens]:
+        if cand in COUNTRY_FLAGS:
+            return COUNTRY_FLAGS[cand]
+
+    # 4. Substring search in dictionary keys
+    for key, flag in COUNTRY_FLAGS.items():
+        if len(key) >= 4 and key in lower:
+            return flag
+
+    return None
 
 def format_country_name(name: str) -> str:
     cleaned = name.strip()
-    lower = cleaned.lower()
-    for key, flag in COUNTRY_FLAGS.items():
-        if key == lower or lower.startswith(key + " ") or lower.endswith(" " + key):
-            if not any(char in cleaned for char in "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"):
-                return f"{flag} {cleaned}"
+    flag = get_country_flag(cleaned)
+    if flag:
+        return f"{flag} {cleaned}"
     return cleaned
 
 def sanitize_phone_number(raw_num: str) -> Optional[str]:
@@ -885,25 +1034,23 @@ def get_or_create_country(country_name: str) -> int:
         get_country_db(cid).close()
         return cid
 
-# Short in-memory cache for the user-facing country list (populated by get_all_countries_with_stock)
-_COUNTRIES_STOCK_CACHE: Optional[List[Dict[str, Any]]] = None
-_COUNTRIES_STOCK_CACHE_TS: float = 0.0
+# Short in-memory cache for country stock queries
+_COUNTRIES_STOCK_CACHE_MAP: Dict[Tuple[bool, bool], Tuple[float, List[Dict[str, Any]]]] = {}
 _COUNTRIES_STOCK_CACHE_TTL: float = 3.0  # seconds
 
 def invalidate_countries_cache() -> None:
-    global _COUNTRIES_STOCK_CACHE, _COUNTRIES_STOCK_CACHE_TS
-    _COUNTRIES_STOCK_CACHE = None
-    _COUNTRIES_STOCK_CACHE_TS = 0.0
+    global _COUNTRIES_STOCK_CACHE_MAP
+    _COUNTRIES_STOCK_CACHE_MAP.clear()
 
 def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = False) -> List[Dict[str, Any]]:
-    global _COUNTRIES_STOCK_CACHE, _COUNTRIES_STOCK_CACHE_TS
+    global _COUNTRIES_STOCK_CACHE_MAP
     import time as _time
 
-    # Return cached result for ultra-fast repeated calls (user list browsing)
-    if only_active and not secret_mode:
-        now_ts = _time.monotonic()
-        if _COUNTRIES_STOCK_CACHE is not None and (now_ts - _COUNTRIES_STOCK_CACHE_TS) < _COUNTRIES_STOCK_CACHE_TTL:
-            return _COUNTRIES_STOCK_CACHE
+    cache_key = (only_active, secret_mode)
+    now_ts = _time.monotonic()
+    cached = _COUNTRIES_STOCK_CACHE_MAP.get(cache_key)
+    if cached is not None and (now_ts - cached[0]) < _COUNTRIES_STOCK_CACHE_TTL:
+        return cached[1]
 
     results = []
     with get_main_db() as conn:
@@ -948,10 +1095,7 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
             "total_used": used_std + used_sec,
         })
 
-    if only_active and not secret_mode:
-        _COUNTRIES_STOCK_CACHE = results
-        _COUNTRIES_STOCK_CACHE_TS = _time.monotonic()
-
+    _COUNTRIES_STOCK_CACHE_MAP[cache_key] = (now_ts, results)
     return results
 
 def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool = False) -> Tuple[int, int]:
@@ -988,16 +1132,48 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
             num = sanitize_phone_number(raw_num)
             if not num:
                 continue
-            cur = conn.execute("DELETE FROM available_numbers WHERE number = ?;", (num,))
+            plain = num.lstrip("+")
+            plus = f"+{plain}"
+            cur = conn.execute(
+                "DELETE FROM available_numbers WHERE number IN (?, ?, ?);",
+                (num, plain, plus)
+            )
             removed += cur.rowcount
         conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+    invalidate_countries_cache()
     return removed
 
 def delete_country_and_stock(country_id: int):
+    # 1. Wipe rows first to guarantee zero numbers regardless of file locks
+    try:
+        with get_country_db(country_id) as cconn:
+            cconn.execute("DELETE FROM available_numbers;")
+            cconn.execute("DELETE FROM used_numbers;")
+            cconn.commit()
+            cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except Exception as e:
+        logger.warning(f"Error wiping country DB tables for {country_id}: {e}")
+
+    _INITIALIZED_COUNTRY_DBS.discard(country_id)
+
+    # 2. Delete country record from main database
     with get_main_db() as conn:
         conn.execute("DELETE FROM countries WHERE id = ?;", (country_id,))
         conn.execute("DELETE FROM delivery_log WHERE country_id = ?;", (country_id,))
         conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+
+    # 3. Invalidate stock cache immediately so all menus instantly reflect 0
+    invalidate_countries_cache()
+
+    # 4. Remove physical database files on disk
     c_db_path = os.path.join(STOCKS_DIR, f"country_{country_id}.db")
     for ext in ["", "-wal", "-shm"]:
         p = c_db_path + ext
@@ -1359,6 +1535,10 @@ class GistStorage:
         self._dirty: bool = False
         self._last_sync_time: float = 0.0
         self._MIN_SYNC_INTERVAL: float = 15.0  # seconds between non-handover syncs
+
+    def mark_dirty(self):
+        """Flags local database as modified for next background flush."""
+        self._dirty = True
 
     def _get_lock(self) -> asyncio.Lock:
         """Lazily create the asyncio.Lock after the event loop is running."""
@@ -1776,10 +1956,10 @@ def format_delivered_numbers(
     display_cname = country_name.strip()
 
     lines = [
-        f"<b>Country:</b> <code>{html.escape(display_cname)}</code>",
+        f"<b>Country:</b> {html.escape(display_cname)}",
     ]
     if available_count is not None:
-        lines.append(f"<b>Available:</b> <code>{available_count} numbers</code>")
+        lines.append(f"<b>Available:</b> {available_count} numbers")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return "\n".join(lines)
@@ -1903,34 +2083,22 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
     """Builds professional preview and controls for country stock broadcast."""
     cid = bcast_data["country_id"]
     c_name = bcast_data["country_name"]
-    srv = bcast_data["service"]
-    qty = bcast_data["quantity"]
+    qty = bcast_data.get("quantity", 0)
     btn_label = bcast_data["button_label"]
-    custom_text = bcast_data.get("custom_text", "")
-
-    preview_box = (
-        f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-        f"📱 <b>Service:</b> <code>{srv}</code>\n"
-        f"📦 <b>Available:</b> <code>{qty} Numbers</code> <i>(In Stock)</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{custom_text}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 <i>Tap the button below to get your number directly:</i>"
-    )
+    custom_text = bcast_data.get("custom_text", "").strip() or f"🔥 Fresh {c_name} numbers are now loaded and ready! Tap below to get your number."
 
     overview = (
         f"📢 <b>Stock Broadcast Setup & Live Preview</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🌍 <b>Target Country:</b> <code>{c_name}</code>\n"
-        f"📱 <b>Service:</b> <code>{srv}</code>\n"
-        f"📦 <b>Stock Quantity:</b> <code>{qty} numbers</code> <i>(Auto-Filled)</i>\n"
+        f"📦 <b>Stock Quantity:</b> <code>{qty} numbers</code>\n"
         f"🏷️ <b>Action Button Name:</b> <code>[{btn_label}]</code>\n"
         f"👥 <b>Target Audience:</b> <code>All Registered Users</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👀 <b>USER BROADCAST PREVIEW:</b>\n\n"
-        f"{preview_box}"
+        f"{custom_text}\n\n"
+        f"<i>[Button Attached]:</i> <code>[{btn_label}]</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
     active_bcast = get_country_active_broadcast(cid)
@@ -1945,10 +2113,9 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
             InlineKeyboardButton("🏷️ Rename Button", callback_data=f"bcast_c_edit_btn_{cid}")
         ],
         [
-            InlineKeyboardButton("📱 Change Service", callback_data=f"bcast_c_edit_srv_{cid}"),
-            InlineKeyboardButton("🔄 Refresh Stock Qty", callback_data=f"bcast_c_refresh_{cid}")
+            InlineKeyboardButton("🔄 Refresh Stock Qty", callback_data=f"bcast_c_refresh_{cid}"),
+            InlineKeyboardButton(del_text, callback_data=del_cb)
         ],
-        [InlineKeyboardButton(del_text, callback_data=del_cb)],
         [InlineKeyboardButton("❌ Cancel & Return", callback_data=f"adm_country_{cid}")]
     ])
     return overview, kb
@@ -3192,6 +3359,14 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("⚠️ <b>Please upload a <code>.txt</code> file.</b>", parse_mode=ParseMode.HTML)
         return
 
+    # Delete previous prompt message if present so it doesn't linger above the uploaded file
+    prev_prompt_id = ADMIN_STATES.get(user.id, {}).get("prompt_msg_id")
+    if prev_prompt_id:
+        try:
+            await context.bot.delete_message(chat_id=user.id, message_id=prev_prompt_id)
+        except Exception:
+            pass
+
     msg = await update.message.reply_text("⏳ <i>Downloading and parsing numbers file...</i>", parse_mode=ParseMode.HTML)
 
     try:
@@ -3225,6 +3400,8 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             "filename": file_name,
             "file_stem": file_stem,
             "mode": prev_mode,
+            "doc_msg_id": update.message.message_id,
+            "step_msg_id": msg.message_id,
         }
 
         if prev_mode == "remove":
@@ -3822,21 +3999,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
-    # Country Broadcast Service Edit
-    if admin_state.get("awaiting_bcast_srv"):
-        cid = admin_state.pop("awaiting_bcast_srv")
-        bcast_data = admin_state.get("country_bcast")
-        if bcast_data:
-            bcast_data["service"] = text.strip()
-            ov_text, kb = render_country_broadcast_panel(bcast_data)
-            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        return
-
     if admin_state.get("awaiting_country_name"):
         country_name = text.strip()
         numbers = admin_state["numbers"]
         filename = admin_state["filename"]
         mode = admin_state.get("mode", "add")
+        step_msg_id = admin_state.get("step_msg_id")
+
+        # Delete user's text message to keep the chat completely clean
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
 
         cid = get_or_create_country(country_name)
         admin_state["awaiting_country_name"] = False
@@ -3845,25 +4019,45 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if mode == "remove":
             removed = remove_numbers_from_country(cid, numbers)
+            doc_id = admin_state.get("doc_msg_id")
             del ADMIN_STATES[user.id]
+            if doc_id:
+                try:
+                    await context.bot.delete_message(chat_id=user.id, message_id=doc_id)
+                except Exception:
+                    pass
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
 
             all_c = get_all_countries_with_stock(only_active=False)
             c_info = next((x for x in all_c if x["id"] == cid), {})
-            await update.message.reply_text(
+            removal_text = (
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🌍 <b>Country:</b> <code>{country_name}</code>\n"
                 f"📄 <b>Source File:</b> <code>{filename}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
+                f"━━━━━━━━━━━━━━━━━━━━"
             )
+            removal_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+            edited = False
+            if step_msg_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user.id,
+                        message_id=step_msg_id,
+                        text=removal_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=removal_kb
+                    )
+                    edited = True
+                except Exception:
+                    pass
+            if not edited:
+                await update.message.reply_text(removal_text, parse_mode=ParseMode.HTML, reply_markup=removal_kb)
             return
 
         choice_text = (
@@ -3880,7 +4074,23 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("🔒 Add to Secret Stock", callback_data=f"apply_stock_sec_{cid}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
         ])
-        await update.message.reply_text(choice_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+        edited = False
+        if step_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=user.id,
+                    message_id=step_msg_id,
+                    text=choice_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard
+                )
+                edited = True
+            except Exception:
+                pass
+        if not edited:
+            new_m = await update.message.reply_text(choice_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            admin_state["step_msg_id"] = new_m.message_id
         return
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4002,7 +4212,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            gist_storage.mark_dirty()
 
         pref_plus = get_user_plus_preference(user.id)
         response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
@@ -4040,7 +4250,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            gist_storage.mark_dirty()
 
         pref_plus = get_user_plus_preference(user.id)
         response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
@@ -4850,7 +5060,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 7. Admin Add Numbers Prompt
     elif data == "admin_upload_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"mode": "add"}
+        ADMIN_STATES[user.id] = {"mode": "add", "prompt_msg_id": query.message.message_id}
         await query.edit_message_text(
             "➕ <b>Add Numbers (.txt):</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -4867,7 +5077,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 7b. Admin Add Secret Numbers Prompt
     elif data == "admin_upload_secret_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"mode": "add_secret"}
+        ADMIN_STATES[user.id] = {"mode": "add_secret", "prompt_msg_id": query.message.message_id}
         await query.edit_message_text(
             "🔒 <b>Add Secret Numbers (.txt):</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -4883,7 +5093,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 8. Admin Remove Numbers Prompt
     elif data == "admin_remove_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"mode": "remove"}
+        ADMIN_STATES[user.id] = {"mode": "remove", "prompt_msg_id": query.message.message_id}
         await query.edit_message_text(
             "🗑️ <b>Remove Numbers (.txt) File:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -5325,13 +5535,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         cid = get_or_create_country(file_stem)
         pending["country_id"] = cid
         pending["country_name"] = file_stem
+        pending["step_msg_id"] = query.message.message_id
         mode = pending.get("mode", "add")
         numbers = pending["numbers"]
         filename = pending["filename"]
 
         if mode == "remove":
             removed = remove_numbers_from_country(cid, numbers)
+            doc_id = pending.get("doc_msg_id")
             del ADMIN_STATES[user.id]
+            if doc_id:
+                try:
+                    await context.bot.delete_message(chat_id=user.id, message_id=doc_id)
+                except Exception:
+                    pass
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
 
@@ -5386,7 +5603,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         if mode == "remove":
             removed = remove_numbers_from_country(cid, numbers)
+            doc_id = pending.get("doc_msg_id")
             del ADMIN_STATES[user.id]
+            if doc_id:
+                try:
+                    await context.bot.delete_message(chat_id=user.id, message_id=doc_id)
+                except Exception:
+                    pass
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
 
@@ -5410,6 +5633,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         # Step 2: Choose Destination Pool (Standard or Secret)
         pending["country_id"] = cid
         pending["country_name"] = c_name
+        pending["step_msg_id"] = query.message.message_id
 
         text = (
             f"🌍 <b>Country Selected:</b> <code>{c_name}</code>\n"
@@ -5440,9 +5664,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         numbers = pending["numbers"]
         filename = pending["filename"]
         c_name = pending.get("country_name", f"Country {cid}")
+        doc_msg_id = pending.get("doc_msg_id")
 
         added, duplicates = add_numbers_to_country(cid, numbers, is_secret=is_secret)
         del ADMIN_STATES[user.id]
+
+        # Clean up the user's uploaded document file message from chat
+        if doc_msg_id:
+            try:
+                await context.bot.delete_message(chat_id=user.id, message_id=doc_msg_id)
+            except Exception:
+                pass
 
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
@@ -5477,6 +5709,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("⚠️ <b>Session expired. Please upload the .txt file again.</b>", parse_mode=ParseMode.HTML)
             return
         pending["awaiting_country_name"] = True
+        pending["step_msg_id"] = query.message.message_id
         await query.edit_message_text(
             f"✍️ <b>Please type the Country Name in chat:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -5487,8 +5720,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 14. Admin Cancel Upload
     elif data == "cancel_upload" and user_admin:
-        if user.id in ADMIN_STATES:
-            del ADMIN_STATES[user.id]
+        pending = ADMIN_STATES.pop(user.id, None)
+        if pending and pending.get("doc_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id=user.id, message_id=pending["doc_msg_id"])
+            except Exception:
+                pass
         await query.edit_message_text("❌ <b>Action cancelled.</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ]))
@@ -5522,15 +5759,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
         btn_label = c_info.get("button_name") or c_name
-        srv_name = c_info.get("service_name") or "WhatsApp"
         active_bcast = get_country_active_broadcast(cid)
 
         menu_buttons = [
             [InlineKeyboardButton("📢 Send Stock Broadcast", callback_data=f"adm_bcast_c_{cid}")],
-            [
-                InlineKeyboardButton("✏️ Rename Button Name", callback_data=f"adm_rename_btn_{cid}"),
-                InlineKeyboardButton("📱 Set Service", callback_data=f"adm_set_service_{cid}")
-            ]
+            [InlineKeyboardButton("✏️ Rename Button Name", callback_data=f"adm_rename_btn_{cid}")]
         ]
         if active_bcast:
             bid = active_bcast["broadcast_id"]
@@ -5544,7 +5777,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
             f"🏷️ <b>Button Label:</b> <code>{btn_label}</code>\n"
-            f"📱 <b>Service:</b> <code>{srv_name}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
             f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
@@ -5576,79 +5808,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
-    # 16b. Set Country Service Prompt & Presets
-    elif data.startswith("adm_set_service_") and user_admin:
-        cid = int(data.split("_")[3])
-        all_c = get_all_countries_with_stock(only_active=False)
-        c_info = next((x for x in all_c if x["id"] == cid), {})
-        c_name = c_info.get("name", "Unknown")
-        current_srv = c_info.get("service_name") or "WhatsApp"
-
-        ADMIN_STATES[user.id] = {"awaiting_country_service": cid}
-        await query.edit_message_text(
-            f"📱 <b>Set Service for {c_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Current Service: <code>{current_srv}</code>\n\n"
-            f"Choose a quick preset below or type any custom service in chat:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("WhatsApp", callback_data=f"adm_srv_set_{cid}_WhatsApp"),
-                    InlineKeyboardButton("Telegram", callback_data=f"adm_srv_set_{cid}_Telegram")
-                ],
-                [
-                    InlineKeyboardButton("Google", callback_data=f"adm_srv_set_{cid}_Google"),
-                    InlineKeyboardButton("Facebook", callback_data=f"adm_srv_set_{cid}_Facebook")
-                ],
-                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_country_{cid}")]
-            ])
-        )
-
-    # 16c. Save Service Preset
-    elif data.startswith("adm_srv_set_") and user_admin:
-        parts = data.split("_")
-        cid = int(parts[3])
-        srv_choice = "_".join(parts[4:])
-        update_country_service_name(cid, srv_choice)
-        if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
-        if user.id in ADMIN_STATES:
-            del ADMIN_STATES[user.id]
-        await query.answer(f"✅ Service updated to {srv_choice}!", show_alert=True)
-        # Re-display country menu
-        all_c = get_all_countries_with_stock(only_active=False)
-        c_info = next((x for x in all_c if x["id"] == cid), {})
-        c_name = c_info.get("name", "Unknown")
-        btn_label = c_info.get("button_name") or c_name
-        active_bcast = get_country_active_broadcast(cid)
-        menu_buttons = [
-            [InlineKeyboardButton("📢 Send Stock Broadcast", callback_data=f"adm_bcast_c_{cid}")],
-            [
-                InlineKeyboardButton("✏️ Rename Button Name", callback_data=f"adm_rename_btn_{cid}"),
-                InlineKeyboardButton("📱 Set Service", callback_data=f"adm_set_service_{cid}")
-            ]
-        ]
-        if active_bcast:
-            bid = active_bcast["broadcast_id"]
-            menu_buttons.append([InlineKeyboardButton(f"🗑️ Recall Broadcast ({bid})", callback_data=f"bcast_del_{bid}")])
-        menu_buttons.extend([
-            [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-            [InlineKeyboardButton("🔙 Back to Stock Pools", callback_data="admin_uploaded_files")]
-        ])
-        await query.edit_message_text(
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-            f"🏷️ <b>Button Label:</b> <code>{btn_label}</code>\n"
-            f"📱 <b>Service:</b> <code>{srv_choice}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
-            f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
-            f"📊 <b>Total Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
-            f"🔒 <b>Delivered / Used:</b> <code>{c_info.get('total_used', 0)}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(menu_buttons)
-        )
-
     # 16d. Launch Country Broadcast Setup with Auto-Filled Details
     elif data.startswith("adm_bcast_c_") and user_admin:
         cid = int(data.split("_")[3])
@@ -5656,14 +5815,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
         btn_name = c_info.get("button_name") or c_name
-        srv = c_info.get("service_name") or "WhatsApp"
         qty = c_info.get("total_available", 0)
         action_btn_label = f"📥 Get {btn_name} Number"
 
         bcast_data = {
             "country_id": cid,
             "country_name": c_name,
-            "service": srv,
             "quantity": qty,
             "button_label": action_btn_label,
             "custom_text": f"🔥 New fresh {c_name} numbers are now loaded and ready! Tap the button below to get your numbers instantly."
@@ -5700,41 +5857,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
-    # 16g. Change Broadcast Service Name
-    elif data.startswith("bcast_c_edit_srv_") and user_admin:
-        cid = int(data.split("_")[4])
-        ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_srv"] = cid
-        await query.edit_message_text(
-            "📱 <b>Change Service for Broadcast:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Choose a preset or type any custom service name in chat:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("WhatsApp", callback_data=f"bcast_srv_set_{cid}_WhatsApp"),
-                    InlineKeyboardButton("Telegram", callback_data=f"bcast_srv_set_{cid}_Telegram")
-                ],
-                [
-                    InlineKeyboardButton("Google", callback_data=f"bcast_srv_set_{cid}_Google"),
-                    InlineKeyboardButton("Facebook", callback_data=f"bcast_srv_set_{cid}_Facebook")
-                ],
-                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_bcast_c_{cid}")]
-            ])
-        )
-
-    # 16h. Set Broadcast Service Preset
-    elif data.startswith("bcast_srv_set_") and user_admin:
-        parts = data.split("_")
-        cid = int(parts[3])
-        srv_choice = "_".join(parts[4:])
-        bcast_data = ADMIN_STATES.get(user.id, {}).get("country_bcast")
-        if bcast_data:
-            bcast_data["service"] = srv_choice
-            ov_text, kb = render_country_broadcast_panel(bcast_data)
-            await query.edit_message_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        else:
-            await query.answer("Session expired", show_alert=True)
-
     # 16i. Refresh Broadcast Stock Quantity
     elif data.startswith("bcast_c_refresh_") and user_admin:
         cid = int(data.split("_")[3])
@@ -5755,7 +5877,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
-        srv = pending.get("service") if pending else (c_info.get("service_name") or "WhatsApp")
         btn_label = pending.get("button_label") if pending else (c_info.get("button_name") or f"📥 Get {c_name} Number")
         custom_text = pending.get("custom_text") if pending else f"🔥 New fresh {c_name} numbers are now loaded and ready! Tap the button below to get your numbers instantly."
         qty = c_info.get("total_available", 0)
@@ -5765,17 +5886,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         total_sent = 0
         total_failed = 0
 
-        broadcast_msg = (
-            f"🔥 <b>NEW {c_name.upper()} NUMBERS AVAILABLE</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-            f"📱 <b>Service:</b> <code>{srv}</code>\n"
-            f"📦 <b>Available:</b> <code>{qty} Numbers</code> <i>(In Stock)</i>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{custom_text}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <i>Tap the button below to get your number directly:</i>"
-        )
+        broadcast_msg = custom_text
         user_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(btn_label, callback_data=f"bcast_getnum_{cid}")]
         ])
@@ -5820,7 +5931,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             total_failed=total_failed,
             country_id=cid,
             button_label=btn_label,
-            service_name=srv,
+            service_name="",
             quantity=qty
         )
         if gist_storage.enabled:
@@ -5831,7 +5942,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
             f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-            f"📱 <b>Service:</b> <code>{srv}</code>\n"
             f"📦 <b>Advertised Stock:</b> <code>{qty} numbers</code>\n"
             f"🏷️ <b>Action Button:</b> <code>[{btn_label}]</code>\n"
             f"📤 <b>Delivered To:</b> <code>{total_sent} users</code>\n"
@@ -5876,7 +5986,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         await query.answer("⚡ Number delivered successfully!")
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            gist_storage.mark_dirty()
 
         pref_plus = get_user_plus_preference(user.id)
         response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)

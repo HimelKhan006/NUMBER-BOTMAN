@@ -2081,7 +2081,7 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
             return InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
                 [InlineKeyboardButton("🔒 Upload Secret Numbers (.txt)", callback_data="admin_upload_secret_prompt")],
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")]
             ])
         retry_cb = "btn_get_secret_number" if is_secret_mode else "btn_get_number"
         return InlineKeyboardMarkup([
@@ -2133,7 +2133,7 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
 
     # Only show Back button in Admin Mode to return to Admin Panel. Removed for users so no inline menu is opened.
     if is_admin_mode:
-        buttons.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")])
 
     return InlineKeyboardMarkup(buttons)
 
@@ -2230,7 +2230,7 @@ def get_numbers_view_keyboard(
 
     btn_rows.append([
         InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
-        InlineKeyboardButton("🔙 Back", callback_data=country_cb)
+        InlineKeyboardButton("◀️ Back", callback_data=country_cb)
     ])
 
     if with_plus:
@@ -2251,7 +2251,7 @@ def get_admin_quantity_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("Fixed: 10", callback_data="admin_set_qty_fixed_10"),
         ],
         [InlineKeyboardButton("✏️ Type Custom Quantity (1–1000)", callback_data="admin_set_qty_prompt")],
-        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+        [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
     ])
 
 # ==========================================
@@ -2547,7 +2547,7 @@ def build_buttons_list_view() -> Tuple[str, InlineKeyboardMarkup]:
         )
         kb = [
             [InlineKeyboardButton("➕ Add New Button", callback_data="link_add_prompt")],
-            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")],
+            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")],
         ]
         return msg, InlineKeyboardMarkup(kb)
 
@@ -2568,7 +2568,7 @@ def build_buttons_list_view() -> Tuple[str, InlineKeyboardMarkup]:
     ])
     kb.append([
         InlineKeyboardButton("🔄 Refresh List", callback_data="link_list"),
-        InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel"),
+        InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel"),
     ])
     return msg, InlineKeyboardMarkup(kb)
 
@@ -4270,7 +4270,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"All available numbers have been consumed. Please select another country.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="btn_get_number")]
+                    [InlineKeyboardButton("◀️ Back", callback_data="btn_get_number")]
                 ])
             )
             return
@@ -4308,7 +4308,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Please select another country from the Secret Pool.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="btn_get_secret_number")]
+                    [InlineKeyboardButton("◀️ Back", callback_data="btn_get_secret_number")]
                 ])
             )
             return
@@ -4860,7 +4860,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
             [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
-            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -4889,7 +4889,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
             buttons.append([InlineKeyboardButton(f"🗑️ Remove {u_tag} ({a['user_id']})", callback_data=f"admin_rm_admin_{a['user_id']}")])
 
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_manage_admins")])
+        buttons.append([InlineKeyboardButton("◀️ Back", callback_data="admin_manage_admins")])
         text = (
             "🗑️ <b>Remove Administrator</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -4926,7 +4926,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
             [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
-            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -4987,7 +4987,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "Upload your first file (.txt) to start serving numbers!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+                    [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )
             return
@@ -5023,7 +5023,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")])
 
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -5039,7 +5039,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "<i>No country files or numbers available to remove.</i>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+                    [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
                 ])
             )
             return
@@ -5070,7 +5070,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             buttons.append(nav_row)
 
         buttons.append([InlineKeyboardButton("📄 Remove Specific Numbers (.txt)", callback_data="admin_remove_prompt")])
-        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")] )
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")] )
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     # 6d. Quick Delete Confirmation
@@ -5135,7 +5135,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "🔒 <i>You can assign numbers to <b>Standard Stock</b> (all users) or <b>Secret Stock</b> (whitelisted users only) in Step 2.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")]
             ])
         )
 
@@ -5151,7 +5151,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "<b>Format:</b> One phone number per line.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")]
             ])
         )
 
@@ -5165,7 +5165,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "<i>The bot will parse the numbers and remove them from the chosen country pool.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")]
             ])
         )
 
@@ -5804,7 +5804,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Upload Numbers (.txt)", callback_data="admin_upload_prompt")],
-                    [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                    [InlineKeyboardButton("◀️ Back to Admin", callback_data="admin_panel")]
                 ])
             )
             return
@@ -5835,7 +5835,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         menu_buttons.extend([
             [InlineKeyboardButton("🗑️ 1-Click Delete File & Stock", callback_data=f"adm_quick_del_{cid}")],
-            [InlineKeyboardButton("🔙 Back to Stock Pools", callback_data="admin_uploaded_files")]
+            [InlineKeyboardButton("◀️ Back to Stock Pools", callback_data="admin_uploaded_files")]
         ])
 
         await query.edit_message_text(

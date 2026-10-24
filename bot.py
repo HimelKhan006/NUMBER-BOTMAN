@@ -2230,7 +2230,7 @@ def get_numbers_view_keyboard(
 
     btn_rows.append([
         InlineKeyboardButton("🔄 Next Number", callback_data=change_cb),
-        InlineKeyboardButton("🌍 Change Country", callback_data=country_cb)
+        InlineKeyboardButton("🔙 Back", callback_data=country_cb)
     ])
 
     if with_plus:
@@ -4270,7 +4270,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"All available numbers have been consumed. Please select another country.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🌍 Choose Another Country", callback_data="btn_get_number")]
+                    [InlineKeyboardButton("🔙 Back", callback_data="btn_get_number")]
                 ])
             )
             return
@@ -4308,7 +4308,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Please select another country from the Secret Pool.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔒 Choose Another Country", callback_data="btn_get_secret_number")]
+                    [InlineKeyboardButton("🔙 Back", callback_data="btn_get_secret_number")]
                 ])
             )
             return

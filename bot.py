@@ -127,7 +127,7 @@ except ImportError:
     CopyTextButton = None
 
 from telegram.constants import ParseMode, ChatType
-from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict
+from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict, BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -3798,9 +3798,10 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_select_country_text(secret_mode: bool = False) -> str:
     """Builds professional full-width header for Select Country message."""
+    divider = "━" * 28
     if secret_mode:
-        return f"🔒 <b>Secret Numbers Pool:</b>\n{CARD_DIVIDER}"
-    return f"🌍 <b>Select Country:</b>\n{CARD_DIVIDER}"
+        return f"🔒 <b>Secret Numbers Pool:</b>\n{divider}"
+    return f"🌍 <b>Select Country:</b>\n{divider}"
 
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
@@ -3857,27 +3858,32 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
         btn_disp = c.get("button_name") or c["name"]
 
         if is_admin_mode:
-
             prefix = "adm_country_"
-
             label = f"{btn_disp} (S:{c['available_std']} | 🔒:{c['available_sec']})"
-
+            if row:
+                buttons.append(row)
+                row = []
+            buttons.append([InlineKeyboardButton(label, callback_data=f"{prefix}{c['id']}")])
+            continue
         elif is_secret_mode:
-
             prefix = "sec_c_"
-
             label = f"🔒 {btn_disp} ({c['available']})"
-
         else:
-
             prefix = "c_"
-
             label = f"{btn_disp} ({c['available']})"
 
-        row.append(InlineKeyboardButton(label, callback_data=f"{prefix}{c['id']}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
+        btn = InlineKeyboardButton(label, callback_data=f"{prefix}{c['id']}")
+        # If label is long (> 16 chars), allocate a dedicated row so available count is never truncated on mobile
+        if len(label) > 16:
+            if row:
+                buttons.append(row)
+                row = []
+            buttons.append([btn])
+        else:
+            row.append(btn)
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
     if row:
         buttons.append(row)
 
@@ -6172,7 +6178,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = query.data
     user = update.effective_user
     if not user:
@@ -6180,7 +6189,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     user_admin = is_admin(user.id)
     if not user_admin and is_user_banned(user.id):
-        await query.answer("⛔ Your account has been banned.", show_alert=True)
+        try:
+            await query.answer("⛔ Your account has been banned.", show_alert=True)
+        except Exception:
+            pass
         return
     register_user(user.id, user.username, user.first_name)
     if data != "admin_search_user_prompt" and user.id in ADMIN_STATES:
@@ -6188,12 +6200,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Language Manager & SMS Language Callbacks
     if data.startswith("copy_num_"):
-        await query.answer("📋 Copied to clipboard!")
+        try:
+            await query.answer("📋 Copied to clipboard!")
+        except Exception:
+            pass
         return
 
     # Noop: display-only buttons that should not trigger any action
     if data == "noop":
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
 
     # 1b. Main Menu callback - silently delete message
@@ -6212,120 +6230,200 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         page = int(data.split("_")[-1]) if "_" in data and data.split("_")[-1].isdigit() else 0
         countries = get_all_countries_with_stock(only_active=True, secret_mode=False)
         if not countries:
-            await query.edit_message_text(
-                "⚠️ <b>No numbers are currently available in stock.</b>\n"
-                "Please check back soon or contact the admin.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_number")]
-                ])
-            )
+            try:
+                await query.edit_message_text(
+                    "⚠️ <b>No numbers are currently available in stock.</b>\n"
+                    "Please check back soon or contact the admin.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_number")]
+                    ])
+                )
+            except BadRequest as br:
+                if "Message is not modified" not in str(br):
+                    raise
             return
 
-        await query.edit_message_text(
-            get_select_country_text(secret_mode=False),
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=False)
-        )
+        try:
+            await query.edit_message_text(
+                get_select_country_text(secret_mode=False),
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=False)
+            )
+        except BadRequest as br:
+            if "Message is not modified" not in str(br):
+                raise
 
     # 2b. Get Secret Numbers -> Choose Country
     elif data == "btn_get_secret_number" or data.startswith("page_sec_"):
         if not user_has_secret_access(user.id):
-            await query.answer("⛔ Access Denied! Secret numbers are restricted to authorized users.", show_alert=True)
+            try:
+                await query.answer("⛔ Access Denied! Secret numbers are restricted to authorized users.", show_alert=True)
+            except Exception:
+                pass
             return
 
         page = int(data.split("_")[-1]) if "_" in data and data.split("_")[-1].isdigit() else 0
         countries = get_all_countries_with_stock(only_active=True, secret_mode=True)
         if not countries:
-            await query.edit_message_text(
-                "🔒 <b>Secret Numbers Pool:</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>No secret numbers are currently available in stock.</i>\n\n"
-                "Please check back soon or contact admin.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_secret_number")]
-                ])
-            )
+            try:
+                await query.edit_message_text(
+                    "🔒 <b>Secret Numbers Pool:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>No secret numbers are currently available in stock.</i>\n\n"
+                    "Please check back soon or contact admin.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="btn_get_secret_number")]
+                    ])
+                )
+            except BadRequest as br:
+                if "Message is not modified" not in str(br):
+                    raise
             return
 
-        await query.edit_message_text(
-            get_select_country_text(secret_mode=True),
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=True)
-        )
+        try:
+            await query.edit_message_text(
+                get_select_country_text(secret_mode=True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_countries_keyboard(page=page, per_page=8, is_admin_mode=False, is_secret_mode=True)
+            )
+        except BadRequest as br:
+            if "Message is not modified" not in str(br):
+                raise
 
     # 3. Deliver Standard Numbers
     elif (data.startswith("c_") and not data.startswith("change_num_") and not data.startswith("cancel_")) or data.startswith("change_num_"):
-        country_id = int(data.split("_")[1]) if data.startswith("c_") else int(data.split("_")[2])
-        limit, is_fixed = get_effective_quantity_for_user(user.id)
+        try:
+            await query.answer()
+        except Exception:
+            pass
 
-        numbers, remaining_count, country_name = consume_numbers_for_user(
-            country_id=country_id,
-            user_id=user.id,
-            limit=limit,
-            is_secret=False
-        )
+        try:
+            country_id = int(data.split("_")[1]) if data.startswith("c_") else int(data.split("_")[2])
+            limit, is_fixed = get_effective_quantity_for_user(user.id)
 
-        if not numbers:
-            await query.edit_message_text(
-                f"⚠️ <b>No more numbers available in stock for {country_name}.</b>\n"
-                f"All available numbers have been consumed. Please select another country.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Back", callback_data="btn_get_number")]
-                ])
+            numbers, remaining_count, country_name = consume_numbers_for_user(
+                country_id=country_id,
+                user_id=user.id,
+                limit=limit,
+                is_secret=False
             )
-            return
 
-        if gist_storage.enabled:
-            gist_storage.mark_dirty()
+            if not numbers:
+                try:
+                    await query.edit_message_text(
+                        f"⚠️ <b>No more numbers available in stock for {country_name}.</b>\n"
+                        f"All available numbers have been consumed. Please select another country.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("◀️ Back", callback_data="btn_get_number")]
+                        ])
+                    )
+                except BadRequest as br:
+                    if "Message is not modified" not in str(br):
+                        raise
+                return
 
-        pref_plus = get_user_plus_preference(user.id)
-        response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
-        await query.edit_message_text(
-            response_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
-        )
+            if gist_storage.enabled:
+                gist_storage.mark_dirty()
+
+            pref_plus = get_user_plus_preference(user.id)
+            response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
+            markup = get_numbers_view_keyboard(country_id, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
+
+            try:
+                await query.edit_message_text(
+                    response_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
+            except BadRequest as br:
+                if "Message is not modified" in str(br):
+                    pass
+                else:
+                    await context.bot.send_message(
+                        chat_id=user.id,
+                        text=response_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=markup
+                    )
+        except Exception as e:
+            logger.error(f"Error delivering numbers for user {user.id}: {e}", exc_info=True)
+            try:
+                await query.answer("⚠️ System busy or error allocating number. Please tap again.", show_alert=True)
+            except Exception:
+                pass
 
     # 3b. Deliver Secret Numbers
     elif data.startswith("sec_c_") or data.startswith("sec_change_num_"):
         if not user_has_secret_access(user.id):
-            await query.answer("⛔ Access Denied! Secret numbers are restricted.", show_alert=True)
+            try:
+                await query.answer("⛔ Access Denied! Secret numbers are restricted.", show_alert=True)
+            except Exception:
+                pass
             return
 
-        country_id = int(data.split("_")[2]) if data.startswith("sec_c_") else int(data.split("_")[3])
-        limit, is_fixed = get_effective_quantity_for_user(user.id)
+        try:
+            await query.answer()
+        except Exception:
+            pass
 
-        numbers, remaining_count, country_name = consume_numbers_for_user(
-            country_id=country_id,
-            user_id=user.id,
-            limit=limit,
-            is_secret=True
-        )
+        try:
+            country_id = int(data.split("_")[2]) if data.startswith("sec_c_") else int(data.split("_")[3])
+            limit, is_fixed = get_effective_quantity_for_user(user.id)
 
-        if not numbers:
-            await query.edit_message_text(
-                f"⚠️ <b>No more secret numbers available for {country_name}.</b>\n"
-                f"Please select another country from the Secret Pool.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Back", callback_data="btn_get_secret_number")]
-                ])
+            numbers, remaining_count, country_name = consume_numbers_for_user(
+                country_id=country_id,
+                user_id=user.id,
+                limit=limit,
+                is_secret=True
             )
-            return
 
-        if gist_storage.enabled:
-            gist_storage.mark_dirty()
+            if not numbers:
+                try:
+                    await query.edit_message_text(
+                        f"⚠️ <b>No more secret numbers available for {country_name}.</b>\n"
+                        f"Please select another country from the Secret Pool.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("◀️ Back", callback_data="btn_get_secret_number")]
+                        ])
+                    )
+                except BadRequest as br:
+                    if "Message is not modified" not in str(br):
+                        raise
+                return
 
-        pref_plus = get_user_plus_preference(user.id)
-        response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
-        await query.edit_message_text(
-            response_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
-        )
+            if gist_storage.enabled:
+                gist_storage.mark_dirty()
+
+            pref_plus = get_user_plus_preference(user.id)
+            response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
+            markup = get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
+
+            try:
+                await query.edit_message_text(
+                    response_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup
+                )
+            except BadRequest as br:
+                if "Message is not modified" in str(br):
+                    pass
+                else:
+                    await context.bot.send_message(
+                        chat_id=user.id,
+                        text=response_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=markup
+                    )
+        except Exception as e:
+            logger.error(f"Error delivering secret numbers for user {user.id}: {e}", exc_info=True)
+            try:
+                await query.answer("⚠️ System busy or error allocating number. Please tap again.", show_alert=True)
+            except Exception:
+                pass
 
     # 3c. Interactive Instant '+' Toggle for Delivered Numbers
     elif data.startswith("toggle_plus_"):

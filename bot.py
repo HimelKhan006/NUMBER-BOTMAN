@@ -3823,6 +3823,7 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
         buttons.append([InlineKeyboardButton(sec_toggle_label, callback_data=f"u_toggle_sec_{target_user_id}")])
         buttons.append([InlineKeyboardButton(ban_toggle_label, callback_data=f"u_toggle_ban_{target_user_id}")])
         buttons.append([InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_user_id}")])
+        buttons.append([InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_user_id}")])
         buttons.append([InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")])
         buttons.append([InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")])
 
@@ -4362,6 +4363,124 @@ async def setgroupname_command(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.HTML
     )
 
+def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds interactive configuration & live preview panel for SMS delivery format (with/without view full SMS)."""
+    curr_fmt = "long" if is_view_full_sms_enabled() else "short"
+
+    short_active = "✅ (Active)" if curr_fmt == "short" else "⚪"
+    long_active  = "✅ (Active)" if curr_fmt == "long" else "⚪"
+
+    msg = (
+        "📋 <b>SMS Format & Live Preview</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Active Mode:</b>   <code>{'Short ⚡ (Without View Full SMS)' if curr_fmt == 'short' else 'Long 📜 (With View Full SMS)'}</code>\n\n"
+        "<b>Available Modes:</b>\n"
+        f"• <b>Short (Without View Full SMS)</b> {short_active}\n"
+        "  Clean, compact card with Service, Country Flag & Name, Unmasked Number & Copy OTP button. No expandable blockquote.\n\n"
+        f"• <b>Long (With View Full SMS)</b> {long_active}\n"
+        "  Full card with Service, Country Flag & Name, Unmasked Number, Copy OTP button, and expandable '📩 View Full SMS' blockquote.\n"
+    )
+
+    sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."
+    otp_sample = "292356"
+
+    if preview_mode == "short":
+        preview_body = format_inbox_otp_message(
+            service="WhatsApp",
+            country_name="Vietnam",
+            country_flag="🇻🇳",
+            unmasked_number="+84987938835",
+            otp_code=otp_sample,
+            raw_message=sample_sms,
+            show_full_sms=False
+        )
+        msg += (
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📺 Live Preview — Short (Without View Full SMS):</b>\n\n"
+            f"{preview_body}\n\n"
+            f"<i>💡 Clean inbox card without expandable blockquote. Tap button below to test copying:</i>"
+        )
+    elif preview_mode == "long":
+        preview_body = format_inbox_otp_message(
+            service="WhatsApp",
+            country_name="Vietnam",
+            country_flag="🇻🇳",
+            unmasked_number="+84987938835",
+            otp_code=otp_sample,
+            raw_message=sample_sms,
+            show_full_sms=True
+        )
+        msg += (
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📺 Live Preview — Long (With View Full SMS):</b>\n\n"
+            f"{preview_body}\n\n"
+            f"<i>💡 Full card with expandable blockquote. Tap button below to test copying:</i>"
+        )
+    else:
+        msg += "\n<i>Choose an option below to set the format or preview it live:</i>"
+
+    kb = []
+    if preview_mode in ("short", "long"):
+        if CopyTextButton:
+            kb.append([InlineKeyboardButton(f"🔐 {otp_sample}  📋", copy_text=CopyTextButton(text=otp_sample))])
+        else:
+            kb.append([InlineKeyboardButton(f"🔐 {otp_sample}", callback_data=f"copy_num_{otp_sample}")])
+
+    kb.append([
+        InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'short' else ''}⚡ Short (Without View)", callback_data="fmt_set_short"),
+        InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'long' else ''}📜 Long (With View)", callback_data="fmt_set_long"),
+    ])
+    kb.append([
+        InlineKeyboardButton("📺 Preview Short", callback_data="fmt_preview_short"),
+        InlineKeyboardButton("📺 Preview Long", callback_data="fmt_preview_long"),
+    ])
+    kb.append([
+        InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")
+    ])
+
+    return msg, InlineKeyboardMarkup(kb)
+
+async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command /format or /preview to manage SMS format and view live preview."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if update.message:
+            await update.message.reply_text("⛔ <b>Access Restricted</b>: Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    if context and context.args:
+        arg = context.args[0].strip().lower()
+        if arg in ("short", "off", "clean"):
+            set_view_full_sms_enabled(False)
+            if gist_storage.enabled:
+                gist_storage.mark_dirty()
+            if update.message:
+                await update.message.reply_text(
+                    "✅ <b>SMS Delivery Format Updated!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "• <b>Active Mode:</b> <code>Short ⚡ (Without View Full SMS)</code>\n"
+                    "• <b>Expandable Blockquote:</b> <code>Removed</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            return
+        elif arg in ("long", "on", "full"):
+            set_view_full_sms_enabled(True)
+            if gist_storage.enabled:
+                gist_storage.mark_dirty()
+            if update.message:
+                await update.message.reply_text(
+                    "✅ <b>SMS Delivery Format Updated!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "• <b>Active Mode:</b> <code>Long 📜 (With View Full SMS)</code>\n"
+                    "• <b>Expandable Blockquote:</b> <code>Active</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            return
+
+    text, markup = build_sms_format_view()
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
 def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     stats = get_system_stats()
     current_bot_name = get_bot_name()
@@ -4425,6 +4544,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(f"📩 Full SMS: {'ON ✅' if is_view_full_sms_enabled() else 'OFF ❌'}", callback_data="toggle_view_full_sms"),
         ],
         [
+            InlineKeyboardButton("👁️ SMS Format & Preview", callback_data="admin_sms_format_menu"),
+            InlineKeyboardButton("🧹 Clear History", callback_data="admin_clear_otp_history"),
+        ],
+        [
             InlineKeyboardButton("➕ Add Numbers", callback_data="admin_upload_prompt"),
             InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
         ],
@@ -4441,12 +4564,11 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
         [
-            InlineKeyboardButton("🧹 Clear History", callback_data="admin_clear_otp_history"),
-            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt")
+            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
+            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash")
         ],
         [
             InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt"),
-            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash")
         ],
     ])
     return admin_text, keyboard
@@ -4781,6 +4903,56 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await addadmin_command(update, context)
 
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command /removeuser <id> to permanently delete a user and their delivery records."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if update.message:
+            await update.message.reply_text("⛔ <b>Access Restricted</b>: Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    arg = ""
+    if context and context.args:
+        arg = context.args[0].strip()
+    elif update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            arg = parts[1].strip()
+
+    if not arg or not arg.isdigit():
+        await update.message.reply_text(
+            "<b>Usage:</b> <code>/removeuser &lt;user_id&gt;</code>\n"
+            "<i>Permanently deletes the user and their delivery records from the database.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target_id = int(arg)
+    if target_id in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ Cannot remove Super Admin defined in environment variables.", parse_mode=ParseMode.HTML)
+        return
+
+    u = get_user_details(target_id)
+    uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
+    consumed = u.get("numbers_consumed", 0) if u else 0
+
+    res = delete_user(target_id)
+    if res and (res.get("deleted_user") or res.get("user_existed")):
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>User Removed Successfully</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Removed User ID:</b> <code>{target_id}</code>\n"
+            f"📛 <b>Name:</b> <code>{html.escape(uname)}</code>\n"
+            f"🔢 <b>Numbers Consumed:</b> <code>{consumed}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗑️ <i>User account and delivery records have been permanently purged from the database.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(f"⚠️ User <code>{target_id}</code> was not found in the database.", parse_mode=ParseMode.HTML)
+
 async def perform_zero_restart_handover(target_message):
     """Executes the clean zero-restart session handover for Number Bot."""
     try:
@@ -5092,6 +5264,66 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     return
 
                 await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+                return
+
+        if admin_state and admin_state.get("awaiting_user_remove"):
+            clean_text = text.strip()
+            custom_btn_texts = [cb["text"] for cb in get_custom_link_buttons()]
+            if clean_text.startswith("/") or clean_text in [
+                "⚡ Get Number", "🔒 Secret Numbers", "👤 My Account", "👑 Admin Panel",
+                "⚡ get number", "🔒 secret numbers", "👤 my account", "👑 admin panel"
+            ] or clean_text in custom_btn_texts:
+                del admin_state["awaiting_user_remove"]
+            else:
+                del admin_state["awaiting_user_remove"]
+                if not clean_text.isdigit():
+                    await update.message.reply_text(
+                        "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🗑️ Try Again", callback_data="admin_remove_user_prompt")],
+                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                        ])
+                    )
+                    return
+
+                target_uid = int(clean_text)
+                if target_uid in ADMIN_USER_IDS:
+                    await update.message.reply_text("⛔ Cannot remove Super Admin defined in environment variables.", parse_mode=ParseMode.HTML)
+                    return
+
+                u = get_user_details(target_uid)
+                if not u:
+                    await update.message.reply_text(
+                        f"⚠️ <b>User Not Found:</b>\n"
+                        f"No account record found for ID: <code>{target_uid}</code>.\n\n"
+                        f"<i>The user has not joined or started the bot yet.</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🗑️ Try Another ID", callback_data="admin_remove_user_prompt")],
+                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                        ])
+                    )
+                    return
+
+                uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
+                confirm_text = (
+                    f"⚠️ <b>Confirm User Removal</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
+                    f"📛 <b>Name:</b> <code>{html.escape(u.get('first_name') or 'N/A')}</code>\n"
+                    f"🔗 <b>Username:</b> {uname}\n"
+                    f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🗑️ <b>This will permanently delete this user, their history, and their delivery log from the database.</b>\n\n"
+                    f"<i>Are you sure? This action cannot be undone!</i>"
+                )
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑️ Yes, Permanently Remove User", callback_data=f"u_del_do_{target_uid}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_uid}")]
+                ])
+                await update.message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
                 return
 
         # Direct User ID lookup if admin sends an Account ID directly in chat
@@ -6245,6 +6477,52 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
+    elif data == "admin_sms_format_menu" and user_admin:
+        text_view, markup = build_sms_format_view()
+        await query.answer()
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_set_short" and user_admin:
+        set_view_full_sms_enabled(False)
+        if gist_storage.enabled:
+            gist_storage.mark_dirty()
+        await query.answer("SMS Format set to Short ⚡ (Without View Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="short")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_set_long" and user_admin:
+        set_view_full_sms_enabled(True)
+        if gist_storage.enabled:
+            gist_storage.mark_dirty()
+        await query.answer("SMS Format set to Long 📜 (With View Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="long")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_preview_short" and user_admin:
+        await query.answer("Previewing Short Format (Without View Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="short")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_preview_long" and user_admin:
+        await query.answer("Previewing Long Format (With View Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="long")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
     elif data == "admin_clear_otp_history" and user_admin:
         cleared_cnt = clear_otp_history(max_age_hours=0)
         await query.answer(f"🧹 Cleared {cleared_cnt} OTP records from history!", show_alert=True)
@@ -6721,6 +6999,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         buttons = [
             [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
+            [InlineKeyboardButton("🗑️ Remove User by ID", callback_data="admin_remove_user_prompt")],
             [InlineKeyboardButton("📋 Browse Users List", callback_data="page_users_0")],
             [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
         ]
@@ -6736,6 +7015,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<i>Example: <code>8751050958</code></i>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>You can also search directly anytime by typing <code>/user &lt;id&gt;</code></i>"
+        )
+        await query.edit_message_text(
+            prompt_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_users")]
+            ])
+        )
+        return
+
+    # 9a-2. Remove User by ID Prompt
+    elif data == "admin_remove_user_prompt" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_user_remove": True}
+        prompt_text = (
+            f"🗑️ <b>Remove User by Account ID:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Please type the numerical Telegram <b>Account ID</b> to permanently remove from the database:\n\n"
+            f"<i>Example: <code>8751050958</code></i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>Tip: You can also remove directly anytime by typing <code>/removeuser &lt;id&gt;</code></i>"
         )
         await query.edit_message_text(
             prompt_text,
@@ -6825,6 +7124,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
             [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
             [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
+            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("🔍 Search Another User", callback_data="admin_search_user_prompt")],
             [InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
@@ -6950,10 +7250,77 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton(toggle_label, callback_data=f"u_toggle_sec_{target_id}")],
             [InlineKeyboardButton(ban_btn_label, callback_data=f"u_toggle_ban_{target_id}")],
             [InlineKeyboardButton("💬 Send Message to User", callback_data=f"bcast_prompt_user_{target_id}")],
+            [InlineKeyboardButton("🗑️ Remove User", callback_data=f"u_del_confirm_{target_id}")],
             [InlineKeyboardButton("👥 Back to Users List", callback_data="admin_users")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 9d. Confirm User Removal
+    elif data.startswith("u_del_confirm_") and user_admin:
+        target_id = int(data.split("_")[3])
+        if target_id in ADMIN_USER_IDS:
+            await query.answer("⛔ Cannot remove Super Admin defined in environment.", show_alert=True)
+            return
+        u = get_user_details(target_id)
+        if not u:
+            await query.answer("⚠️ User not found in database.", show_alert=True)
+            return
+        uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
+        confirm_text = (
+            f"⚠️ <b>Confirm User Removal</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>User ID:</b> <code>{u['user_id']}</code>\n"
+            f"📛 <b>Name:</b> <code>{html.escape(u.get('first_name') or 'N/A')}</code>\n"
+            f"🔗 <b>Username:</b> {uname}\n"
+            f"🔢 <b>Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗑️ <b>This will permanently delete this user, their history, and their delivery log from the database.</b>\n\n"
+            f"<i>Are you sure? This action cannot be undone!</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Yes, Permanently Remove User", callback_data=f"u_del_do_{target_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_id}")]
+        ])
+        await query.edit_message_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    # 9e. Execute User Removal
+    elif data.startswith("u_del_do_") and user_admin:
+        target_id = int(data.split("_")[3])
+        if target_id in ADMIN_USER_IDS:
+            await query.answer("⛔ Cannot remove Super Admin.", show_alert=True)
+            return
+        u = get_user_details(target_id)
+        uname = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(target_id))
+        consumed = u.get("numbers_consumed", 0) if u else 0
+
+        res = delete_user(target_id)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+
+        if res and (res.get("deleted_user") or res.get("user_existed")):
+            await query.answer("🗑️ User permanently removed!", show_alert=True)
+            result_text = (
+                f"✅ <b>User Removed Successfully</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 <b>Removed User ID:</b> <code>{target_id}</code>\n"
+                f"📛 <b>Name:</b> <code>{html.escape(uname)}</code>\n"
+                f"🔢 <b>Numbers They Consumed:</b> <code>{consumed}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🗑️ <i>User account, logs, and permissions have been permanently purged from the database.</i>"
+            )
+        else:
+            await query.answer("⚠️ User not found or already deleted.", show_alert=True)
+            result_text = (
+                f"⚠️ <b>User Not Found</b>\n"
+                f"<i>User <code>{target_id}</code> was not found in the database.</i>"
+            )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await query.edit_message_text(result_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     # Broadcast Hub Menu
     elif data == "admin_broadcast_menu" and user_admin:
@@ -7975,6 +8342,7 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("adduser", adduser_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler(["removeuser", "deleteuser"], removeuser_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setlink", setlink_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removelink", removelink_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setbtnurl", setbtnurl_command, filters=filters.ChatType.PRIVATE))
@@ -8005,6 +8373,7 @@ def main():
     app.add_handler(CommandHandler("sendto", sendto_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("recall", recall_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("delbroadcast", recall_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler(["format", "preview"], format_command, filters=filters.ChatType.PRIVATE))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, handle_document_upload))

@@ -2839,10 +2839,10 @@ def format_inbox_otp_message(
 
     lines = [
         f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
+        CARD_DIVIDER,
         c_display,
         f"📱 <b>{html.escape(num_display)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
+        CARD_DIVIDER,
     ]
 
     if show_full_sms and raw_message:

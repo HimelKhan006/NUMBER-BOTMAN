@@ -2765,32 +2765,13 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
     return "SMS Service", "🏷️"
 
 def format_phone_for_card(raw_num: str) -> str:
-    """Formats phone number with grouped spacing so Telegram never auto-links it as a blue phone call link."""
+    """Formats phone number cleanly without internal spaces."""
     clean = str(raw_num or "").strip()
     has_plus = clean.startswith("+")
     prefix_char = "+" if has_plus else ""
     digits = re.sub(r"\D", "", clean)
     if not digits:
         return clean
-    found_prefix = ""
-    for p_len in [4, 3, 2, 1]:
-        cand = digits[:p_len]
-        if cand in PREFIX_ISO_MAP and len(digits) > p_len:
-            found_prefix = cand
-            break
-    if found_prefix:
-        rest = digits[len(found_prefix):]
-        if len(rest) >= 10:
-            rest_fmt = f"{rest[:3]} {rest[3:7]} {rest[7:]}"
-        elif len(rest) >= 7:
-            rest_fmt = f"{rest[:3]} {rest[3:6]} {rest[6:]}"
-        elif len(rest) >= 4:
-            rest_fmt = f"{rest[:3]} {rest[3:]}"
-        else:
-            rest_fmt = rest
-        return f"{prefix_char}{found_prefix} {rest_fmt}"
-    elif len(digits) >= 10:
-        return f"{prefix_char}{digits[:3]} {digits[3:6]} {digits[6:]}"
     return f"{prefix_char}{digits}"
 
 def format_inbox_otp_message(
@@ -2837,7 +2818,8 @@ def format_inbox_otp_message(
 
     lines = [
         f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>  {country_part}",
-        f"📱 <b>{html.escape(num_display)}</b>",
+        "",
+        f"<b>{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
@@ -3786,15 +3768,16 @@ def format_delivered_numbers(
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery text with country and available numbers."""
+    """Builds clean, professional delivery confirmation text matching user examples (no broken divider line)."""
     display_cname = country_name.strip()
 
     lines = [
-        f"<b>{html.escape(display_cname)}</b>",
+        f"<b>{html.escape(display_cname)} Allocated</b>  🏷️ <b>WhatsApp</b>",
+        "",
+        "🕒 <b>Waiting for OTP...</b> ⏳",
     ]
-    if available_count is not None:
-        lines.append(f"<b>Available:</b> {available_count} numbers")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if available_count is not None and available_count > 0:
+        lines.append(f"📦 <i>Available: {available_count} numbers</i>")
 
     return "\n".join(lines)
 
@@ -3969,20 +3952,28 @@ def get_numbers_view_keyboard(
 
     btn_rows = []
 
-    # One-tap copy button for each number
+    c_info = get_country_by_id(country_id)
+    c_flag = ""
+    if c_info and c_info.get("name"):
+        c_parts = c_info["name"].strip().split(maxsplit=1)
+        if c_parts:
+            c_flag = c_parts[0] if len(c_parts[0]) <= 4 else ""
+
+    # One-tap copy button for each number (with country flag prefix matching user examples)
     if numbers:
         for n in numbers:
             clean = _clean_number(n, with_plus)
+            btn_label = f"{c_flag} {clean}".strip() if c_flag else clean
             if CopyTextButton is not None:
                 btn_rows.append([
                     InlineKeyboardButton(
-                        clean,
+                        btn_label,
                         copy_text=CopyTextButton(text=clean)
                     )
                 ])
             else:
                 btn_rows.append([
-                    InlineKeyboardButton(clean, callback_data=f"copy_num_{country_id}")
+                    InlineKeyboardButton(btn_label, callback_data=f"copy_num_{country_id}")
                 ])
 
     # Custom link buttons placed at top of Next and Change buttons (side-by-side)

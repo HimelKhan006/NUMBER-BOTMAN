@@ -2764,6 +2764,33 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
 
     return "SMS Service", "🏷️"
 
+def format_phone_for_card(raw_num: str) -> str:
+    """Formats phone number with grouped spacing so Telegram never auto-links it as a blue phone call link."""
+    clean = str(raw_num or "").strip()
+    digits = re.sub(r"\D", "", clean)
+    if not digits:
+        return clean
+    found_prefix = ""
+    for p_len in [4, 3, 2, 1]:
+        cand = digits[:p_len]
+        if cand in PREFIX_ISO_MAP and len(digits) > p_len:
+            found_prefix = cand
+            break
+    if found_prefix:
+        rest = digits[len(found_prefix):]
+        if len(rest) >= 10:
+            rest_fmt = f"{rest[:3]} {rest[3:7]} {rest[7:]}"
+        elif len(rest) >= 7:
+            rest_fmt = f"{rest[:3]} {rest[3:6]} {rest[6:]}"
+        elif len(rest) >= 4:
+            rest_fmt = f"{rest[:3]} {rest[3:]}"
+        else:
+            rest_fmt = rest
+        return f"+{found_prefix} {rest_fmt}"
+    elif len(digits) >= 10:
+        return f"+{digits[:3]} {digits[3:6]} {digits[6:]}"
+    return f"+{digits}"
+
 def format_inbox_otp_message(
     service: str,
     country_name: str,
@@ -2772,20 +2799,20 @@ def format_inbox_otp_message(
     otp_code: str,
     raw_message: str,
     show_full_sms: bool = True,
-    service_icon: Optional[str] = None
+    service_icon: Optional[str] = None,
+    country_iso: str = ""
 ) -> str:
     """
-    Formats the clean, simple inbox OTP card directly matching user screenshot:
+    Formats the Option 1 Clean Minimalist Pass inbox OTP card:
     - Service name with 🏷️ icon matching OTP bot
     - Divider line
-    - Flag + Country name
-    - Fully unmasked phone number (bold text, NOT copyable code)
-    - (No Reward / Balance lines)
+    - Country with flag emoji and country ISO: 🇩🇪 Germany (DE) matching OTP bot
+    - Number with 📱 icon, non-copyable bold text, formatted to prevent blue phone link
+    - Divider line
+    - No Passcode line on card (passcode is ONLY on the button below)
     - Optional expandable 'View Full SMS' blockquote if enabled
     """
-    num_clean = str(unmasked_number or "").strip()
-    digits = re.sub(r"\D", "", num_clean)
-    num_display = f"+{digits}" if digits else num_clean
+    num_display = format_phone_for_card(unmasked_number)
 
     if not service_icon:
         _, detected_icon = detect_service_and_icon(service, raw_message)
@@ -2793,12 +2820,29 @@ def format_inbox_otp_message(
 
     c_flag = country_flag or "🌐"
     c_name = country_name or "Global"
+    iso_clean = (country_iso or "").strip().upper()
+
+    if not iso_clean and c_name:
+        for code, name in ISO_TO_COUNTRY_NAME.items():
+            if name.lower() == c_name.lower():
+                iso_clean = code
+                break
+
+    if iso_clean and iso_clean != "XX" and c_name and c_name != "Global":
+        c_display = f"{c_flag} <b>{html.escape(c_name)} ({iso_clean})</b>"
+    elif c_name and c_name != "Global":
+        c_display = f"{c_flag} <b>{html.escape(c_name)}</b>"
+    elif iso_clean and iso_clean != "XX":
+        c_display = f"{c_flag} <b>{iso_clean}</b>"
+    else:
+        c_display = f"{c_flag} <b>Global</b>"
 
     lines = [
         f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"{c_flag} <b>{html.escape(c_name)}</b>",
-        f"<b>{html.escape(num_display)}</b>",
+        c_display,
+        f"📱 <b>{html.escape(num_display)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
 
     if show_full_sms and raw_message:
@@ -3136,6 +3180,7 @@ async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
             raw_message=raw_msg,
             show_full_sms=full_sms_enabled,
             service_icon=service_icon,
+            country_iso=iso,
         )
         inbox_kb = build_otp_button_row(otp_code)
         try:
@@ -4643,7 +4688,8 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
             unmasked_number="+84987938835",
             otp_code=otp_sample,
             raw_message=sample_sms,
-            show_full_sms=False
+            show_full_sms=False,
+            country_iso="VN",
         )
         msg += (
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -4659,7 +4705,8 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
             unmasked_number="+84987938835",
             otp_code=otp_sample,
             raw_message=sample_sms,
-            show_full_sms=True
+            show_full_sms=True,
+            country_iso="VN",
         )
         msg += (
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -4673,9 +4720,9 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     kb = []
     if preview_mode in ("short", "long"):
         if CopyTextButton:
-            kb.append([InlineKeyboardButton(f"🔐 {otp_sample}  📋", copy_text=CopyTextButton(text=otp_sample))])
+            kb.append([InlineKeyboardButton(otp_sample, copy_text=CopyTextButton(text=otp_sample))])
         else:
-            kb.append([InlineKeyboardButton(f"🔐 {otp_sample}", callback_data=f"copy_num_{otp_sample}")])
+            kb.append([InlineKeyboardButton(f"🔑 {otp_sample}", callback_data=f"copy_num_{otp_sample}")])
 
     kb.append([
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'short' else ''}⚡ Short (Without View)", callback_data="fmt_set_short"),

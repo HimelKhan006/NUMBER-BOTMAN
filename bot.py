@@ -2783,15 +2783,6 @@ def format_phone_for_card(raw_num: str) -> str:
         chunks.append(digits[i:i+chunk_size])
     return prefix_char + "\u200c".join(chunks)
 
-def get_centered_number_line(num_display: str) -> str:
-    """Calculates optical centering for the number line using Unicode braille whitespace."""
-    vis_len = len(num_display.replace("\u200c", ""))
-    content_width = 3 + vis_len  # 📱 (2) + space (1) + number
-    target_center = 22
-    pad_count = max(1, (target_center - content_width) // 2)
-    padding = "\u2800" * pad_count
-    return f"{padding}📱 <b>{num_display}</b>"
-
 def format_inbox_otp_message(
     service: str,
     country_name: str,
@@ -2806,7 +2797,7 @@ def format_inbox_otp_message(
     """
     Formats the Ultra-Minimalist inbox OTP card:
     - Service name with 🏷️ icon, country flag & ISO on the side at top: 🏷️ WhatsApp  🇳🇬 NG
-    - Number with 📱 icon centered, non-copyable bold text, never turning blue
+    - Number with 📱 icon, non-copyable bold text, never turning blue
     - No divider bars (Ultra-Minimalist)
     - Passcode ONLY on the copy button below
     - Optional expandable 'View Full SMS' blockquote if enabled
@@ -2834,11 +2825,10 @@ def format_inbox_otp_message(
     else:
         country_part = f"{c_flag}"
 
-    number_line = get_centered_number_line(num_display)
     lines = [
         f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>  {country_part}",
         "",
-        number_line,
+        f"📱 <b>{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
@@ -3781,24 +3771,21 @@ def get_country_available_count(country_id: int, is_secret: bool = False) -> int
     except Exception:
         return 0
 
-def clean_country_display_name(cname: str) -> str:
-    """Strips leading emoji/flags from country name for clean delivery header."""
-    s = (cname or "").strip()
-    cleaned = re.sub(r"^[\U00010000-\U0010ffff\u2600-\u27bf\s]+", "", s).strip()
-    return cleaned if cleaned else s
-
 def format_delivered_numbers(
     numbers: List[str],
     country_name: str,
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery confirmation header matching user instructions."""
-    display_cname = clean_country_display_name(country_name)
+    """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
+    display_cname = format_country_name(country_name)
     lines = [
         f"<b>{html.escape(display_cname)} Allocated For You</b>",
-        CARD_DIVIDER,
+        "🕒 <b>Waiting for OTP...</b> ⏳",
     ]
+    if available_count is not None and available_count > 0:
+        lines.append(f"📦 <b>Available:</b> {available_count} numbers")
+    lines.append(CARD_DIVIDER)
     return "\n".join(lines)
 
 def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -> str:

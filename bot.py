@@ -3790,7 +3790,7 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_select_country_text(secret_mode: bool = False) -> str:
     """Builds professional full-width header for Select Country message."""
-    divider = "━" * 28
+    divider = "━" * 22
     if secret_mode:
         return f"🔒 <b>Secret Numbers Pool:</b>\n{divider}"
     return f"🌍 <b>Select Country:</b>\n{divider}"

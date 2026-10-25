@@ -1135,22 +1135,34 @@ CONSUMED_NUMBERS_CACHE: Set[str] = set()
 
 def load_consumed_cache():
     global CONSUMED_NUMBERS_CACHE
-    if not os.path.exists(STOCKS_DIR):
-        return
     count = 0
-    for fname in os.listdir(STOCKS_DIR):
-        if fname.startswith("country_") and fname.endswith(".db"):
-            c_path = os.path.join(STOCKS_DIR, fname)
-            try:
-                with sqlite3.connect(c_path, timeout=10.0) as conn:
-                    cur = conn.execute("SELECT number FROM used_numbers;")
-                    for row in cur.fetchall():
-                        num = str(row[0]).strip()
-                        if num:
-                            CONSUMED_NUMBERS_CACHE.add(num)
-                            count += 1
-            except Exception as e:
-                logger.warning(f"Error reading cache from {fname}: {e}")
+    # 1. Load from main_db user_claimed_numbers table
+    try:
+        with get_main_db() as mconn:
+            cur = mconn.execute("SELECT number FROM user_claimed_numbers;")
+            for row in cur.fetchall():
+                num = sanitize_phone_number(str(row[0]))
+                if num:
+                    CONSUMED_NUMBERS_CACHE.add(num)
+                    count += 1
+    except Exception as e:
+        logger.warning(f"Error reading user_claimed_numbers for cache: {e}")
+
+    # 2. Load from each country db used_numbers table
+    if os.path.exists(STOCKS_DIR):
+        for fname in os.listdir(STOCKS_DIR):
+            if fname.startswith("country_") and fname.endswith(".db"):
+                c_path = os.path.join(STOCKS_DIR, fname)
+                try:
+                    with sqlite3.connect(c_path, timeout=10.0) as conn:
+                        cur = conn.execute("SELECT number FROM used_numbers;")
+                        for row in cur.fetchall():
+                            num = sanitize_phone_number(str(row[0]))
+                            if num:
+                                CONSUMED_NUMBERS_CACHE.add(num)
+                                count += 1
+                except Exception as e:
+                    logger.warning(f"Error reading cache from {fname}: {e}")
     logger.info(f"Loaded {count} previously consumed numbers into memory cache.")
 
 def get_or_create_country(country_name: str) -> int:
@@ -1243,6 +1255,10 @@ def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool 
             if not num:
                 continue
             if num in CONSUMED_NUMBERS_CACHE:
+                duplicates += 1
+                continue
+            if conn.execute("SELECT 1 FROM used_numbers WHERE number = ? LIMIT 1;", (num,)).fetchone():
+                CONSUMED_NUMBERS_CACHE.add(num)
                 duplicates += 1
                 continue
             try:
@@ -1373,6 +1389,14 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
             mconn.commit()
     except Exception as e:
         logger.warning(f"Error logging delivery: {e}")
+
+    if "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.create_task(gist_storage.export_and_sync(immediate=True))
+        except Exception:
+            gist_storage.mark_dirty()
 
     return numbers, remaining, country_name
 
@@ -3614,6 +3638,9 @@ class GistStorage:
                             if isinstance(c_stock, dict):
                                 std_nums = c_stock.get("standard", [])
                                 sec_nums = c_stock.get("secret", [])
+                                # Strictly exclude any number that was already consumed
+                                std_nums = [n for n in std_nums if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
+                                sec_nums = [n for n in sec_nums if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
                                 if std_nums:
                                     added_std, _ = add_numbers_to_country(cid, std_nums, is_secret=False)
                                     total_std_restored += added_std
@@ -3621,8 +3648,10 @@ class GistStorage:
                                     added_sec, _ = add_numbers_to_country(cid, sec_nums, is_secret=True)
                                     total_sec_restored += added_sec
                             elif isinstance(c_stock, list):
-                                added, _ = add_numbers_to_country(cid, c_stock, is_secret=False)
-                                total_std_restored += added
+                                valid_nums = [n for n in c_stock if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
+                                if valid_nums:
+                                    added, _ = add_numbers_to_country(cid, valid_nums, is_secret=False)
+                                    total_std_restored += added
 
                         logger.info(
                             f"☁️ Restored {len(users_data)} users, "
@@ -3773,6 +3802,7 @@ def format_delivered_numbers(
     display_cname = format_country_name(country_name)
     lines = [
         f"<b>{html.escape(display_cname)} Allocated For You</b>",
+        "",
         "🕒 <b>Waiting for OTP...</b> ⏳",
     ]
     if available_count is not None and available_count > 0:
@@ -6318,7 +6348,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 return
 
             if gist_storage.enabled:
-                gist_storage.mark_dirty()
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             pref_plus = get_user_plus_preference(user.id)
             response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
@@ -6388,7 +6418,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 return
 
             if gist_storage.enabled:
-                gist_storage.mark_dirty()
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             pref_plus = get_user_plus_preference(user.id)
             response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
@@ -8308,7 +8338,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         await query.answer("⚡ Number delivered successfully!")
         if gist_storage.enabled:
-            gist_storage.mark_dirty()
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
         pref_plus = get_user_plus_preference(user.id)
         response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)

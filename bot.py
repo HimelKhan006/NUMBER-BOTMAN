@@ -7283,7 +7283,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if nav_row:
             buttons.append(nav_row)
 
-        buttons.append([InlineKeyboardButton("📄 Remove Specific Numbers (.txt)", callback_data="admin_remove_prompt")])
         buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")] )
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 

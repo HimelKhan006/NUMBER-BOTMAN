@@ -2631,7 +2631,7 @@ def get_otp_stats(max_age_hours: int = 28) -> Tuple[int, int, Dict[str, int]]:
 def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service: str = "") -> Tuple[str, str]:
     """
     Intelligently identifies the originating service (WhatsApp, Telegram, Google, Facebook, etc.)
-    and returns (service_name, icon). Directly matching OTP bot logic.
+    and returns (service_name, icon). Service icon is '🏷️' matching OTP bot.
     """
     low_src = (raw_source or "").lower()
     low_msg = (raw_message or "").lower()
@@ -2640,129 +2640,129 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
     # WhatsApp
     wa_keys = ["whatsapp", "‏واتساب‏", "واتساب", "ватсап", "wa code", "wa.me"]
     if any(k in low_src for k in ["whatsapp", "wa.me"]) or any(k in low_msg for k in wa_keys) or "whatsapp" in low_fb:
-        return "WhatsApp", "💬"
+        return "WhatsApp", "🏷️"
 
     # Telegram
     tg_keys = ["telegram", "telegram code", "t.me"]
     if any(k in low_src for k in ["telegram", "t.me"]) or any(k in low_msg for k in tg_keys) or "telegram" in low_fb:
-        return "Telegram", "✈️"
+        return "Telegram", "🏷️"
 
     # Facebook / Meta
     fb_keys = ["facebook", "meta", "fb code", "fb.me"]
     if any(k in low_src for k in ["facebook", "meta"]) or any(k in low_msg for k in fb_keys) or "facebook" in low_fb:
-        return "Facebook", "🔵"
+        return "Facebook", "🏷️"
 
     # Instagram
     ig_keys = ["instagram", "ig code"]
     if "instagram" in low_src or any(k in low_msg for k in ig_keys) or "instagram" in low_fb:
-        return "Instagram", "📸"
+        return "Instagram", "🏷️"
 
     # Google
     if "google" in low_src or "google" in low_msg or (raw_message or "").strip().startswith("G-") or "google" in low_fb:
-        return "Google", "🔍"
+        return "Google", "🏷️"
 
     # TikTok
     if "tiktok" in low_src or "tiktok" in low_msg or "bytedance" in low_msg or "tiktok" in low_fb:
-        return "TikTok", "🎵"
+        return "TikTok", "🏷️"
 
     # Twitter / X
     if "twitter" in low_src or "twitter" in low_msg or "x.com" in low_msg or "twitter" in low_fb:
-        return "Twitter (X)", "🐦"
+        return "Twitter (X)", "🏷️"
 
     # Snapchat
     if "snapchat" in low_src or "snapchat" in low_msg or "snap code" in low_msg:
-        return "Snapchat", "👻"
+        return "Snapchat", "🏷️"
 
     # Apple
     if "apple" in low_src or "apple" in low_msg or "icloud" in low_msg:
-        return "Apple", "🍎"
+        return "Apple", "🏷️"
 
     # Microsoft
     if "microsoft" in low_src or "microsoft" in low_msg or "live.com" in low_msg or "msft" in low_msg:
-        return "Microsoft", "💻"
+        return "Microsoft", "🏷️"
 
     # Binance / Crypto
     if "binance" in low_src or "binance" in low_msg:
-        return "Binance", "🪙"
+        return "Binance", "🏷️"
 
     # PayPal
     if "paypal" in low_src or "paypal" in low_msg:
-        return "PayPal", "💳"
+        return "PayPal", "🏷️"
 
     # Uber
     if "uber" in low_src or "uber" in low_msg:
-        return "Uber", "🚗"
+        return "Uber", "🏷️"
 
     # Netflix
     if "netflix" in low_src or "netflix" in low_msg:
-        return "Netflix", "🎬"
+        return "Netflix", "🏷️"
 
     # Discord
     if "discord" in low_src or "discord" in low_msg:
-        return "Discord", "🎮"
+        return "Discord", "🏷️"
 
     # IMO
     if "imo" in low_src or "imo" in low_msg:
-        return "IMO", "🟢"
+        return "IMO", "🏷️"
 
     # Viber
     if "viber" in low_src or "viber" in low_msg:
-        return "Viber", "💜"
+        return "Viber", "🏷️"
 
     # Signal
     if "signal" in low_src or "signal" in low_msg:
-        return "Signal", "🔒"
+        return "Signal", "🏷️"
 
     # Amazon
     if "amazon" in low_src or "amazon" in low_msg:
-        return "Amazon", "📦"
+        return "Amazon", "🏷️"
 
     # Line
     if "line" in low_src or "line" in low_msg:
-        return "LINE", "🟢"
+        return "LINE", "🏷️"
 
     # Tinder
     if "tinder" in low_src or "tinder" in low_msg:
-        return "Tinder", "🔥"
+        return "Tinder", "🏷️"
 
     # Steam
     if "steam" in low_src or "steam" in low_msg:
-        return "Steam", "🎮"
+        return "Steam", "🏷️"
 
     # LinkedIn
     if "linkedin" in low_src or "linkedin" in low_msg:
-        return "LinkedIn", "💼"
+        return "LinkedIn", "🏷️"
 
     # Reddit
     if "reddit" in low_src or "reddit" in low_msg:
-        return "Reddit", "🤖"
+        return "Reddit", "🏷️"
 
     # VK / VKontakte
     if "vk.com" in low_src or "vkontakte" in low_msg or low_src == "vk":
-        return "VK", "🔷"
+        return "VK", "🏷️"
 
     # eBay
     if "ebay" in low_src or "ebay" in low_msg:
-        return "eBay", "🛍️"
+        return "eBay", "🏷️"
 
     # OpenAI / ChatGPT
     if "openai" in low_src or "openai" in low_msg or "chatgpt" in low_msg:
-        return "OpenAI", "🤖"
+        return "OpenAI", "🏷️"
 
     # Yahoo
     if "yahoo" in low_src or "yahoo" in low_msg:
-        return "Yahoo", "🟣"
+        return "Yahoo", "🏷️"
 
     # Twitch
     if "twitch" in low_src or "twitch" in low_msg:
-        return "Twitch", "🟣"
+        return "Twitch", "🏷️"
 
     # Clean fallback
     cand = raw_source or fallback_service or ""
     if cand and not cand.isdigit() and len(cand) > 1 and cand.lower() != "sms service":
         return cand.title(), "🏷️"
 
-    return "SMS Service", "💬"
+    return "SMS Service", "🏷️"
 
 def format_inbox_otp_message(
     service: str,
@@ -2776,7 +2776,7 @@ def format_inbox_otp_message(
 ) -> str:
     """
     Formats the clean, simple inbox OTP card directly matching user screenshot:
-    - Service name with dynamic icon
+    - Service name with 🏷️ icon matching OTP bot
     - Divider line
     - Flag + Country name
     - Fully unmasked phone number (bold text, NOT copyable code)
@@ -2789,7 +2789,7 @@ def format_inbox_otp_message(
 
     if not service_icon:
         _, detected_icon = detect_service_and_icon(service, raw_message)
-        service_icon = detected_icon or "💬"
+        service_icon = detected_icon or "🏷️"
 
     c_flag = country_flag or "🌐"
     c_name = country_name or "Global"

@@ -2767,6 +2767,8 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
 def format_phone_for_card(raw_num: str) -> str:
     """Formats phone number with grouped spacing so Telegram never auto-links it as a blue phone call link."""
     clean = str(raw_num or "").strip()
+    has_plus = clean.startswith("+")
+    prefix_char = "+" if has_plus else ""
     digits = re.sub(r"\D", "", clean)
     if not digits:
         return clean
@@ -2786,10 +2788,10 @@ def format_phone_for_card(raw_num: str) -> str:
             rest_fmt = f"{rest[:3]} {rest[3:]}"
         else:
             rest_fmt = rest
-        return f"+{found_prefix} {rest_fmt}"
+        return f"{prefix_char}{found_prefix} {rest_fmt}"
     elif len(digits) >= 10:
-        return f"+{digits[:3]} {digits[3:6]} {digits[6:]}"
-    return f"+{digits}"
+        return f"{prefix_char}{digits[:3]} {digits[3:6]} {digits[6:]}"
+    return f"{prefix_char}{digits}"
 
 def format_inbox_otp_message(
     service: str,
@@ -2803,13 +2805,11 @@ def format_inbox_otp_message(
     country_iso: str = ""
 ) -> str:
     """
-    Formats the Option 1 Clean Minimalist Pass inbox OTP card:
-    - Service name with 🏷️ icon matching OTP bot
-    - Divider line
-    - Country with flag emoji and country ISO: 🇩🇪 Germany (DE) matching OTP bot
-    - Number with 📱 icon, non-copyable bold text, formatted to prevent blue phone link
-    - Divider line
-    - No Passcode line on card (passcode is ONLY on the button below)
+    Formats the Ultra-Minimalist inbox OTP card:
+    - Service name with 🏷️ icon, country flag & #ISO on the side at top: 🏷️ WhatsApp  🇳🇬 #NG
+    - Number with 📱 icon at bottom, non-copyable bold text
+    - No divider bars (Ultra-Minimalist)
+    - Passcode ONLY on the copy button below
     - Optional expandable 'View Full SMS' blockquote if enabled
     """
     num_display = format_phone_for_card(unmasked_number)
@@ -2828,21 +2828,16 @@ def format_inbox_otp_message(
                 iso_clean = code
                 break
 
-    if iso_clean and iso_clean != "XX" and c_name and c_name != "Global":
-        c_display = f"{c_flag} <b>{html.escape(c_name)} ({iso_clean})</b>"
+    if iso_clean and iso_clean != "XX":
+        country_part = f"{c_flag} #{iso_clean}"
     elif c_name and c_name != "Global":
-        c_display = f"{c_flag} <b>{html.escape(c_name)}</b>"
-    elif iso_clean and iso_clean != "XX":
-        c_display = f"{c_flag} <b>{iso_clean}</b>"
+        country_part = f"{c_flag} {html.escape(c_name)}"
     else:
-        c_display = f"{c_flag} <b>Global</b>"
+        country_part = f"{c_flag}"
 
     lines = [
-        f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>",
-        CARD_DIVIDER,
-        c_display,
+        f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>  {country_part}",
         f"📱 <b>{html.escape(num_display)}</b>",
-        CARD_DIVIDER,
     ]
 
     if show_full_sms and raw_message:

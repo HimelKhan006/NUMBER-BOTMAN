@@ -2239,7 +2239,8 @@ def parse_message_timestamp(time_str: str) -> float:
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
 COLLAPSED_SMS_HINT = "\u2800" * 7 + "  " + "<b>Tap to read...</b>"
-CARD_DIVIDER = "━" * 23
+CARD_DIVIDER = "━" * 20
+QUOTE_DIVIDER = "━" * 16
 
 def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 28) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
@@ -2765,14 +2766,31 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
     return "SMS Service", "🏷️"
 
 def format_phone_for_card(raw_num: str) -> str:
-    """Formats phone number cleanly without internal spaces."""
+    """
+    Formats phone number cleanly without internal spaces,
+    inserting invisible Zero-Width Non-Joiner (\u200c) between digit chunks
+    so Telegram's client-side phone linkifier regex does NOT turn it blue.
+    """
     clean = str(raw_num or "").strip()
     has_plus = clean.startswith("+")
     prefix_char = "+" if has_plus else ""
     digits = re.sub(r"\D", "", clean)
     if not digits:
         return clean
-    return f"{prefix_char}{digits}"
+    chunks = []
+    chunk_size = 4
+    for i in range(0, len(digits), chunk_size):
+        chunks.append(digits[i:i+chunk_size])
+    return prefix_char + "\u200c".join(chunks)
+
+def get_centered_number_line(num_display: str) -> str:
+    """Calculates optical centering for the number line using Unicode braille whitespace."""
+    vis_len = len(num_display.replace("\u200c", ""))
+    content_width = 3 + vis_len  # 📱 (2) + space (1) + number
+    target_center = 22
+    pad_count = max(1, (target_center - content_width) // 2)
+    padding = "\u2800" * pad_count
+    return f"{padding}📱 <b>{num_display}</b>"
 
 def format_inbox_otp_message(
     service: str,
@@ -2787,8 +2805,8 @@ def format_inbox_otp_message(
 ) -> str:
     """
     Formats the Ultra-Minimalist inbox OTP card:
-    - Service name with 🏷️ icon, country flag & #ISO on the side at top: 🏷️ WhatsApp  🇳🇬 #NG
-    - Number with 📱 icon at bottom, non-copyable bold text
+    - Service name with 🏷️ icon, country flag & ISO on the side at top: 🏷️ WhatsApp  🇳🇬 NG
+    - Number with 📱 icon centered, non-copyable bold text, never turning blue
     - No divider bars (Ultra-Minimalist)
     - Passcode ONLY on the copy button below
     - Optional expandable 'View Full SMS' blockquote if enabled
@@ -2816,10 +2834,11 @@ def format_inbox_otp_message(
     else:
         country_part = f"{c_flag}"
 
+    number_line = get_centered_number_line(num_display)
     lines = [
         f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>  {country_part}",
         "",
-        f"<b>{html.escape(num_display)}</b>",
+        number_line,
     ]
 
     if show_full_sms and raw_message:
@@ -2830,7 +2849,7 @@ def format_inbox_otp_message(
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
-            f"{CARD_DIVIDER}\n"
+            f"{QUOTE_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
@@ -2889,7 +2908,7 @@ def format_group_otp_message(
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
-            f"{CARD_DIVIDER}\n"
+            f"{QUOTE_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
@@ -3762,23 +3781,24 @@ def get_country_available_count(country_id: int, is_secret: bool = False) -> int
     except Exception:
         return 0
 
+def clean_country_display_name(cname: str) -> str:
+    """Strips leading emoji/flags from country name for clean delivery header."""
+    s = (cname or "").strip()
+    cleaned = re.sub(r"^[\U00010000-\U0010ffff\u2600-\u27bf\s]+", "", s).strip()
+    return cleaned if cleaned else s
+
 def format_delivered_numbers(
     numbers: List[str],
     country_name: str,
     available_count: Optional[int] = None,
     with_plus: bool = True
 ) -> str:
-    """Builds clean, professional delivery confirmation text matching user examples (no broken divider line)."""
-    display_cname = country_name.strip()
-
+    """Builds clean, professional delivery confirmation header matching user instructions."""
+    display_cname = clean_country_display_name(country_name)
     lines = [
-        f"<b>{html.escape(display_cname)} Allocated</b>  🏷️ <b>WhatsApp</b>",
-        "",
-        "🕒 <b>Waiting for OTP...</b> ⏳",
+        f"<b>{html.escape(display_cname)} Allocated For You</b>",
+        CARD_DIVIDER,
     ]
-    if available_count is not None and available_count > 0:
-        lines.append(f"📦 <i>Available: {available_count} numbers</i>")
-
     return "\n".join(lines)
 
 def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -> str:
@@ -3792,14 +3812,8 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 def get_select_country_text(secret_mode: bool = False) -> str:
     """Builds professional full-width header for Select Country message."""
     if secret_mode:
-        return (
-            "🔒 <b>Secret Numbers Pool:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-    return (
-        "🌍 <b>Select Country:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+        return f"🔒 <b>Secret Numbers Pool:</b>\n{CARD_DIVIDER}"
+    return f"🌍 <b>Select Country:</b>\n{CARD_DIVIDER}"
 
 def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     """
@@ -3952,18 +3966,11 @@ def get_numbers_view_keyboard(
 
     btn_rows = []
 
-    c_info = get_country_by_id(country_id)
-    c_flag = ""
-    if c_info and c_info.get("name"):
-        c_parts = c_info["name"].strip().split(maxsplit=1)
-        if c_parts:
-            c_flag = c_parts[0] if len(c_parts[0]) <= 4 else ""
-
-    # One-tap copy button for each number (with country flag prefix matching user examples)
+    # One-tap copy button for each number (clean number without country flag)
     if numbers:
         for n in numbers:
             clean = _clean_number(n, with_plus)
-            btn_label = f"{c_flag} {clean}".strip() if c_flag else clean
+            btn_label = clean
             if CopyTextButton is not None:
                 btn_rows.append([
                     InlineKeyboardButton(

@@ -3806,6 +3806,7 @@ def format_delivered_numbers(
         "🕒 <b>Waiting for OTP...</b> ⏳",
     ]
     if available_count is not None and available_count > 0:
+        lines.append("")
         lines.append(f"📦 <b>Available:</b> {available_count} numbers")
     lines.append(CARD_DIVIDER)
     return "\n".join(lines)

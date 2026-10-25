@@ -45,6 +45,7 @@ jobs:
             bot4_database.db-wal
             bot4_database.db-shm
             country_stocks/
+            bot_data.json
             otp_group_link.txt
           key: bot4-database-persistent-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
@@ -232,6 +233,7 @@ jobs:
             bot4_database.db-wal
             bot4_database.db-shm
             country_stocks/
+            bot_data.json
             otp_group_link.txt
           key: bot4-database-persistent-${{ github.run_id }}-${{ github.run_attempt }}
 

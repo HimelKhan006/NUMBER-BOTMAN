@@ -981,6 +981,11 @@ def add_admin(user_id: int, added_by: int = 0, username: str = "", first_name: s
             """, (user_id, added_by, username or "", first_name or ""))
             conn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (user_id,))
             conn.commit()
+        if "gist_storage" in globals() and gist_storage.enabled:
+            try:
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"Error adding admin {user_id}: {e}")
@@ -995,6 +1000,11 @@ def remove_admin(user_id: int) -> bool:
             conn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (user_id,))
             conn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (user_id,))
             conn.commit()
+        if "gist_storage" in globals() and gist_storage.enabled:
+            try:
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"Error removing admin {user_id}: {e}")
@@ -1107,6 +1117,11 @@ def delete_user(user_id: int) -> Optional[Dict[str, Any]]:
 
         if result["user_existed"] or result["deleted_user"]:
             logger.info(f"🗑️ Successfully purged user {user_id}: {result}")
+            if "gist_storage" in globals() and gist_storage.enabled:
+                try:
+                    asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+                except Exception:
+                    pass
             return result
         return None
     except Exception as e:
@@ -1487,9 +1502,21 @@ def get_bot_setting(key: str, default: str = "") -> str:
         with get_main_db() as conn:
             row = conn.execute("SELECT value FROM bot_settings WHERE key = ?;", (key,)).fetchone()
             if row and row["value"] is not None:
-                return str(row["value"]).strip()
+                val = str(row["value"]).strip()
+                if val:
+                    return val
     except Exception as e:
         logger.debug(f"Error reading setting {key}: {e}")
+    # Fallback to local bot_data.json if DB has not populated yet
+    data_file = os.path.join(BASE_DIR, "bot_data.json")
+    if os.path.exists(data_file):
+        try:
+            with open(data_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if key in data and data[key] is not None:
+                    return str(data[key]).strip()
+        except Exception:
+            pass
     return default
 
 def set_bot_setting(key: str, value: str) -> bool:
@@ -1504,6 +1531,21 @@ def set_bot_setting(key: str, value: str) -> bool:
                 conn.execute("PRAGMA wal_checkpoint(FULL);")
             except Exception:
                 pass
+        # Also persist to local bot_data.json backup matching OTP Bot
+        try:
+            data_file = os.path.join(BASE_DIR, "bot_data.json")
+            data = {}
+            if os.path.exists(data_file):
+                try:
+                    with open(data_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            data[key] = str(value).strip()
+            with open(data_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
         return True
     except Exception as e:
         logger.warning(f"Error saving setting {key}: {e}")
@@ -1535,25 +1577,29 @@ def normalize_button_url(raw_url: str) -> Optional[str]:
 def get_custom_link_buttons() -> List[Dict[str, str]]:
     """
     Returns list of custom buttons for Number Bot: [{"id": "1", "text": "...", "url": "..."}, ...]
-    Backwards compatible with legacy group_link / otp_group_link.
+    Backwards compatible with legacy group_link / otp_group_link only if custom_link_buttons was never configured.
     """
     buttons = []
+    has_explicit_setting = False
     try:
-        raw_val = get_bot_setting("custom_link_buttons", "")
-        if raw_val:
-            parsed = json.loads(raw_val)
-            if isinstance(parsed, list):
-                for idx, item in enumerate(parsed):
-                    if isinstance(item, dict) and item.get("text") and item.get("url"):
-                        b_text = str(item["text"]).strip()
-                        b_url  = str(item["url"]).strip()
-                        b_id   = str(item.get("id") or (idx + 1))
-                        buttons.append({"id": b_id, "text": b_text, "url": b_url})
+        raw_val = get_bot_setting("custom_link_buttons", None)
+        if raw_val is not None:
+            has_explicit_setting = True
+            raw_str = str(raw_val).strip()
+            if raw_str and raw_str != "[]":
+                parsed = json.loads(raw_str)
+                if isinstance(parsed, list):
+                    for idx, item in enumerate(parsed):
+                        if isinstance(item, dict) and item.get("text") and item.get("url"):
+                            b_text = str(item["text"]).strip()
+                            b_url  = str(item["url"]).strip()
+                            b_id   = str(item.get("id") or (idx + 1))
+                            buttons.append({"id": b_id, "text": b_text, "url": b_url})
     except Exception as e:
         logger.warning(f"Error reading custom_link_buttons: {e}")
 
-    # Backwards compatibility with legacy single group link
-    if not buttons:
+    # Backwards compatibility with legacy single group link only if never explicitly configured
+    if not buttons and not has_explicit_setting:
         legacy_url = get_group_link()
         legacy_name = get_group_name()
         if legacy_url:
@@ -1584,7 +1630,7 @@ def save_custom_link_buttons(buttons: List[Dict[str, str]]):
 
     if "gist_storage" in globals() and gist_storage.enabled:
         try:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
         except Exception:
             pass
 
@@ -1608,6 +1654,11 @@ def set_bot_name(name: str) -> bool:
         clean = default_name
     set_bot_setting("bot_name", clean)
     set_bot_setting("default_bot_name", clean)
+    if "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+        except Exception:
+            pass
     return True
 
 def get_admin_fixed_quantity() -> Optional[int]:
@@ -1622,11 +1673,17 @@ def get_admin_fixed_quantity() -> Optional[int]:
 def set_admin_fixed_quantity(quantity_val: str) -> bool:
     """Sets admin fixed quantity ('default' or integer string '1'-'1000')."""
     clean = str(quantity_val).strip().lower()
+    res = False
     if clean == "default":
-        return set_bot_setting("admin_fixed_quantity", "default")
-    if clean.isdigit() and 1 <= int(clean) <= 1000:
-        return set_bot_setting("admin_fixed_quantity", str(int(clean)))
-    return False
+        res = set_bot_setting("admin_fixed_quantity", "default")
+    elif clean.isdigit() and 1 <= int(clean) <= 1000:
+        res = set_bot_setting("admin_fixed_quantity", str(int(clean)))
+    if res and "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+        except Exception:
+            pass
+    return res
 
 def get_effective_quantity_for_user(user_id: int = 0) -> Tuple[int, bool]:
     """
@@ -1679,6 +1736,11 @@ def is_inbox_otp_enabled() -> bool:
 def set_inbox_otp_enabled(enabled: bool):
     """Saves Inbox OTP receiving toggle setting permanently to SQLite bot_settings."""
     set_bot_setting("inbox_otp_enabled", "true" if enabled else "false")
+    if "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+        except Exception:
+            pass
 
 def is_view_full_sms_enabled() -> bool:
     """Returns True if View Full SMS (expandable blockquote) is enabled (long format), False if removed (short format)."""
@@ -1688,6 +1750,11 @@ def is_view_full_sms_enabled() -> bool:
 def set_view_full_sms_enabled(enabled: bool):
     """Saves View Full SMS toggle ('long' or 'short') permanently to SQLite bot_settings."""
     set_bot_setting("sms_format", "long" if enabled else "short")
+    if "gist_storage" in globals() and gist_storage.enabled:
+        try:
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+        except Exception:
+            pass
 
 def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int]:
     """
@@ -2561,6 +2628,142 @@ def get_otp_stats(max_age_hours: int = 28) -> Tuple[int, int, Dict[str, int]]:
         logger.warning(f"Error computing OTP stats: {e}")
     return total_today, total_28h, country_counts
 
+def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service: str = "") -> Tuple[str, str]:
+    """
+    Intelligently identifies the originating service (WhatsApp, Telegram, Google, Facebook, etc.)
+    and returns (service_name, icon). Directly matching OTP bot logic.
+    """
+    low_src = (raw_source or "").lower()
+    low_msg = (raw_message or "").lower()
+    low_fb  = (fallback_service or "").lower()
+
+    # WhatsApp
+    wa_keys = ["whatsapp", "‏واتساب‏", "واتساب", "ватсап", "wa code", "wa.me"]
+    if any(k in low_src for k in ["whatsapp", "wa.me"]) or any(k in low_msg for k in wa_keys) or "whatsapp" in low_fb:
+        return "WhatsApp", "💬"
+
+    # Telegram
+    tg_keys = ["telegram", "telegram code", "t.me"]
+    if any(k in low_src for k in ["telegram", "t.me"]) or any(k in low_msg for k in tg_keys) or "telegram" in low_fb:
+        return "Telegram", "✈️"
+
+    # Facebook / Meta
+    fb_keys = ["facebook", "meta", "fb code", "fb.me"]
+    if any(k in low_src for k in ["facebook", "meta"]) or any(k in low_msg for k in fb_keys) or "facebook" in low_fb:
+        return "Facebook", "🔵"
+
+    # Instagram
+    ig_keys = ["instagram", "ig code"]
+    if "instagram" in low_src or any(k in low_msg for k in ig_keys) or "instagram" in low_fb:
+        return "Instagram", "📸"
+
+    # Google
+    if "google" in low_src or "google" in low_msg or (raw_message or "").strip().startswith("G-") or "google" in low_fb:
+        return "Google", "🔍"
+
+    # TikTok
+    if "tiktok" in low_src or "tiktok" in low_msg or "bytedance" in low_msg or "tiktok" in low_fb:
+        return "TikTok", "🎵"
+
+    # Twitter / X
+    if "twitter" in low_src or "twitter" in low_msg or "x.com" in low_msg or "twitter" in low_fb:
+        return "Twitter (X)", "🐦"
+
+    # Snapchat
+    if "snapchat" in low_src or "snapchat" in low_msg or "snap code" in low_msg:
+        return "Snapchat", "👻"
+
+    # Apple
+    if "apple" in low_src or "apple" in low_msg or "icloud" in low_msg:
+        return "Apple", "🍎"
+
+    # Microsoft
+    if "microsoft" in low_src or "microsoft" in low_msg or "live.com" in low_msg or "msft" in low_msg:
+        return "Microsoft", "💻"
+
+    # Binance / Crypto
+    if "binance" in low_src or "binance" in low_msg:
+        return "Binance", "🪙"
+
+    # PayPal
+    if "paypal" in low_src or "paypal" in low_msg:
+        return "PayPal", "💳"
+
+    # Uber
+    if "uber" in low_src or "uber" in low_msg:
+        return "Uber", "🚗"
+
+    # Netflix
+    if "netflix" in low_src or "netflix" in low_msg:
+        return "Netflix", "🎬"
+
+    # Discord
+    if "discord" in low_src or "discord" in low_msg:
+        return "Discord", "🎮"
+
+    # IMO
+    if "imo" in low_src or "imo" in low_msg:
+        return "IMO", "🟢"
+
+    # Viber
+    if "viber" in low_src or "viber" in low_msg:
+        return "Viber", "💜"
+
+    # Signal
+    if "signal" in low_src or "signal" in low_msg:
+        return "Signal", "🔒"
+
+    # Amazon
+    if "amazon" in low_src or "amazon" in low_msg:
+        return "Amazon", "📦"
+
+    # Line
+    if "line" in low_src or "line" in low_msg:
+        return "LINE", "🟢"
+
+    # Tinder
+    if "tinder" in low_src or "tinder" in low_msg:
+        return "Tinder", "🔥"
+
+    # Steam
+    if "steam" in low_src or "steam" in low_msg:
+        return "Steam", "🎮"
+
+    # LinkedIn
+    if "linkedin" in low_src or "linkedin" in low_msg:
+        return "LinkedIn", "💼"
+
+    # Reddit
+    if "reddit" in low_src or "reddit" in low_msg:
+        return "Reddit", "🤖"
+
+    # VK / VKontakte
+    if "vk.com" in low_src or "vkontakte" in low_msg or low_src == "vk":
+        return "VK", "🔷"
+
+    # eBay
+    if "ebay" in low_src or "ebay" in low_msg:
+        return "eBay", "🛍️"
+
+    # OpenAI / ChatGPT
+    if "openai" in low_src or "openai" in low_msg or "chatgpt" in low_msg:
+        return "OpenAI", "🤖"
+
+    # Yahoo
+    if "yahoo" in low_src or "yahoo" in low_msg:
+        return "Yahoo", "🟣"
+
+    # Twitch
+    if "twitch" in low_src or "twitch" in low_msg:
+        return "Twitch", "🟣"
+
+    # Clean fallback
+    cand = raw_source or fallback_service or ""
+    if cand and not cand.isdigit() and len(cand) > 1 and cand.lower() != "sms service":
+        return cand.title(), "🏷️"
+
+    return "SMS Service", "💬"
+
 def format_inbox_otp_message(
     service: str,
     country_name: str,
@@ -2568,14 +2771,15 @@ def format_inbox_otp_message(
     unmasked_number: str,
     otp_code: str,
     raw_message: str,
-    show_full_sms: bool = True
+    show_full_sms: bool = True,
+    service_icon: Optional[str] = None
 ) -> str:
     """
     Formats the clean, simple inbox OTP card directly matching user screenshot:
-    - Service name with icon
+    - Service name with dynamic icon
     - Divider line
     - Flag + Country name
-    - Fully unmasked phone number (unhidden on inbox only)
+    - Fully unmasked phone number (bold text, NOT copyable code)
     - (No Reward / Balance lines)
     - Optional expandable 'View Full SMS' blockquote if enabled
     """
@@ -2583,23 +2787,18 @@ def format_inbox_otp_message(
     digits = re.sub(r"\D", "", num_clean)
     num_display = f"+{digits}" if digits else num_clean
 
-    svc_icon = "💬"
-    low_svc = (service or "").lower()
-    if "whatsapp" in low_svc:
-        svc_icon = "💬"
-    elif "telegram" in low_svc:
-        svc_icon = "✈️"
-    elif "google" in low_svc:
-        svc_icon = "🔍"
+    if not service_icon:
+        _, detected_icon = detect_service_and_icon(service, raw_message)
+        service_icon = detected_icon or "💬"
 
     c_flag = country_flag or "🌐"
     c_name = country_name or "Global"
 
     lines = [
-        f"{svc_icon} <b>{html.escape(service or 'SMS Service')}</b>",
+        f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"{c_flag} <b>{html.escape(c_name)}</b>",
-        f"<code>{html.escape(num_display)}</code>",
+        f"<b>{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
@@ -2892,7 +3091,8 @@ class ThirdwaveClient:
 thirdwave_client = ThirdwaveClient(base_url=THIRDWAVE_BASE_URL, api_key=THIRDWAVE_API_KEY)
 
 async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
-    """Delivers incoming OTP to user inbox if claimed, and forwards to Telegram group(s)."""
+    """Delivers incoming OTP directly to the user who claimed this phone number.
+    Number Bot NEVER forwards to Telegram groups (handled exclusively by OTP bot)."""
     mid = str(item.get("id") or "").strip()
     raw_number = str(
         item.get("number") or item.get("destinationNumber") or
@@ -2917,21 +3117,12 @@ async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
     iso = parts[1] if len(parts) > 1 else "XX"
     country_name = get_country_full_name(iso, item)
 
-    low_source = raw_source.lower()
-    low_msg = raw_msg.lower()
-    if "whatsapp" in low_source or "whatsapp" in low_msg or "wa code" in low_msg:
-        service_name = "WhatsApp"
-    elif "telegram" in low_source or "telegram" in low_msg:
-        service_name = "Telegram"
-    elif "google" in low_source or "google" in low_msg or raw_msg.startswith("G-"):
-        service_name = "Google"
-    else:
-        service_name = raw_source or "SMS Service"
+    service_name, service_icon = detect_service_and_icon(raw_source, raw_msg)
 
     inbox_enabled = is_inbox_otp_enabled()
     full_sms_enabled = is_view_full_sms_enabled()
 
-    # 1. User inbox delivery (unmasked phone number)
+    # User inbox delivery (unmasked phone number, bold text - never copyable)
     owner_id = get_number_owner(raw_number, max_age_hours=28)
     inbox_delivered = False
 
@@ -2944,6 +3135,7 @@ async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
             otp_code=otp_code,
             raw_message=raw_msg,
             show_full_sms=full_sms_enabled,
+            service_icon=service_icon,
         )
         inbox_kb = build_otp_button_row(otp_code)
         try:
@@ -2954,46 +3146,25 @@ async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
                 reply_markup=inbox_kb,
             )
             inbox_delivered = True
-            logger.info(f"📬 Delivered Live OTP ({mid}) to User Inbox {owner_id} ({raw_number})")
+            logger.info(f"📬 Delivered Live OTP ({mid}) to User Inbox {owner_id} ({raw_number}) [{service_name}]")
         except Exception as e:
             logger.warning(f"Could not deliver OTP to user inbox {owner_id}: {e}")
 
-    # 2. Telegram Group(s) delivery (masked phone number for privacy)
-    group_targets = get_target_group_chat_ids()
-    group_delivered = False
-    if group_targets:
-        group_text, _, _ = format_group_otp_message(item, sms_format=("long" if full_sms_enabled else "short"))
-        group_kb = build_otp_button_row(otp_code, custom_buttons=get_custom_link_buttons())
-        for gid in group_targets:
-            try:
-                await bot.send_message(
-                    chat_id=gid,
-                    text=group_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=group_kb,
-                )
-                group_delivered = True
-            except Exception as e:
-                logger.warning(f"Could not forward OTP to group {gid}: {e}")
+    # Note: NUMBER_BOTMAN deliberately does NOT forward to Telegram group(s).
+    # Group forwarding is handled exclusively by THIRDWAVE_BOT (OTP bot).
 
-    # 3. Permanent database record for deduplication & retention
-    status = "inbox_and_group" if (inbox_delivered and group_delivered) else (
-        "inbox_only" if inbox_delivered else (
-            "group_only" if group_delivered else (
-                "silent_recorded" if not inbox_enabled else "unclaimed_recorded"
-            )
-        )
-    )
+    # Record message in database for deduplication & 28h retention
+    status = "inbox_delivered" if inbox_delivered else "unclaimed_recorded"
     save_processed_otp_message(
         item=item,
-        chat_id=group_targets[0] if group_targets else 0,
+        chat_id=0,
         user_id=owner_id or 0,
         country=country_name,
         masked_num=mask_phone_number(raw_number),
         otp_code=otp_code,
         status=status,
     )
-    return inbox_delivered or group_delivered or True
+    return inbox_delivered or True
 
 async def poll_thirdwave_otp_loop(application: Application):
     """
@@ -3166,14 +3337,14 @@ class GistStorage:
             logger.error(f"Gist initialization error: {e}")
         return False
 
-    async def export_and_sync(self, is_handover: bool = False) -> bool:
+    async def export_and_sync(self, is_handover: bool = False, immediate: bool = False) -> bool:
         """Exports main DB + all country databases to GitHub Gist.
 
         Debounced: non-handover calls that arrive while a sync is running
         (or sooner than _MIN_SYNC_INTERVAL seconds after the last sync)
         set a dirty flag and return immediately without blocking the bot.
         A background loop (periodic_gist_sync_loop) flushes dirty state.
-        Handover / manual syncs always run immediately and wait for completion.
+        Handover / manual / immediate syncs always run immediately and wait for completion.
         """
         if not self.enabled:
             return False
@@ -3183,7 +3354,7 @@ class GistStorage:
         lock = self._get_lock()
 
         # --- Throttle non-critical syncs ---
-        if not is_handover:
+        if not is_handover and not immediate:
             if lock.locked():
                 self._dirty = True
                 return True  # another sync is already running; come back later
@@ -3234,6 +3405,14 @@ class GistStorage:
 
                     current_group_link = get_group_link()
                     current_group_name = get_group_name()
+
+                # Also backup settings directly to local bot_data.json
+                try:
+                    data_file = os.path.join(BASE_DIR, "bot_data.json")
+                    with open(data_file, "w", encoding="utf-8") as f:
+                        json.dump(settings_data, f, indent=2)
+                except Exception:
+                    pass
 
                 cutoff_seen = datetime.now(timezone.utc).timestamp() - (28 * 3600)
                 valid_seen = {k: v for k, v in seen_timestamps.items() if v >= cutoff_seen}
@@ -3316,14 +3495,16 @@ class GistStorage:
                                 except Exception:
                                     pass
 
-                        # Restore Group Link & Button Name
-                        saved_group = parsed.get("group_link") or parsed.get("otp_group_link")
-                        if saved_group:
-                            set_group_link(str(saved_group).strip())
+                        # Restore Group Link & Button Name ONLY if custom_link_buttons not configured
+                        saved_buttons = saved_settings.get("custom_link_buttons") if isinstance(saved_settings, dict) else None
+                        if not saved_buttons:
+                            saved_group = parsed.get("group_link") or parsed.get("otp_group_link")
+                            if saved_group:
+                                set_group_link(str(saved_group).strip())
 
-                        saved_name = parsed.get("group_name") or parsed.get("otp_group_name")
-                        if saved_name:
-                            set_group_name(str(saved_name).strip())
+                            saved_name = parsed.get("group_name") or parsed.get("otp_group_name")
+                            if saved_name:
+                                set_group_name(str(saved_name).strip())
 
                         # Restore Users & Permissions
                         with get_main_db() as mconn:
@@ -3364,6 +3545,25 @@ class GistStorage:
                                             first_name = CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE bot_admins.first_name END;
                                     """, (aid, a.get("added_by", 0), a.get("username", ""), a.get("first_name", "")))
                                     mconn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (aid,))
+
+                            # Reconcile deletions: remove deleted users present in SQLite but absent from cloud Gist
+                            if users_data and isinstance(users_data, list):
+                                cloud_uids = {int(u["user_id"]) for u in users_data if u.get("user_id")}
+                                if cloud_uids:
+                                    local_users = [r[0] for r in mconn.execute("SELECT user_id FROM users;").fetchall()]
+                                    for l_uid in local_users:
+                                        if l_uid not in cloud_uids and not is_admin(l_uid):
+                                            mconn.execute("DELETE FROM users WHERE user_id = ?;", (l_uid,))
+                                            mconn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (l_uid,))
+
+                            # Reconcile admin revocations: remove revoked admins present in SQLite but absent from cloud Gist
+                            if isinstance(admins_data, list):
+                                cloud_aids = {int(a["user_id"]) for a in admins_data if a.get("user_id")}
+                                local_admins = [r[0] for r in mconn.execute("SELECT user_id FROM bot_admins;").fetchall()]
+                                for l_aid in local_admins:
+                                    if l_aid not in cloud_aids and l_aid not in ADMIN_USER_IDS:
+                                        mconn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (l_aid,))
+                                        mconn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (l_aid,))
 
                             mconn.commit()
 
@@ -4591,14 +4791,6 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"🔔 Inbox OTP: {'ON ✅' if is_inbox_otp_enabled() else 'OFF ❌'}", callback_data="toggle_inbox_otp"),
-            InlineKeyboardButton(f"📩 Full SMS: {'ON ✅' if is_view_full_sms_enabled() else 'OFF ❌'}", callback_data="toggle_view_full_sms"),
-        ],
-        [
-            InlineKeyboardButton("📋 SMS Format", callback_data="admin_sms_format_menu"),
-            InlineKeyboardButton("🧹 Clear History", callback_data="admin_clear_otp_history"),
-        ],
-        [
             InlineKeyboardButton("➕ Add Numbers", callback_data="admin_upload_prompt"),
             InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
         ],
@@ -4612,6 +4804,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_menu"),
+            InlineKeyboardButton("📋 SMS Format", callback_data="admin_sms_format_menu")
+        ],
+        [
+            InlineKeyboardButton(f"🔔 Inbox OTP: {'ON ✅' if is_inbox_otp_enabled() else 'OFF ❌'}", callback_data="toggle_inbox_otp"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
         [
@@ -6574,14 +6770,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-    elif data == "admin_clear_otp_history" and user_admin:
-        cleared_cnt = clear_otp_history(max_age_hours=0)
-        await query.answer(f"🧹 Cleared {cleared_cnt} OTP records from history!", show_alert=True)
-        admin_text, keyboard = build_admin_dashboard(user.id)
-        try:
-            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        except Exception:
-            pass
 
     # 6. Admin Panel / Refresh Dashboard
     elif (data == "admin_panel" or data == "admin_refresh_dash") and user_admin:

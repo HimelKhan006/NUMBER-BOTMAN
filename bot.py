@@ -8837,6 +8837,8 @@ def main():
             application.stop_running()
         except Exception as e:
             logger.warning(f"Notice calling stop_running: {e}")
+        await asyncio.sleep(2.0)
+        os._exit(0)
 
     async def periodic_gist_sync_loop():
         """Background task: flush dirty Gist state every 15 seconds."""

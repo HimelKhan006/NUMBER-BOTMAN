@@ -172,6 +172,9 @@ jobs:
           # Total ~5h 35min — safely within the 5h 58min (358min) job limit.
           END_TIME=$((SECONDS + 19500))
 
+          # Instantly exit when GitHub sends cancellation signals (SIGTERM/SIGINT)
+          trap "echo '🛑 Immediate cancellation signal received. Halting runner.'; exit 0" SIGTERM SIGINT
+
           while true; do
             REMAINING=$((END_TIME - SECONDS))
 
@@ -195,6 +198,13 @@ jobs:
             if [ $EXIT_CODE -eq 1 ]; then
               echo "❌ Fatal config error (exit 1). Halting."
               exit 1
+            fi
+
+            # Exit > 128 = killed by GitHub Actions cancel-in-progress (SIGINT=130, SIGTERM=143)
+            # Must exit immediately so the newly pushed workflow run starts with ZERO delay!
+            if [ $EXIT_CODE -gt 128 ]; then
+              echo "🛑 Process terminated by GitHub cancellation ($EXIT_CODE). Exiting loop immediately."
+              break
             fi
 
             # Any other exit = transient crash — auto-restart after 3s

@@ -2238,11 +2238,11 @@ def parse_message_timestamp(time_str: str) -> float:
         return 0.0
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
-COLLAPSED_SMS_HINT = "\u2800" * 7 + "  " + "<b>Tap to read...</b>"
+COLLAPSED_SMS_HINT = "<b>Tap to read SMS...</b>"
 CARD_DIVIDER = "━" * 20
-QUOTE_DIVIDER = "━" * 16
+QUOTE_DIVIDER = "━" * 18
 
-def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 28) -> str:
+def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 20) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
     if not msg:
         return ""
@@ -2795,18 +2795,13 @@ def format_inbox_otp_message(
     country_iso: str = ""
 ) -> str:
     """
-    Formats the Ultra-Minimalist inbox OTP card:
-    - Service name with 🏷️ icon, country flag & ISO on the side at top: 🏷️ WhatsApp  🇳🇬 NG
-    - Number with 📱 icon, non-copyable bold text, never turning blue
-    - No divider bars (Ultra-Minimalist)
-    - Passcode ONLY on the copy button below
-    - Optional expandable 'View Full SMS' blockquote if enabled
+    Formats Format D: Floating Ticket (Single-Line Compact):
+    - Service & Country on single top line: 💬 WhatsApp (VN 🇻🇳)
+    - Number with 📱 icon directly underneath: 📱 +84987938835
+    - Passcode ONLY on the copy button below without extra icons or text
+    - Identical small size for both With Full SMS and Without Full SMS
     """
     num_display = format_phone_for_card(unmasked_number)
-
-    if not service_icon:
-        _, detected_icon = detect_service_and_icon(service, raw_message)
-        service_icon = detected_icon or "🏷️"
 
     c_flag = country_flag or "🌐"
     c_name = country_name or "Global"
@@ -2819,28 +2814,24 @@ def format_inbox_otp_message(
                 break
 
     if iso_clean and iso_clean != "XX":
-        country_part = f"{c_flag} {iso_clean}"
+        country_part = f"({iso_clean} {c_flag})"
     elif c_name and c_name != "Global":
-        country_part = f"{c_flag} {html.escape(c_name)}"
+        country_part = f"({html.escape(c_name)} {c_flag})"
     else:
-        country_part = f"{c_flag}"
+        country_part = f"({c_flag})"
 
+    svc_display = html.escape(service or "SMS Service")
     lines = [
-        f"{service_icon} <b>{html.escape(service or 'SMS Service')}</b>  {country_part}",
-        "",
+        f"💬 <b>{svc_display}</b> {country_part}",
         f"📱 <b>{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
-        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=28)
+        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=20)
         lines.append("")
-        lines.append(EXPANDABLE_SMS_LABEL)
         lines.append(
-            f"<blockquote expandable>⠀\n"
-            f"{COLLAPSED_SMS_HINT}\n"
-            f"⠀\n"
+            f"<blockquote expandable>{COLLAPSED_SMS_HINT}\n"
             f"{QUOTE_DIVIDER}\n"
-            f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
 
@@ -2954,10 +2945,11 @@ def build_otp_button_row(
     buttons = []
     otp_btn = None
     if otp_code:
+        clean_code = str(otp_code).strip()
         if CopyTextButton:
-            otp_btn = InlineKeyboardButton(otp_code, copy_text=CopyTextButton(text=otp_code))
+            otp_btn = InlineKeyboardButton(clean_code, copy_text=CopyTextButton(text=clean_code))
         else:
-            otp_btn = InlineKeyboardButton(f"🔑 {otp_code}", callback_data=f"copy_num_{otp_code}")
+            otp_btn = InlineKeyboardButton(clean_code, callback_data=f"copy_num_{clean_code}")
 
     custom_btns = []
     if custom_buttons:
@@ -4708,7 +4700,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         if CopyTextButton:
             kb.append([InlineKeyboardButton(otp_sample, copy_text=CopyTextButton(text=otp_sample))])
         else:
-            kb.append([InlineKeyboardButton(f"🔑 {otp_sample}", callback_data=f"copy_num_{otp_sample}")])
+            kb.append([InlineKeyboardButton(otp_sample, callback_data=f"copy_num_{otp_sample}")])
 
     kb.append([
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'short' else ''}⚡ Short (Without View)", callback_data="fmt_set_short"),

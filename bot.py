@@ -2791,21 +2791,19 @@ def detect_service_and_icon(raw_source: str, raw_message: str, fallback_service:
 
 def format_phone_for_card(raw_num: str) -> str:
     """
-    Formats phone number cleanly without internal spaces,
+    Formats phone number cleanly with guaranteed '+' prefix and without internal spaces,
     inserting invisible Zero-Width Non-Joiner (\u200c) between digit chunks
     so Telegram's client-side phone linkifier regex does NOT turn it blue.
     """
     clean = str(raw_num or "").strip()
-    has_plus = clean.startswith("+")
-    prefix_char = "+" if has_plus else ""
     digits = re.sub(r"\D", "", clean)
     if not digits:
-        return clean
+        return clean if clean.startswith("+") else f"+{clean}"
     chunks = []
     chunk_size = 4
     for i in range(0, len(digits), chunk_size):
         chunks.append(digits[i:i+chunk_size])
-    return prefix_char + "\u200c".join(chunks)
+    return "+" + "\u200c".join(chunks)
 
 def format_inbox_otp_message(
     service: str,
@@ -2820,8 +2818,9 @@ def format_inbox_otp_message(
 ) -> str:
     """
     Formats Format D: Floating Ticket (Single-Line Compact):
-    - Service & Country on single top line: 💬 WhatsApp (VN 🇻🇳)
-    - Number with 📱 icon directly underneath: 📱 +84987938835
+    - Top title: 📩 New SMS Received
+    - Service & Country on line below: 💬 WhatsApp (VN 🇻🇳)
+    - Number with guaranteed + and 📱 icon: 📱 +84987938835
     - Passcode ONLY on the copy button below without extra icons or text
     - Identical small size for both With Full SMS and Without Full SMS
     """
@@ -2846,6 +2845,8 @@ def format_inbox_otp_message(
 
     svc_display = html.escape(service or "SMS Service")
     lines = [
+        "📩 <b>New SMS Received</b>",
+        "",
         f"💬 <b>{svc_display}</b> {country_part}",
         f"📱 <b>{html.escape(num_display)}</b>",
     ]

@@ -60,6 +60,8 @@ import time
 import argparse
 import io
 import unicodedata
+import hashlib
+import textwrap
 from typing import Set, Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 
@@ -180,6 +182,18 @@ STARTUP_TYPE           = os.getenv("STARTUP_TYPE", "workflow_dispatch").strip().
 
 _admin_raw    = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS: List[int] = [int(u.strip()) for u in _admin_raw.split(",") if u.strip().isdigit()]
+
+THIRDWAVE_API_KEY      = os.getenv("THIRDWAVE_API_KEY", "").strip()
+_raw_tw_base           = os.getenv("THIRDWAVE_BASE_URL", "https://thirdwave.im").strip().rstrip("/")
+if _raw_tw_base.endswith("/api/v1/traffic"):
+    _raw_tw_base = _raw_tw_base[:-len("/api/v1/traffic")].rstrip("/")
+if _raw_tw_base and not _raw_tw_base.startswith(("http://", "https://")):
+    _raw_tw_base = f"https://{_raw_tw_base}"
+THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
+
+TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
+SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "2.0"))
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -586,6 +600,71 @@ def init_db():
             conn.execute("ALTER TABLE broadcast_history ADD COLUMN quantity INTEGER DEFAULT 0;")
         except Exception:
             pass
+
+        # Dedicated user claimed numbers tracking table for instant owner lookup
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_claimed_numbers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                country_id INTEGER DEFAULT 0,
+                is_secret INTEGER DEFAULT 0,
+                claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ucn_num ON user_claimed_numbers(number);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ucn_user ON user_claimed_numbers(user_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ucn_claimed_at ON user_claimed_numbers(claimed_at);")
+
+        # Permanent processed OTPs table matching OTP bot with 28h retention schema
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_otps (
+                id                 TEXT PRIMARY KEY,
+                source             TEXT,
+                country            TEXT,
+                number             TEXT,
+                otp_code           TEXT,
+                raw_message        TEXT,
+                rate               TEXT,
+                message_time       TEXT,
+                received_at        TEXT,
+                received_at_epoch  REAL,
+                expires_at         TEXT,
+                expires_at_epoch   REAL,
+                chat_id            INTEGER DEFAULT 0,
+                user_id            INTEGER DEFAULT 0,
+                forwarded_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status             TEXT DEFAULT 'forwarded'
+            );
+        """)
+
+        # Auto-migration for existing processed_otps tables
+        existing_cols = {col["name"] for col in conn.execute("PRAGMA table_info(processed_otps);").fetchall()}
+        for col_name, col_type in [
+            ("source", "TEXT"),
+            ("rate", "TEXT"),
+            ("message_time", "TEXT"),
+            ("received_at_epoch", "REAL"),
+            ("expires_at", "TEXT"),
+            ("expires_at_epoch", "REAL"),
+            ("chat_id", "INTEGER DEFAULT 0"),
+            ("user_id", "INTEGER DEFAULT 0"),
+            ("forwarded_at", "TIMESTAMP"),
+            ("status", "TEXT DEFAULT 'forwarded'"),
+        ]:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(f"ALTER TABLE processed_otps ADD COLUMN {col_name} {col_type};")
+                except Exception:
+                    pass
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_fwd_at ON processed_otps(forwarded_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_num_otp ON processed_otps(number, otp_code);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_num_msg ON processed_otps(number, raw_message);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_recv_epoch ON processed_otps(received_at_epoch);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_expires_epoch ON processed_otps(expires_at_epoch);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_user_id ON processed_otps(user_id);")
+
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
@@ -1265,6 +1344,11 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
             mconn.execute("""
                 INSERT INTO delivery_log (user_id, country_id, number_count, is_secret) VALUES (?, ?, ?, ?);
             """, (user_id, country_id, len(numbers), secret_val))
+            for num in numbers:
+                mconn.execute("""
+                    INSERT INTO user_claimed_numbers (number, user_id, country_id, is_secret, claimed_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP);
+                """, (num, user_id, country_id, secret_val))
             mconn.commit()
     except Exception as e:
         logger.warning(f"Error logging delivery: {e}")
@@ -1551,6 +1635,1389 @@ def get_effective_quantity_for_user(user_id: int = 0) -> Tuple[int, bool]:
     return 10, False
 
 # ==========================================
+# 5c. Thirdwave SMS & Integrated OTP Engine
+# ==========================================
+def get_target_group_chat_ids() -> List[int]:
+    """Returns list of Telegram group chat IDs to forward OTPs to."""
+    groups: List[int] = []
+    seen: Set[int] = set()
+    if TELEGRAM_GROUP_CHAT_ID:
+        for part in TELEGRAM_GROUP_CHAT_ID.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    cid = int(part)
+                    if cid not in seen:
+                        seen.add(cid)
+                        groups.append(cid)
+                except ValueError:
+                    pass
+    if SECONDARY_GROUP_CHAT_ID:
+        for part in SECONDARY_GROUP_CHAT_ID.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    cid = int(part)
+                    if cid not in seen:
+                        seen.add(cid)
+                        groups.append(cid)
+                except ValueError:
+                    pass
+    return groups
+
+def is_inbox_otp_enabled() -> bool:
+    """Returns True if Inbox OTP delivery to claimed number users is enabled, False if turned OFF."""
+    val = get_bot_setting("inbox_otp_enabled", "true").strip().lower()
+    return val in ("true", "1", "yes", "on")
+
+def set_inbox_otp_enabled(enabled: bool):
+    """Saves Inbox OTP receiving toggle setting permanently to SQLite bot_settings."""
+    set_bot_setting("inbox_otp_enabled", "true" if enabled else "false")
+
+def is_view_full_sms_enabled() -> bool:
+    """Returns True if View Full SMS (expandable blockquote) is enabled (long format), False if removed (short format)."""
+    val = get_bot_setting("sms_format", "long").strip().lower()
+    return val not in ("short", "false", "0", "off")
+
+def set_view_full_sms_enabled(enabled: bool):
+    """Saves View Full SMS toggle ('long' or 'short') permanently to SQLite bot_settings."""
+    set_bot_setting("sms_format", "long" if enabled else "short")
+
+def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int]:
+    """
+    Finds which user claimed this phone number within the active retention window.
+    Checks user_claimed_numbers table with phone number variants (+prefix, no prefix, digits only).
+    Also checks country databases' used_numbers table as a fallback.
+    """
+    if not phone_number:
+        return None
+    raw_num = str(phone_number).strip()
+    digits = re.sub(r"\D", "", raw_num)
+    if not digits:
+        return None
+    candidates = [raw_num, f"+{digits}", digits]
+    cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with get_main_db() as conn:
+            placeholders = ",".join(["?"] * len(candidates))
+            cur = conn.execute(
+                f"""SELECT user_id FROM user_claimed_numbers
+                    WHERE number IN ({placeholders}) AND datetime(claimed_at) >= datetime(?)
+                    ORDER BY id DESC LIMIT 1;""",
+                (*candidates, cutoff_dt)
+            )
+            row = cur.fetchone()
+            if row and row["user_id"]:
+                return int(row["user_id"])
+    except Exception as e:
+        logger.debug(f"Error checking user_claimed_numbers owner: {e}")
+
+    # Fallback: check individual country databases used_numbers
+    try:
+        if os.path.exists(STOCKS_DIR):
+            for f in os.listdir(STOCKS_DIR):
+                if f.endswith(".db"):
+                    c_path = os.path.join(STOCKS_DIR, f)
+                    try:
+                        with sqlite3.connect(c_path, timeout=5.0) as cconn:
+                            placeholders = ",".join(["?"] * len(candidates))
+                            cur = cconn.execute(
+                                f"SELECT user_id FROM used_numbers WHERE number IN ({placeholders}) AND user_id > 0 ORDER BY id DESC LIMIT 1;",
+                                candidates
+                            )
+                            r = cur.fetchone()
+                            if r and r[0]:
+                                return int(r[0])
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.debug(f"Country stock owner check fallback note: {e}")
+
+    return None
+
+COUNTRY_ISO_DATA: Dict[str, Tuple[str, str]] = {
+    # Asia & Middle East
+    "sri lanka": ("🇱🇰", "LK"), "lk": ("🇱🇰", "LK"),
+    "indonesia": ("🇮🇩", "ID"), "id": ("🇮🇩", "ID"),
+    "india":     ("🇮🇳", "IN"), "in": ("🇮🇳", "IN"),
+    "bangladesh":("🇧🇩", "BD"), "bd": ("🇧🇩", "BD"),
+    "pakistan":  ("🇵🇰", "PK"), "pk": ("🇵🇰", "PK"),
+    "vietnam":   ("🇻🇳", "VN"), "vn": ("🇻🇳", "VN"),
+    "philippines":("🇵🇭","PH"), "ph": ("🇵🇭", "PH"),
+    "thailand":  ("🇹🇭", "TH"), "th": ("🇹🇭", "TH"),
+    "malaysia":  ("🇲🇾", "MY"), "my": ("🇲🇾", "MY"),
+    "cambodia":  ("🇰🇭", "KH"), "kh": ("🇰🇭", "KH"),
+    "myanmar":   ("🇲🇲", "MM"), "mm": ("🇲🇲", "MM"),
+    "nepal":     ("🇳🇵", "NP"), "np": ("🇳🇵", "NP"),
+    "china":     ("🇨🇳", "CN"), "cn": ("🇨🇳", "CN"),
+    "taiwan":    ("🇹🇼", "TW"), "tw": ("🇹🇼", "TW"),
+    "japan":     ("🇯🇵", "JP"), "jp": ("🇯🇵", "JP"),
+    "south korea":("🇰🇷","KR"), "kr": ("🇰🇷", "KR"),
+    "singapore": ("🇸🇬", "SG"), "sg": ("🇸🇬", "SG"),
+    "hong kong": ("🇭🇰", "HK"), "hk": ("🇭🇰", "HK"),
+    "russia":    ("🇷🇺", "RU"), "ru": ("🇷🇺", "RU"),
+    "ukraine":   ("🇺🇦", "UA"), "ua": ("🇺🇦", "UA"),
+    "turkey":    ("🇹🇷", "TR"), "tr": ("🇹🇷", "TR"),
+    "saudi arabia":("🇸🇦","SA"),"sa": ("🇸🇦", "SA"),
+    "uae":       ("🇦🇪", "AE"), "ae": ("🇦🇪", "AE"),
+    "united arab emirates":("🇦🇪","AE"),
+    "iran":      ("🇮🇷", "IR"), "ir": ("🇮🇷", "IR"),
+    "iraq":      ("🇮🇶", "IQ"), "iq": ("🇮🇶", "IQ"),
+    "israel":    ("🇮🇱", "IL"), "il": ("🇮🇱", "IL"),
+    "jordan":    ("🇯🇴", "JO"), "jo": ("🇯🇴", "JO"),
+    "kuwait":    ("🇰🇼", "KW"), "kw": ("🇰🇼", "KW"),
+    "lebanon":   ("🇱🇧", "LB"), "lb": ("🇱🇧", "LB"),
+    "oman":      ("🇴🇲", "OM"), "om": ("🇴🇲", "OM"),
+    "qatar":     ("🇶🇦", "QA"), "qa": ("🇶🇦", "QA"),
+    "syria":     ("🇸🇾", "SY"), "sy": ("🇸🇾", "SY"),
+    "yemen":     ("🇾🇪", "YE"), "ye": ("🇾🇪", "YE"),
+    "bahrain":   ("🇧🇭", "BH"), "bh": ("🇧🇭", "BH"),
+    "uzbekistan":("🇺🇿","UZ"), "uz": ("🇺🇿", "UZ"),
+    "kazakhstan":("🇰🇿","KZ"), "kz": ("🇰🇿", "KZ"),
+    "kyrgyzstan":("🇰🇬","KG"), "kg": ("🇰🇬", "KG"),
+    "tajikistan":("🇹🇯","TJ"), "tj": ("🇹🇯", "TJ"),
+    "turkmenistan":("🇹🇲","TM"), "tm": ("🇹🇲", "TM"),
+    "afghanistan":("🇦🇫","AF"), "af": ("🇦🇫", "AF"),
+    "azerbaijan":("🇦🇿","AZ"), "az": ("🇦🇿", "AZ"),
+    "armenia":   ("🇦🇲", "AM"), "am": ("🇦🇲", "AM"),
+    "georgia":   ("🇬🇪", "GE"), "ge": ("🇬🇪", "GE"),
+    "laos":      ("🇱🇦", "LA"), "la": ("🇱🇦", "LA"),
+    "bhutan":    ("🇧🇹", "BT"), "bt": ("🇧🇹", "BT"),
+    "maldives":  ("🇲🇻", "MV"), "mv": ("🇲🇻", "MV"),
+
+    # Africa
+    "ivory coast":("🇨🇮","CI"), "cote d'ivoire":("🇨🇮","CI"), "ci":("🇨🇮","CI"),
+    "egypt":     ("🇪🇬", "EG"), "eg": ("🇪🇬", "EG"),
+    "nigeria":   ("🇳🇬", "NG"), "ng": ("🇳🇬", "NG"),
+    "kenya":     ("🇰🇪", "KE"), "ke": ("🇰🇪", "KE"),
+    "ghana":     ("🇬🇭", "GH"), "gh": ("🇬🇭", "GH"),
+    "south africa":("🇿🇦","ZA"),"za": ("🇿🇦", "ZA"),
+    "morocco":   ("🇲🇦", "MA"), "ma": ("🇲🇦", "MA"),
+    "algeria":   ("🇩🇿", "DZ"), "dz": ("🇩🇿", "DZ"),
+    "tunisia":   ("🇹🇳", "TN"), "tn": ("🇹🇳", "TN"),
+    "libya":     ("🇱🇾", "LY"), "ly": ("🇱🇾", "LY"),
+    "tanzania":  ("🇹🇿", "TZ"), "tz": ("🇹🇿", "TZ"),
+    "uganda":    ("🇺🇬", "UG"), "ug": ("🇺🇬", "UG"),
+    "ethiopia":  ("🇪🇹", "ET"), "et": ("🇪🇹", "ET"),
+    "somalia":   ("🇸🇴", "SO"), "so": ("🇸🇴", "SO"),
+    "sudan":     ("🇸🇩", "SD"), "sd": ("🇸🇩", "SD"),
+    "senegal":   ("🇸🇳", "SN"), "sn": ("🇸🇳", "SN"),
+    "cameroon":  ("🇨🇲", "CM"), "cm": ("🇨🇲", "CM"),
+    "rwanda":    ("🇷🇼", "RW"), "rw": ("🇷🇼", "RW"),
+    "zambia":    ("🇿🇲", "ZM"), "zm": ("🇿🇲", "ZM"),
+    "zimbabwe":  ("🇿🇼", "ZW"), "zw": ("🇿🇼", "ZW"),
+    "mozambique":("🇲🇿","MZ"), "mz": ("🇲🇿", "MZ"),
+    "angola":    ("🇦🇴", "AO"), "ao": ("🇦🇴", "AO"),
+    "mali":      ("🇲🇱", "ML"), "ml": ("🇲🇱", "ML"),
+    "burkina faso":("🇧🇫","BF"),"bf": ("🇧🇫", "BF"),
+    "guinea":    ("🇬🇳", "GN"), "gn": ("🇬🇳", "GN"),
+    "benin":     ("🇧🇯", "BJ"), "bj": ("🇧🇯", "BJ"),
+    "togo":      ("🇹🇬", "TG"), "tg": ("🇹🇬", "TG"),
+    "madagascar":("🇲🇬","MG"), "mg": ("🇲🇬", "MG"),
+    "mauritius": ("🇲🇺", "MU"), "mu": ("🇲🇺", "MU"),
+    "botswana":  ("🇧🇼", "BW"), "bw": ("🇧🇼", "BW"),
+    "namibia":   ("🇳🇦", "NA"), "na": ("🇳🇦", "NA"),
+
+    # Europe
+    "kosovo":    ("🇽🇰", "XK"), "xk": ("🇽🇰", "XK"),
+    "united kingdom":("🇬🇧","GB"),"uk": ("🇬🇧", "GB"), "gb": ("🇬🇧", "GB"),
+    "germany":   ("🇩🇪", "DE"), "de": ("🇩🇪", "DE"),
+    "france":    ("🇫🇷", "FR"), "fr": ("🇫🇷", "FR"),
+    "italy":     ("🇮🇹", "IT"), "it": ("🇮🇹", "IT"),
+    "spain":     ("🇪🇸", "ES"), "es": ("🇪🇸", "ES"),
+    "poland":    ("🇵🇱", "PL"), "pl": ("🇵🇱", "PL"),
+    "netherlands":("🇳🇱","NL"), "nl": ("🇳🇱", "NL"),
+    "portugal":  ("🇵🇹", "PT"), "pt": ("🇵🇹", "PT"),
+    "sweden":    ("🇸🇪", "SE"), "se": ("🇸🇪", "SE"),
+    "norway":    ("🇳🇴", "NO"), "no": ("🇳🇴", "NO"),
+    "denmark":   ("🇩🇰", "DK"), "dk": ("🇩🇰", "DK"),
+    "finland":   ("🇫🇮", "FI"), "fi": ("🇫🇮", "FI"),
+    "switzerland":("🇨🇭","CH"), "ch": ("🇨🇭", "CH"),
+    "austria":   ("🇦🇹", "AT"), "at": ("🇦🇹", "AT"),
+    "belgium":   ("🇧🇪", "BE"), "be": ("🇧🇪", "BE"),
+    "greece":    ("🇬🇷", "GR"), "gr": ("🇬🇷", "GR"),
+    "ireland":   ("🇮🇪", "IE"), "ie": ("🇮🇪", "IE"),
+    "czech":     ("🇨🇿", "CZ"), "cz": ("🇨🇿", "CZ"), "czech republic":("🇨🇿","CZ"),
+    "romania":   ("🇷🇴", "RO"), "ro": ("🇷🇴", "RO"),
+    "hungary":   ("🇭🇺", "HU"), "hu": ("🇭🇺", "HU"),
+    "albania":   ("🇦🇱", "AL"), "al": ("🇦🇱", "AL"),
+    "serbia":    ("🇷🇸", "RS"), "rs": ("🇷🇸", "RS"),
+    "croatia":   ("🇭🇷", "HR"), "hr": ("🇭🇷", "HR"),
+    "bulgaria":  ("🇧🇬", "BG"), "bg": ("🇧🇬", "BG"),
+    "slovakia":  ("🇸🇰", "SK"), "sk": ("🇸🇰", "SK"),
+    "slovenia":  ("🇸🇮", "SI"), "si": ("🇸🇮", "SI"),
+    "estonia":   ("🇪🇪", "EE"), "ee": ("🇪🇪", "EE"),
+    "latvia":    ("🇱🇻", "LV"), "lv": ("🇱🇻", "LV"),
+    "lithuania": ("🇱🇹", "LT"), "lt": ("🇱🇹", "LT"),
+    "belarus":   ("🇧🇾", "BY"), "by": ("🇧🇾", "BY"),
+    "moldova":   ("🇲🇩", "MD"), "md": ("🇲🇩", "MD"),
+    "bosnia":    ("🇧🇦", "BA"), "ba": ("🇧🇦", "BA"),
+    "north macedonia":("🇲🇰","MK"),"mk": ("🇲🇰", "MK"),
+    "cyprus":    ("🇨🇾", "CY"), "cy": ("🇨🇾", "CY"),
+    "malta":     ("🇲🇹", "MT"), "mt": ("🇲🇹", "MT"),
+    "iceland":   ("🇮🇸", "IS"), "is": ("🇮🇸", "IS"),
+    "luxembourg":("🇱🇺","LU"), "lu": ("🇱🇺", "LU"),
+
+    # Americas
+    "united states":("🇺🇸","US"),"us": ("🇺🇸", "US"), "usa": ("🇺🇸", "US"),
+    "canada":    ("🇨🇦", "CA"), "ca": ("🇨🇦", "CA"),
+    "brazil":    ("🇧🇷", "BR"), "br": ("🇧🇷", "BR"),
+    "mexico":    ("🇲🇽", "MX"), "mx": ("🇲🇽", "MX"),
+    "colombia":  ("🇨🇴", "CO"), "co": ("🇨🇴", "CO"),
+    "argentina": ("🇦🇷", "AR"), "ar": ("🇦🇷", "AR"),
+    "peru":      ("🇵🇪", "PE"), "pe": ("🇵🇪", "PE"),
+    "chile":     ("🇨🇱", "CL"), "cl": ("🇨🇱", "CL"),
+    "venezuela": ("🇻🇪", "VE"), "ve": ("🇻🇪", "VE"),
+    "ecuador":   ("🇪🇨", "EC"), "ec": ("🇪🇨", "EC"),
+    "guatemala": ("🇬🇹", "GT"), "gt": ("🇬🇹", "GT"),
+    "cuba":      ("🇨🇺", "CU"), "cu": ("🇨🇺", "CU"),
+    "bolivia":   ("🇧🇴", "BO"), "bo": ("🇧🇴", "BO"),
+    "dominican republic":("🇩🇴","DO"),"do": ("🇩🇴", "DO"),
+    "honduras":  ("🇭🇳", "HN"), "hn": ("🇭🇳", "HN"),
+    "paraguay":  ("🇵🇾", "PY"), "py": ("🇵🇾", "PY"),
+    "el salvador":("🇸🇻","SV"),"sv": ("🇸🇻", "SV"),
+    "nicaragua": ("🇳🇮", "NI"), "ni": ("🇳🇮", "NI"),
+    "costa rica":("🇨🇷","CR"), "cr": ("🇨🇷", "CR"),
+    "panama":    ("🇵🇦", "PA"), "pa": ("🇵🇦", "PA"),
+    "uruguay":   ("🇺🇾", "UY"), "uy": ("🇺🇾", "UY"),
+    "jamaica":   ("🇯🇲", "JM"), "jm": ("🇯🇲", "JM"),
+    "haiti":     ("🇭🇹", "HT"), "ht": ("🇭🇹", "HT"),
+
+    # Oceania
+    "australia": ("🇦🇺", "AU"), "au": ("🇦🇺", "AU"),
+    "new zealand":("🇳🇿","NZ"), "nz": ("🇳🇿", "NZ"),
+    "fiji":      ("🇫🇯", "FJ"), "fj": ("🇫🇯", "FJ"),
+    "papua new guinea":("🇵🇬","PG"),"pg": ("🇵🇬", "PG"),
+}
+
+PREFIX_ISO_MAP: Dict[str, Tuple[str, str]] = {
+    # 1-digit
+    "1":   ("🇺🇸", "US"), "7":   ("🇷🇺", "RU"),
+
+    # 2-digit
+    "20":  ("🇪🇬", "EG"), "27":  ("🇿🇦", "ZA"), "30":  ("🇬🇷", "GR"),
+    "31":  ("🇳🇱", "NL"), "32":  ("🇧🇪", "BE"), "33":  ("🇫🇷", "FR"),
+    "34":  ("🇪🇸", "ES"), "36":  ("🇭🇺", "HU"), "39":  ("🇮🇹", "IT"),
+    "40":  ("🇷🇴", "RO"), "41":  ("🇨🇭", "CH"), "43":  ("🇦🇹", "AT"),
+    "44":  ("🇬🇧", "GB"), "45":  ("🇩🇰", "DK"), "46":  ("🇸🇪", "SE"),
+    "47":  ("🇳🇴", "NO"), "48":  ("🇵🇱", "PL"), "49":  ("🇩🇪", "DE"),
+    "51":  ("🇵🇪", "PE"), "52":  ("🇲🇽", "MX"), "53":  ("🇨🇺", "CU"),
+    "54":  ("🇦🇷", "AR"), "55":  ("🇧🇷", "BR"), "56":  ("🇨🇱", "CL"),
+    "57":  ("🇨🇴", "CO"), "58":  ("🇻🇪", "VE"), "60":  ("🇲🇾", "MY"),
+    "61":  ("🇦🇺", "AU"), "62":  ("🇮🇩", "ID"), "63":  ("🇵🇭", "PH"),
+    "64":  ("🇳🇿", "NZ"), "65":  ("🇸🇬", "SG"), "66":  ("🇹🇭", "TH"),
+    "81":  ("🇯🇵", "JP"), "82":  ("🇰🇷", "KR"), "84":  ("🇻🇳", "VN"),
+    "86":  ("🇨🇳", "CN"), "90":  ("🇹🇷", "TR"), "91":  ("🇮🇳", "IN"),
+    "92":  ("🇵🇰", "PK"), "93":  ("🇦🇫", "AF"), "94":  ("🇱🇰", "LK"),
+    "95":  ("🇲🇲", "MM"), "98":  ("🇮🇷", "IR"),
+
+    # 3-digit Africa
+    "212": ("🇲🇦", "MA"), "213": ("🇩🇿", "DZ"), "216": ("🇹🇳", "TN"),
+    "218": ("🇱🇾", "LY"), "220": ("🇬🇲", "GM"), "221": ("🇸🇳", "SN"),
+    "222": ("🇲🇷", "MR"), "223": ("🇲🇱", "ML"), "224": ("🇬🇳", "GN"),
+    "225": ("🇨🇮", "CI"), "226": ("🇧🇫", "BF"), "227": ("🇳🇪", "NE"),
+    "228": ("🇹🇬", "TG"), "229": ("🇧🇯", "BJ"), "230": ("🇲🇺", "MU"),
+    "231": ("🇱🇷", "LR"), "232": ("🇸🇱", "SL"), "233": ("🇬🇭", "GH"),
+    "234": ("🇳🇬", "NG"), "235": ("🇹🇩", "TD"), "236": ("🇨🇫", "CF"),
+    "237": ("🇨🇲", "CM"), "238": ("🇨🇻", "CV"), "239": ("🇸🇹", "ST"),
+    "240": ("🇬🇶", "GQ"), "241": ("🇬🇦", "GA"), "242": ("🇨🇬", "CG"),
+    "243": ("🇨🇩", "CD"), "244": ("🇦🇴", "AO"), "245": ("🇬🇼", "GW"),
+    "248": ("🇸🇨", "SC"), "249": ("🇸🇩", "SD"), "250": ("🇷🇼", "RW"),
+    "251": ("🇪🇹", "ET"), "252": ("🇸🇴", "SO"), "253": ("🇩🇯", "DJ"),
+    "254": ("🇰🇪", "KE"), "255": ("🇹🇿", "TZ"), "256": ("🇺🇬", "UG"),
+    "257": ("🇧🇮", "BI"), "258": ("🇲🇿", "MZ"), "260": ("🇿🇲", "ZM"),
+    "261": ("🇲🇬", "MG"), "263": ("🇿🇼", "ZW"), "264": ("🇳🇦", "NA"),
+    "265": ("🇲🇼", "MW"), "266": ("🇱🇸", "LS"), "267": ("🇧🇼", "BW"),
+    "268": ("🇸🇿", "SZ"),
+
+    # 3-digit Europe & Middle East
+    "350": ("🇬🇮", "GI"), "351": ("🇵🇹", "PT"), "352": ("🇱🇺", "LU"),
+    "353": ("🇮🇪", "IE"), "354": ("🇮🇸", "IS"), "355": ("🇦🇱", "AL"),
+    "356": ("🇲🇹", "MT"), "357": ("🇨🇾", "CY"), "358": ("🇫🇮", "FI"),
+    "359": ("🇧🇬", "BG"), "370": ("🇱🇹", "LT"), "371": ("🇱🇻", "LV"),
+    "372": ("🇪🇪", "EE"), "373": ("🇲🇩", "MD"), "374": ("🇦🇲", "AM"),
+    "375": ("🇧🇾", "BY"), "376": ("🇦🇩", "AD"), "377": ("🇲🇨", "MC"),
+    "380": ("🇺🇦", "UA"), "381": ("🇷🇸", "RS"), "382": ("🇲🇪", "ME"),
+    "383": ("🇽🇰", "XK"), "385": ("🇭🇷", "HR"), "386": ("🇸🇮", "SI"),
+    "387": ("🇧🇦", "BA"), "389": ("🇲🇰", "MK"), "420": ("🇨🇿", "CZ"),
+    "421": ("🇸🇰", "SK"), "852": ("🇭🇰", "HK"), "853": ("🇲🇴", "MO"),
+    "855": ("🇰🇭", "KH"), "856": ("🇱🇦", "LA"), "880": ("🇧🇩", "BD"),
+    "886": ("🇹🇼", "TW"), "960": ("🇲🇻", "MV"), "961": ("🇱🇧", "LB"),
+    "962": ("🇯🇴", "JO"), "963": ("🇸🇾", "SY"), "964": ("🇮🇶", "IQ"),
+    "965": ("🇰🇼", "KW"), "966": ("🇸🇦", "SA"), "967": ("🇾🇪", "YE"),
+    "968": ("🇴🇲", "OM"), "970": ("🇵🇸", "PS"), "971": ("🇦🇪", "AE"),
+    "972": ("🇮🇱", "IL"), "973": ("🇧🇭", "BH"), "974": ("🇶🇦", "QA"),
+    "975": ("🇧🇹", "BT"), "976": ("🇲🇳", "MN"), "977": ("🇳🇵", "NP"),
+    "992": ("🇹🇯", "TJ"), "993": ("🇹🇲", "TM"), "994": ("🇦🇿", "AZ"),
+    "995": ("🇬🇪", "GE"), "996": ("🇰🇬", "KG"), "998": ("🇺🇿", "UZ"),
+
+    # 3-digit Americas & Caribbean
+    "501": ("🇧🇿", "BZ"), "502": ("🇬🇹", "GT"), "503": ("🇸🇻", "SV"),
+    "504": ("🇭🇳", "HN"), "505": ("🇳🇮", "NI"), "506": ("🇨🇷", "CR"),
+    "507": ("🇵🇦", "PA"), "509": ("🇭🇹", "HT"), "591": ("🇧🇴", "BO"),
+    "592": ("🇬🇾", "GY"), "593": ("🇪🇨", "EC"), "595": ("🇵🇾", "PY"),
+    "597": ("🇸🇷", "SR"), "598": ("🇺🇾", "UY"), "675": ("🇵🇬", "PG"),
+    "679": ("🇫🇯", "FJ"),
+}
+
+ISO_TO_COUNTRY_NAME: Dict[str, str] = {
+    "AD": "Andorra", "AE": "UAE", "AF": "Afghanistan", "AL": "Albania",
+    "AM": "Armenia", "AO": "Angola", "AR": "Argentina", "AT": "Austria", "AU": "Australia",
+    "AZ": "Azerbaijan", "BA": "Bosnia", "BD": "Bangladesh", "BE": "Belgium",
+    "BF": "Burkina Faso", "BG": "Bulgaria", "BH": "Bahrain", "BI": "Burundi", "BJ": "Benin",
+    "BO": "Bolivia", "BR": "Brazil", "BT": "Bhutan", "BW": "Botswana", "BY": "Belarus",
+    "BZ": "Belize", "CA": "Canada", "CD": "DR Congo", "CF": "Central Africa",
+    "CG": "Congo", "CH": "Switzerland", "CI": "Ivory Coast", "CL": "Chile", "CM": "Cameroon",
+    "CN": "China", "CO": "Colombia", "CR": "Costa Rica", "CU": "Cuba", "CV": "Cape Verde",
+    "CY": "Cyprus", "CZ": "Czech Republic", "DE": "Germany", "DJ": "Djibouti", "DK": "Denmark",
+    "DO": "Dominican Rep.", "DZ": "Algeria", "EC": "Ecuador", "EE": "Estonia", "EG": "Egypt",
+    "ES": "Spain", "ET": "Ethiopia", "FI": "Finland", "FJ": "Fiji", "FR": "France",
+    "GA": "Gabon", "GB": "United Kingdom", "GE": "Georgia", "GH": "Ghana", "GI": "Gibraltar",
+    "GM": "Gambia", "GN": "Guinea", "GQ": "Eq. Guinea", "GR": "Greece", "GT": "Guatemala",
+    "GW": "Guinea-Bissau", "GY": "Guyana", "HK": "Hong Kong", "HN": "Honduras", "HR": "Croatia",
+    "HT": "Haiti", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland", "IL": "Israel",
+    "IN": "India", "IQ": "Iraq", "IR": "Iran", "IS": "Iceland", "IT": "Italy",
+    "JM": "Jamaica", "JO": "Jordan", "JP": "Japan", "KE": "Kenya", "KG": "Kyrgyzstan",
+    "KH": "Cambodia", "KR": "South Korea", "KW": "Kuwait", "KZ": "Kazakhstan", "LA": "Laos",
+    "LB": "Lebanon", "LK": "Sri Lanka", "LR": "Liberia", "LS": "Lesotho", "LT": "Lithuania",
+    "LU": "Luxembourg", "LV": "Latvia", "LY": "Libya", "MA": "Morocco", "MC": "Monaco",
+    "MD": "Moldova", "ME": "Montenegro", "MG": "Madagascar", "MK": "North Macedonia", "ML": "Mali",
+    "MM": "Myanmar", "MN": "Mongolia", "MO": "Macau", "MR": "Mauritania", "MT": "Malta",
+    "MU": "Mauritius", "MV": "Maldives", "MW": "Malawi", "MX": "Mexico", "MY": "Malaysia",
+    "MZ": "Mozambique", "NA": "Namibia", "NE": "Niger", "NG": "Nigeria", "NI": "Nicaragua",
+    "NL": "Netherlands", "NO": "Norway", "NP": "Nepal", "NZ": "New Zealand", "OM": "Oman",
+    "PA": "Panama", "PE": "Peru", "PG": "Papua NG", "PH": "Philippines", "PK": "Pakistan",
+    "PL": "Poland", "PS": "Palestine", "PT": "Portugal", "PY": "Paraguay", "QA": "Qatar",
+    "RO": "Romania", "RS": "Serbia", "RU": "Russia", "RW": "Rwanda", "SA": "Saudi Arabia",
+    "SC": "Seychelles", "SD": "Sudan", "SE": "Sweden", "SG": "Singapore", "SI": "Slovenia",
+    "SK": "Slovakia", "SL": "Sierra Leone", "SN": "Senegal", "SO": "Somalia", "SR": "Suriname",
+    "ST": "Sao Tome", "SV": "El Salvador", "SY": "Syria", "SZ": "Eswatini", "TD": "Chad",
+    "TG": "Togo", "TH": "Thailand", "TJ": "Tajikistan", "TL": "Timor-Leste", "TM": "Turkmenistan",
+    "TN": "Tunisia", "TO": "Tonga", "TR": "Turkey", "TT": "Trinidad", "TW": "Taiwan",
+    "TZ": "Tanzania", "UA": "Ukraine", "UG": "Uganda", "US": "United States", "UY": "Uruguay",
+    "UZ": "Uzbekistan", "VC": "Saint Vincent", "VE": "Venezuela", "VN": "Vietnam", "VU": "Vanuatu",
+    "WS": "Samoa", "XK": "Kosovo", "YE": "Yemen", "ZA": "South Africa", "ZM": "Zambia", "ZW": "Zimbabwe"
+}
+
+def get_country_iso_display(item: Dict[str, Any]) -> str:
+    """Returns flag emoji and ISO code for any traffic item."""
+    for field in ["countryCode", "iso", "iso2", "country"]:
+        val = str(item.get(field) or "").strip().lower()
+        if val in COUNTRY_ISO_DATA:
+            flag, code = COUNTRY_ISO_DATA[val]
+            return f"{flag} {code}"
+
+    raw_range = str(item.get("range_name") or item.get("rangeName") or item.get("destinationName") or "").strip()
+    if raw_range:
+        parts = re.split(r"[-–—,:/]", raw_range)
+        name_key = parts[0].strip().lower()
+        if name_key in COUNTRY_ISO_DATA:
+            flag, code = COUNTRY_ISO_DATA[name_key]
+            return f"{flag} {code}"
+        for country_name, (flag, code) in COUNTRY_ISO_DATA.items():
+            if len(country_name) > 3 and country_name in raw_range.lower():
+                return f"{flag} {code}"
+
+    raw_number = str(
+        item.get("number") or item.get("destinationNumber") or
+        item.get("range_template") or item.get("rangeTemplate") or
+        item.get("dst") or ""
+    ).strip()
+    digits = re.sub(r"\D", "", raw_number)
+    for p_len in [4, 3, 2, 1]:
+        prefix = digits[:p_len]
+        if prefix in PREFIX_ISO_MAP:
+            flag, code = PREFIX_ISO_MAP[prefix]
+            return f"{flag} {code}"
+
+    return "🌐 XX"
+
+def get_country_full_name(iso_code: str, item: Optional[Dict[str, Any]] = None) -> str:
+    """Translates ISO-2 alpha code or range name to formal English country title."""
+    iso = (iso_code or "").strip().upper()
+    if iso in ISO_TO_COUNTRY_NAME:
+        return ISO_TO_COUNTRY_NAME[iso]
+    if item:
+        raw_range = str(item.get("range_name") or item.get("rangeName") or item.get("destinationName") or "").strip()
+        if raw_range:
+            parts = re.split(r"[-–—,:/]", raw_range)
+            cand = parts[0].strip().title()
+            if cand and len(cand) > 2:
+                if len(cand) > 15:
+                    cand = cand[:14].rstrip() + "."
+                return cand
+    return "Global"
+
+def mask_phone_number(num_str: str) -> str:
+    """Masks phone number for group privacy (e.g. +84987****35)."""
+    if not num_str:
+        return ""
+    clean = str(num_str).strip().replace(" ", "").replace("\u00a0", "")
+    if "*" in clean:
+        masked = re.sub(r"\d?\*{2,}", "****", clean)
+        masked = re.sub(r"\*+", "****", masked)
+        if not masked.startswith("+"):
+            masked = f"+{masked}"
+        return masked
+    digits = re.sub(r"\D", "", clean)
+    if not digits:
+        return clean
+
+    found_prefix = ""
+    for p_len in [4, 3, 2, 1]:
+        cand = digits[:p_len]
+        if cand in PREFIX_ISO_MAP and len(digits) > p_len:
+            found_prefix = cand
+            break
+
+    if found_prefix:
+        rest = digits[len(found_prefix):]
+        if len(rest) >= 6:
+            return f"+{found_prefix}{rest[:3]}****{rest[-3:]}"
+        elif len(rest) >= 4:
+            return f"+{found_prefix}{rest[:2]}****{rest[-2:]}"
+        elif len(rest) > 2:
+            return f"+{found_prefix}{rest[:1]}****{rest[-1:]}"
+        return f"+{found_prefix}{rest}"
+
+    if len(digits) >= 8:
+        return f"+{digits[:4]}****{digits[-3:]}"
+    elif len(digits) >= 5:
+        return f"+{digits[:2]}****{digits[-2:]}"
+    return f"+{digits}"
+
+def extract_otp_code(text: str) -> str:
+    """Extracts numeric or alphanumeric verification passcode from SMS text."""
+    if not text:
+        return ""
+    g_match = re.search(r"\b([Gg]-\d{4,8})\b", text)
+    if g_match:
+        return g_match.group(1).upper()
+
+    pre_match = re.search(r"\b([A-Za-z0-9\-]{3,10})\s+is\s+your\b", text, re.IGNORECASE)
+    if pre_match:
+        cand = pre_match.group(1).strip()
+        if any(c.isdigit() for c in cand):
+            return cand
+
+    kw_match = re.search(
+        r"(?:code|otp|pin|passcode|secret|verif\w*|kod\w*|codigo|clave|is)[:\s\-]+([A-Za-z0-9\-]{3,10})\b",
+        text, re.IGNORECASE,
+    )
+    if kw_match:
+        code = kw_match.group(1).strip()
+        if any(c.isdigit() for c in code):
+            return code
+
+    hyphen_match = re.findall(r"\b\d{3}-\d{3}\b|\b\d{3}-\d{4}\b|\b\d{4}-\d{4}\b", text)
+    if hyphen_match:
+        return hyphen_match[0]
+
+    digits_match = re.findall(r"\b[0-9]{4,8}\b", text)
+    if digits_match:
+        return digits_match[0]
+    return ""
+
+def parse_message_timestamp(time_str: str) -> float:
+    """Parses various timestamp representations into a UNIX epoch float."""
+    if not time_str:
+        return 0.0
+    clean = str(time_str).strip()
+    try:
+        if clean.replace(".", "", 1).isdigit():
+            val = float(clean)
+            return (val / 1000.0) if val > 1e11 else val
+        if "T" in clean:
+            clean_iso = clean.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(clean_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(clean[:19], fmt[:len(clean[:19])]).replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                continue
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
+COLLAPSED_SMS_HINT = "\u2800" * 7 + "  " + "<b>Tap to read...</b>"
+CARD_DIVIDER = "━" * 23
+
+def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 28) -> str:
+    """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
+    if not msg:
+        return ""
+    lines = []
+    for paragraph in str(msg).splitlines():
+        p = paragraph.strip()
+        if p:
+            lines.extend(textwrap.wrap(p, width=width, break_long_words=True))
+        else:
+            lines.append("")
+    wrapped = "\n".join(lines)
+    escaped = html.escape(wrapped, quote=False)
+    if otp:
+        raw_otp = otp.strip()
+        esc_otp = html.escape(raw_otp, quote=False)
+        if esc_otp and esc_otp in escaped:
+            escaped = escaped.replace(esc_otp, f"<code>{esc_otp}</code>", 1)
+        else:
+            digits = re.sub(r'\D', '', raw_otp)
+            if digits and len(digits) >= 3:
+                pattern = re.compile(r'\b' + r'[-\s]?'.join(re.escape(d) for d in digits) + r'\b')
+                m = pattern.search(escaped)
+                if m:
+                    matched_str = m.group(0)
+                    escaped = escaped[:m.start()] + f"<code>{matched_str}</code>" + escaped[m.end():]
+                elif esc_otp.replace("-", "") in escaped:
+                    raw_c = esc_otp.replace("-", "")
+                    escaped = escaped.replace(raw_c, f"<code>{raw_c}</code>", 1)
+    return escaped
+
+# In-memory deduplication caches
+seen_message_ids: Set[str] = set()
+seen_timestamps: Dict[str, float] = {}
+seen_content_signatures: Dict[str, float] = {}
+
+def is_message_duplicate(mid: str, item: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    4-Layer Duplicate & Repeat Prevention Guard:
+    1. In-memory message ID cache (seen_message_ids)
+    2. In-memory content signatures (seen_content_signatures: phone+OTP & phone+SMS body)
+    3. Primary Key check in SQLite DB (id = ?)
+    4. SQLite active content signature check (within 28h retention window).
+    """
+    if mid and mid in seen_message_ids:
+        return True
+
+    raw_num = ""
+    masked_num = ""
+    raw_msg = ""
+    otp_code = ""
+    digits = ""
+    if item:
+        raw_num = str(item.get("number") or item.get("destinationNumber") or item.get("range_template") or item.get("rangeTemplate") or item.get("dst") or "").strip()
+        if raw_num:
+            masked_num = mask_phone_number(raw_num)
+            digits = re.sub(r"\D", "", raw_num)
+        raw_msg = str(item.get("sms") or item.get("messageBody") or item.get("message") or item.get("text") or item.get("body") or item.get("otp") or "").strip()
+        otp_code = extract_otp_code(raw_msg)
+
+    if digits:
+        if otp_code:
+            sig_otp = f"otp:{digits}:{otp_code}"
+            if sig_otp in seen_content_signatures:
+                if mid:
+                    seen_message_ids.add(mid)
+                return True
+        if raw_msg:
+            clean_b = re.sub(r"\s+", " ", raw_msg).strip()
+            sig_body = f"body:{digits}:{clean_b}"
+            if sig_body in seen_content_signatures:
+                if mid:
+                    seen_message_ids.add(mid)
+                return True
+
+    num_variants = []
+    if raw_num:
+        num_variants.append(raw_num)
+        if digits:
+            if digits not in num_variants:
+                num_variants.append(digits)
+            with_plus = f"+{digits}"
+            if with_plus not in num_variants:
+                num_variants.append(with_plus)
+    if masked_num and masked_num not in num_variants:
+        num_variants.append(masked_num)
+
+    try:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        with get_main_db() as conn:
+            if mid:
+                cur = conn.execute("SELECT 1 FROM processed_otps WHERE id = ? LIMIT 1;", (mid,))
+                if cur.fetchone() is not None:
+                    seen_message_ids.add(mid)
+                    return True
+
+            if otp_code and num_variants:
+                placeholders = ",".join(["?"] * len(num_variants))
+                cur = conn.execute(
+                    f"""SELECT 1 FROM processed_otps 
+                       WHERE number IN ({placeholders}) AND otp_code = ? 
+                         AND (expires_at_epoch IS NULL OR expires_at_epoch > ?)
+                       LIMIT 1;""",
+                    (*num_variants, otp_code, now_epoch)
+                )
+                if cur.fetchone() is not None:
+                    if mid:
+                        seen_message_ids.add(mid)
+                    if digits:
+                        seen_content_signatures[f"otp:{digits}:{otp_code}"] = now_epoch
+                    return True
+
+            if raw_msg and num_variants:
+                placeholders = ",".join(["?"] * len(num_variants))
+                cur = conn.execute(
+                    f"""SELECT 1 FROM processed_otps 
+                       WHERE number IN ({placeholders}) AND TRIM(raw_message) = ? 
+                         AND (expires_at_epoch IS NULL OR expires_at_epoch > ?)
+                       LIMIT 1;""",
+                    (*num_variants, raw_msg, now_epoch)
+                )
+                if cur.fetchone() is not None:
+                    if mid:
+                        seen_message_ids.add(mid)
+                    if digits:
+                        clean_b = re.sub(r"\s+", " ", raw_msg).strip()
+                        seen_content_signatures[f"body:{digits}:{clean_b}"] = now_epoch
+                    return True
+
+    except Exception as e:
+        logger.error(f"DB duplicate check error: {e}")
+
+    return False
+
+def save_processed_otp_message(
+    item: Dict[str, Any],
+    chat_id: int = 0,
+    user_id: int = 0,
+    country: str = "",
+    masked_num: str = "",
+    otp_code: str = "",
+    status: str = "forwarded"
+) -> bool:
+    """Saves received SMS to SQLite processed_otps with arrival timestamp and strict 28h expiration."""
+    mid = str(item.get("id") or "").strip()
+    if not mid:
+        return False
+
+    raw_message = str(item.get("sms") or item.get("messageBody") or item.get("message") or item.get("text") or item.get("body") or item.get("otp") or "").strip()
+    raw_number = str(item.get("number") or item.get("destinationNumber") or item.get("range_template") or item.get("rangeTemplate") or item.get("dst") or "").strip()
+    stored_num = raw_number or masked_num
+    otp_val = otp_code or extract_otp_code(raw_message)
+    source = str(item.get("sender_id") or item.get("sourceAddress") or item.get("source") or item.get("caller") or item.get("sender") or "").strip()
+    rate = str(item.get("rate") or "").strip()
+
+    message_time = str(item.get("received_at") or item.get("receivedAt") or item.get("messageTime") or item.get("createdAt") or "").strip()
+    item_ts = parse_message_timestamp(message_time)
+    now_utc = datetime.now(timezone.utc)
+    now_epoch = now_utc.timestamp()
+
+    if item_ts > 0:
+        recv_epoch = item_ts
+    else:
+        recv_epoch = now_epoch
+        message_time = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    recv_iso = datetime.fromtimestamp(recv_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    retention_seconds = 28 * 3600
+    cutoff_28h = now_epoch - retention_seconds
+    if recv_epoch < cutoff_28h:
+        seen_message_ids.add(mid)
+        seen_timestamps[mid] = recv_epoch
+        return False
+
+    expires_epoch = recv_epoch + retention_seconds
+    expires_iso = datetime.fromtimestamp(expires_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    fwd_time_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    seen_message_ids.add(mid)
+    seen_timestamps[mid] = recv_epoch
+    if stored_num:
+        num_digits = re.sub(r"\D", "", stored_num)
+        if num_digits and otp_val:
+            seen_content_signatures[f"otp:{num_digits}:{otp_val}"] = recv_epoch
+        if num_digits and raw_message:
+            clean_b = re.sub(r"\s+", " ", raw_message).strip()
+            seen_content_signatures[f"body:{num_digits}:{clean_b}"] = recv_epoch
+
+    try:
+        with get_main_db() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_otps
+                    (id, source, country, number, otp_code, raw_message, rate, message_time,
+                     received_at, received_at_epoch, expires_at, expires_at_epoch,
+                     chat_id, user_id, forwarded_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (mid, source, country, stored_num, otp_val, raw_message, rate, message_time,
+                  recv_iso, recv_epoch, expires_iso, expires_epoch,
+                  chat_id, user_id, fwd_time_str, status))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"processed_otps DB save error: {e}")
+    return False
+
+def preload_seen_otps_from_db():
+    """Preloads active seen message IDs and signatures from SQLite into memory on startup."""
+    try:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        cutoff_epoch = now_epoch - (28 * 3600)
+        with get_main_db() as conn:
+            cur = conn.execute("""
+                SELECT id, number, otp_code, raw_message, received_at_epoch, expires_at_epoch
+                FROM processed_otps
+                WHERE (expires_at_epoch IS NOT NULL AND expires_at_epoch > ?)
+                   OR (received_at_epoch IS NOT NULL AND received_at_epoch > ?);
+            """, (now_epoch, cutoff_epoch))
+            count = 0
+            for r in cur.fetchall():
+                mid = str(r["id"] or "").strip()
+                if mid:
+                    seen_message_ids.add(mid)
+                    epoch_v = float(r["received_at_epoch"] or now_epoch)
+                    seen_timestamps[mid] = epoch_v
+                    stored_num = str(r["number"] or "").strip()
+                    otp_c = str(r["otp_code"] or "").strip()
+                    raw_m = str(r["raw_message"] or "").strip()
+                    num_digits = re.sub(r"\D", "", stored_num)
+                    if num_digits and otp_c:
+                        seen_content_signatures[f"otp:{num_digits}:{otp_c}"] = epoch_v
+                    if num_digits and raw_m:
+                        clean_b = re.sub(r"\s+", " ", raw_m).strip()
+                        seen_content_signatures[f"body:{num_digits}:{clean_b}"] = epoch_v
+                    count += 1
+        logger.info(f"Preloaded {count} active seen OTPs & signatures from SQLite database.")
+    except Exception as e:
+        logger.warning(f"Error preloading seen OTPs: {e}")
+
+def cleanup_old_otp_messages(max_age_hours: int = 28):
+    """
+    Cleans up expired OTP records older than 28 hours from:
+    1. Local SQLite processed_otps and user_claimed_numbers
+    2. In-memory deduplication caches (seen_message_ids, seen_timestamps, seen_content_signatures)
+    """
+    try:
+        now_utc = datetime.now(timezone.utc)
+        now_epoch = now_utc.timestamp()
+        now_iso = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_epoch = now_epoch - (max_age_hours * 3600)
+        cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        expired_ids = [mid for mid, ts in list(seen_timestamps.items()) if ts < cutoff_epoch]
+        for mid in expired_ids:
+            seen_timestamps.pop(mid, None)
+            seen_message_ids.discard(mid)
+
+        expired_sigs = [sig for sig, ts in list(seen_content_signatures.items()) if ts < cutoff_epoch]
+        for sig in expired_sigs:
+            seen_content_signatures.pop(sig, None)
+
+        with get_main_db() as conn:
+            cur1 = conn.execute(
+                """DELETE FROM processed_otps 
+                   WHERE (expires_at_epoch IS NOT NULL AND expires_at_epoch <= ?)
+                      OR (expires_at IS NOT NULL AND datetime(expires_at) <= datetime(?))
+                      OR (expires_at IS NULL AND datetime(forwarded_at) < datetime(?));""",
+                (now_epoch, now_iso, cutoff_iso)
+            )
+            deleted_otps = cur1.rowcount
+
+            cur2 = conn.execute(
+                "DELETE FROM user_claimed_numbers WHERE datetime(claimed_at) < datetime(?);",
+                (cutoff_iso,)
+            )
+            deleted_claims = cur2.rowcount
+            conn.commit()
+            if deleted_otps > 0 or deleted_claims > 0 or expired_ids:
+                logger.info(
+                    f"🧹 28h Cleanup: Pruned {deleted_otps} expired OTPs, {deleted_claims} claimed numbers & {len(expired_ids)} cache keys."
+                )
+    except Exception as e:
+        logger.warning(f"Error cleaning up old OTP messages: {e}")
+
+def clear_otp_history(max_age_hours: int = 0) -> int:
+    """Manually clears OTP records from database history. Returns number of records deleted."""
+    deleted = 0
+    try:
+        with get_main_db() as conn:
+            if max_age_hours > 0:
+                cutoff_epoch = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+                cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                cur = conn.execute(
+                    "DELETE FROM processed_otps WHERE (expires_at_epoch IS NOT NULL AND expires_at_epoch <= ?) OR (datetime(forwarded_at) < datetime(?));",
+                    (cutoff_epoch, cutoff_iso)
+                )
+            else:
+                cur = conn.execute("DELETE FROM processed_otps;")
+            deleted = cur.rowcount
+            conn.commit()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+        if max_age_hours == 0:
+            seen_message_ids.clear()
+            seen_timestamps.clear()
+            seen_content_signatures.clear()
+    except Exception as e:
+        logger.warning(f"Error clearing OTP history: {e}")
+    return deleted
+
+def get_today_start_utc() -> str:
+    """Returns today's 00:00:00 AM (BST = UTC+6) converted to UTC 'YYYY-MM-DD HH:MM:SS' string for today metrics."""
+    now_bd = get_bangladesh_now()
+    today_start_bd = now_bd.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_bd.astimezone(timezone.utc)
+    return today_start_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+def get_otp_stats(max_age_hours: int = 28) -> Tuple[int, int, Dict[str, int]]:
+    """Computes exact OTP statistics from processed_otps: (today_total, total_28h, country_counts)."""
+    cleanup_old_otp_messages(max_age_hours=max_age_hours)
+    cutoff_epoch = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+    cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    today_start_str = get_today_start_utc()
+    total_28h = 0
+    total_today = 0
+    country_counts: Dict[str, int] = {}
+    try:
+        with get_main_db() as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM processed_otps WHERE datetime(forwarded_at) >= datetime(?);",
+                (cutoff_iso,)
+            )
+            row = cur.fetchone()
+            total_28h = row[0] if row else 0
+
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM processed_otps WHERE datetime(forwarded_at) >= datetime(?);",
+                (today_start_str,)
+            )
+            row = cur.fetchone()
+            total_today = row[0] if row else 0
+
+            cur = conn.execute("""
+                SELECT country, COUNT(*) as cnt 
+                FROM processed_otps 
+                WHERE datetime(forwarded_at) >= datetime(?) 
+                  AND country IS NOT NULL AND country != '' 
+                GROUP BY country 
+                ORDER BY cnt DESC;
+            """, (cutoff_iso,))
+            for r in cur.fetchall():
+                c_name = str(r[0]).strip()
+                c_cnt = int(r[1])
+                if c_name:
+                    country_counts[c_name] = country_counts.get(c_name, 0) + c_cnt
+    except Exception as e:
+        logger.warning(f"Error computing OTP stats: {e}")
+    return total_today, total_28h, country_counts
+
+def format_inbox_otp_message(
+    service: str,
+    country_name: str,
+    country_flag: str,
+    unmasked_number: str,
+    otp_code: str,
+    raw_message: str,
+    show_full_sms: bool = True
+) -> str:
+    """
+    Formats the clean, simple inbox OTP card directly matching user screenshot:
+    - Service name with icon
+    - Divider line
+    - Flag + Country name
+    - Fully unmasked phone number (unhidden on inbox only)
+    - (No Reward / Balance lines)
+    - Optional expandable 'View Full SMS' blockquote if enabled
+    """
+    num_clean = str(unmasked_number or "").strip()
+    digits = re.sub(r"\D", "", num_clean)
+    num_display = f"+{digits}" if digits else num_clean
+
+    svc_icon = "💬"
+    low_svc = (service or "").lower()
+    if "whatsapp" in low_svc:
+        svc_icon = "💬"
+    elif "telegram" in low_svc:
+        svc_icon = "✈️"
+    elif "google" in low_svc:
+        svc_icon = "🔍"
+
+    c_flag = country_flag or "🌐"
+    c_name = country_name or "Global"
+
+    lines = [
+        f"{svc_icon} <b>{html.escape(service or 'SMS Service')}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{c_flag} <b>{html.escape(c_name)}</b>",
+        f"<code>{html.escape(num_display)}</code>",
+    ]
+
+    if show_full_sms and raw_message:
+        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=28)
+        lines.append("")
+        lines.append(EXPANDABLE_SMS_LABEL)
+        lines.append(
+            f"<blockquote expandable>⠀\n"
+            f"{COLLAPSED_SMS_HINT}\n"
+            f"⠀\n"
+            f"{CARD_DIVIDER}\n"
+            f"💬 <b>SMS Content:</b>\n"
+            f"{styled_sms}</blockquote>"
+        )
+
+    return "\n".join(lines)
+
+def format_group_otp_message(
+    item: Dict[str, Any],
+    sms_format: str = "long"
+) -> Tuple[str, str, str]:
+    """Formats verification pass OTP card for Telegram groups with masked number for privacy."""
+    raw_source = str(item.get("sender_id") or item.get("sourceAddress") or item.get("source") or item.get("caller") or item.get("sender") or "SMS Service").strip()
+    raw_number = str(item.get("number") or item.get("destinationNumber") or item.get("range_template") or item.get("rangeTemplate") or item.get("template") or item.get("dst") or "")
+    masked_number = html.escape(mask_phone_number(raw_number)) if raw_number else ""
+    raw_message = str(item.get("sms") or item.get("messageBody") or item.get("message") or item.get("text") or item.get("body") or item.get("otp") or "")
+    otp_code = extract_otp_code(raw_message)
+
+    country_iso = get_country_iso_display(item).strip()
+    parts = country_iso.split(maxsplit=1)
+    flag = parts[0] if parts else "🌐"
+    iso = parts[1] if len(parts) > 1 else "XX"
+    country_name = get_country_full_name(iso, item)
+
+    if iso != "XX" and country_name and country_name != "Global":
+        country_display = f"{flag} <b>{html.escape(country_name)} ({iso})</b>"
+    elif country_name and country_name != "Global":
+        country_display = f"{flag} <b>{html.escape(country_name)}</b>"
+    elif iso != "XX":
+        country_display = f"{flag} <b>{iso}</b>"
+    else:
+        country_display = f"{flag} <b>Global</b>"
+
+    low_source = raw_source.lower()
+    low_msg = raw_message.lower()
+    wa_keywords = ["whatsapp", "‏واتساب‏", "واتساب", "ватсап", "wa code", "wa.me"]
+    tg_keywords = ["telegram", "telegram code", "t.me"]
+    if "whatsapp" in low_source or any(k in low_msg for k in wa_keywords):
+        source = "WhatsApp"
+    elif "telegram" in low_source or any(k in low_msg for k in tg_keywords):
+        source = "Telegram"
+    elif "google" in low_source or "google" in low_msg or raw_message.startswith("G-"):
+        source = "Google"
+    else:
+        source = html.escape(raw_source)
+
+    num_plain = masked_number if masked_number else country_name
+    country_plain = re.sub(r'<[^>]+>', '', country_display).strip()
+    source_plain = html.unescape(source)
+    clean_msg = raw_message.strip()
+
+    quote_block = ""
+    if sms_format != "short" and clean_msg:
+        styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=28)
+        quote_block = (
+            f"\n\n{EXPANDABLE_SMS_LABEL}\n"
+            f"<blockquote expandable>⠀\n"
+            f"{COLLAPSED_SMS_HINT}\n"
+            f"⠀\n"
+            f"{CARD_DIVIDER}\n"
+            f"💬 <b>SMS Content:</b>\n"
+            f"{styled_sms}</blockquote>"
+        )
+
+    if otp_code:
+        full_text = (
+            f"🎟️ <b>VERIFICATION PASS</b>\n"
+            f"{CARD_DIVIDER}\n"
+            f"🏷️ <b>Service:</b> {source_plain}\n"
+            f"🌍 <b>Country:</b> {country_plain}\n"
+            f"📱 <b>Number:</b> {num_plain}\n"
+            f"{CARD_DIVIDER}\n"
+            f"🔑 <b>PASSCODE:</b> <code>{otp_code}</code>"
+            f"{quote_block}"
+        )
+    elif clean_msg:
+        if sms_format == "short":
+            full_text = (
+                f"🎟️ <b>VERIFICATION PASS</b>\n"
+                f"{CARD_DIVIDER}\n"
+                f"🏷️ <b>Service:</b> {source_plain}\n"
+                f"🌍 <b>Country:</b> {country_plain}\n"
+                f"📱 <b>Number:</b> {num_plain}\n"
+                f"{CARD_DIVIDER}\n"
+                f"🔑 <b>PASSCODE:</b> <i>See full SMS</i>"
+            )
+        else:
+            full_text = (
+                f"🎟️ <b>VERIFICATION PASS</b>\n"
+                f"{CARD_DIVIDER}\n"
+                f"🏷️ <b>Service:</b> {source_plain}\n"
+                f"🌍 <b>Country:</b> {country_plain}\n"
+                f"📱 <b>Number:</b> {num_plain}\n"
+                f"{CARD_DIVIDER}"
+                f"{quote_block}"
+            )
+    else:
+        full_text = (
+            f"🎟️ <b>VERIFICATION PASS</b>\n"
+            f"{CARD_DIVIDER}\n"
+            f"🏷️ <b>Service:</b> {source_plain}\n"
+            f"🌍 <b>Country:</b> {country_plain}\n"
+            f"📱 <b>Number:</b> {num_plain}"
+        )
+
+    return full_text, otp_code, raw_message
+
+def build_otp_button_row(
+    otp_code: str,
+    custom_buttons: Optional[List[Dict[str, str]]] = None
+) -> Optional[InlineKeyboardMarkup]:
+    """Builds inline keyboard with tap-to-copy OTP button and optional custom link buttons."""
+    buttons = []
+    otp_btn = None
+    if otp_code:
+        if CopyTextButton:
+            otp_btn = InlineKeyboardButton(otp_code, copy_text=CopyTextButton(text=otp_code))
+        else:
+            otp_btn = InlineKeyboardButton(f"🔑 {otp_code}", callback_data=f"copy_num_{otp_code}")
+
+    custom_btns = []
+    if custom_buttons:
+        for cb in custom_buttons:
+            b_text = str(cb.get("text", "")).strip()
+            raw_u = str(cb.get("url", "")).strip()
+            norm_u = normalize_button_url(raw_u) or raw_u
+            if b_text and norm_u.startswith(("http://", "https://", "tg://")):
+                custom_btns.append(InlineKeyboardButton(b_text, url=norm_u))
+
+    if otp_btn and custom_btns:
+        if len(custom_btns) <= 2:
+            buttons.append([otp_btn] + custom_btns)
+        else:
+            buttons.append([otp_btn, custom_btns[0]])
+            for i in range(1, len(custom_btns), 2):
+                buttons.append(custom_btns[i:i+2])
+    elif otp_btn:
+        buttons.append([otp_btn])
+    elif custom_btns:
+        if len(custom_btns) <= 3:
+            buttons.append(custom_btns)
+        else:
+            for i in range(0, len(custom_btns), 2):
+                buttons.append(custom_btns[i:i+2])
+
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+class ThirdwaveClient:
+    """Client for Thirdwave SMS API (GET https://thirdwave.im/api/v1/traffic) with 30 req/min rate limit protection."""
+    def __init__(self, base_url: str, api_key: str, timeout: float = 20.0):
+        self.base_url = self.clean_base_url(base_url)
+        self.api_key = api_key.strip()
+        self.timeout = timeout
+        self.cooldown_until: float = 0.0
+        self._client: Optional[httpx.AsyncClient] = None
+
+    @staticmethod
+    def clean_base_url(url: str) -> str:
+        clean = (url or "").strip().rstrip("/")
+        if clean.endswith("/api/v1/traffic"):
+            clean = clean[:-len("/api/v1/traffic")].rstrip("/")
+        if clean and not clean.startswith(("http://", "https://")):
+            clean = f"https://{clean}"
+        return clean or "https://thirdwave.im"
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0),
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "NumberBotman/2.0",
+                },
+            )
+        return self._client
+
+    async def fetch_incoming_messages(self, limit: int = 30) -> List[Dict[str, Any]]:
+        now = time.time()
+        if now < self.cooldown_until:
+            return []
+
+        if not self.api_key:
+            return []
+
+        endpoint = f"{self.base_url}/api/v1/traffic"
+        safe_limit = min(max(1, limit), 60)
+        params = {
+            "api_key": self.api_key,
+            "limit": safe_limit,
+        }
+
+        try:
+            client = self._get_http_client()
+            res = await client.get(endpoint, params=params)
+
+            if res.is_success:
+                data = res.json()
+                raw_items = []
+                if isinstance(data, dict):
+                    raw_items = data.get("items") or data.get("rows") or []
+                elif isinstance(data, list):
+                    raw_items = data
+
+                seen = set()
+                out: List[Dict[str, Any]] = []
+
+                for r in raw_items:
+                    if not isinstance(r, dict):
+                        continue
+
+                    item_num = str(r.get("number") or r.get("destinationNumber") or "").strip()
+                    item_sender = str(r.get("sender_id") or r.get("sourceAddress") or r.get("source") or r.get("caller") or r.get("sender") or "").strip()
+                    item_sms = str(r.get("sms") or r.get("messageBody") or r.get("message") or r.get("text") or r.get("body") or r.get("otp") or "").strip()
+                    item_recv = str(r.get("received_at") or r.get("receivedAt") or r.get("messageTime") or r.get("createdAt") or "").strip()
+                    item_range = str(r.get("range_name") or r.get("rangeName") or r.get("destinationName") or "").strip()
+                    item_tmpl = str(r.get("range_template") or r.get("rangeTemplate") or "").strip()
+                    item_rate = str(r.get("rate") or "").strip()
+
+                    mid = str(r.get("id") or "").strip()
+                    if not mid:
+                        sig = f"{item_num}|{item_recv}|{item_sender}|{item_sms}"
+                        mid = hashlib.sha256(sig.encode("utf-8")).hexdigest()[:20]
+
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+
+                    item_dict = dict(r)
+                    item_dict["id"] = mid
+                    item_dict["number"] = item_num
+                    item_dict["destinationNumber"] = item_num
+                    item_dict["sender_id"] = item_sender
+                    item_dict["sourceAddress"] = item_sender
+                    item_dict["source"] = item_sender
+                    item_dict["sms"] = item_sms
+                    item_dict["messageBody"] = item_sms
+                    item_dict["message"] = item_sms
+                    item_dict["received_at"] = item_recv
+                    item_dict["receivedAt"] = item_recv
+                    item_dict["range_name"] = item_range
+                    item_dict["rangeName"] = item_range
+                    item_dict["destinationName"] = item_range
+                    item_dict["range_template"] = item_tmpl
+                    item_dict["rangeTemplate"] = item_tmpl
+                    item_dict["rate"] = item_rate
+
+                    out.append(item_dict)
+
+                return out
+
+            elif res.status_code == 429:
+                retry_header = res.headers.get("Retry-After", "")
+                try:
+                    retry_wait = float(retry_header) if retry_header else 20.0
+                except Exception:
+                    retry_wait = 20.0
+                self.cooldown_until = time.time() + retry_wait
+                logger.warning(f"⚠️ Thirdwave 429 Rate Limit. Waiting {retry_wait:.1f}s...")
+                return []
+
+            elif res.status_code in (401, 403):
+                logger.warning(f"❌ Thirdwave Auth Error (HTTP {res.status_code})")
+                return []
+
+            elif res.status_code == 503:
+                self.cooldown_until = time.time() + 5.0
+                return []
+
+            else:
+                logger.warning(f"⚠️ Thirdwave API returned HTTP {res.status_code}")
+                return []
+
+        except httpx.ConnectTimeout:
+            logger.debug("Thirdwave API connection timed out.")
+        except Exception as e:
+            logger.debug(f"Thirdwave fetch error: {e}")
+        return []
+
+thirdwave_client = ThirdwaveClient(base_url=THIRDWAVE_BASE_URL, api_key=THIRDWAVE_API_KEY)
+
+async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
+    """Delivers incoming OTP to user inbox if claimed, and forwards to Telegram group(s)."""
+    mid = str(item.get("id") or "").strip()
+    raw_number = str(
+        item.get("number") or item.get("destinationNumber") or
+        item.get("range_template") or item.get("rangeTemplate") or
+        item.get("dst") or ""
+    ).strip()
+    raw_msg = str(
+        item.get("sms") or item.get("messageBody") or
+        item.get("message") or item.get("text") or
+        item.get("body") or item.get("otp") or ""
+    ).strip()
+    raw_source = str(
+        item.get("sender_id") or item.get("sourceAddress") or
+        item.get("source") or item.get("caller") or
+        item.get("sender") or "SMS Service"
+    ).strip()
+    otp_code = extract_otp_code(raw_msg)
+
+    country_iso = get_country_iso_display(item).strip()
+    parts = country_iso.split(maxsplit=1)
+    flag = parts[0] if parts else "🌐"
+    iso = parts[1] if len(parts) > 1 else "XX"
+    country_name = get_country_full_name(iso, item)
+
+    low_source = raw_source.lower()
+    low_msg = raw_msg.lower()
+    if "whatsapp" in low_source or "whatsapp" in low_msg or "wa code" in low_msg:
+        service_name = "WhatsApp"
+    elif "telegram" in low_source or "telegram" in low_msg:
+        service_name = "Telegram"
+    elif "google" in low_source or "google" in low_msg or raw_msg.startswith("G-"):
+        service_name = "Google"
+    else:
+        service_name = raw_source or "SMS Service"
+
+    inbox_enabled = is_inbox_otp_enabled()
+    full_sms_enabled = is_view_full_sms_enabled()
+
+    # 1. User inbox delivery (unmasked phone number)
+    owner_id = get_number_owner(raw_number, max_age_hours=28)
+    inbox_delivered = False
+
+    if owner_id and inbox_enabled:
+        inbox_text = format_inbox_otp_message(
+            service=service_name,
+            country_name=country_name,
+            country_flag=flag,
+            unmasked_number=raw_number,
+            otp_code=otp_code,
+            raw_message=raw_msg,
+            show_full_sms=full_sms_enabled,
+        )
+        inbox_kb = build_otp_button_row(otp_code)
+        try:
+            await bot.send_message(
+                chat_id=owner_id,
+                text=inbox_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=inbox_kb,
+            )
+            inbox_delivered = True
+            logger.info(f"📬 Delivered Live OTP ({mid}) to User Inbox {owner_id} ({raw_number})")
+        except Exception as e:
+            logger.warning(f"Could not deliver OTP to user inbox {owner_id}: {e}")
+
+    # 2. Telegram Group(s) delivery (masked phone number for privacy)
+    group_targets = get_target_group_chat_ids()
+    group_delivered = False
+    if group_targets:
+        group_text, _, _ = format_group_otp_message(item, sms_format=("long" if full_sms_enabled else "short"))
+        group_kb = build_otp_button_row(otp_code, custom_buttons=get_custom_link_buttons())
+        for gid in group_targets:
+            try:
+                await bot.send_message(
+                    chat_id=gid,
+                    text=group_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=group_kb,
+                )
+                group_delivered = True
+            except Exception as e:
+                logger.warning(f"Could not forward OTP to group {gid}: {e}")
+
+    # 3. Permanent database record for deduplication & retention
+    status = "inbox_and_group" if (inbox_delivered and group_delivered) else (
+        "inbox_only" if inbox_delivered else (
+            "group_only" if group_delivered else (
+                "silent_recorded" if not inbox_enabled else "unclaimed_recorded"
+            )
+        )
+    )
+    save_processed_otp_message(
+        item=item,
+        chat_id=group_targets[0] if group_targets else 0,
+        user_id=owner_id or 0,
+        country=country_name,
+        masked_num=mask_phone_number(raw_number),
+        otp_code=otp_code,
+        status=status,
+    )
+    return inbox_delivered or group_delivered or True
+
+async def poll_thirdwave_otp_loop(application: Application):
+    """
+    Continuous background polling loop for Thirdwave traffic.
+    Respects the 30 req/min API rate limit, checks 4-layer duplicate prevention,
+    delivers claimed numbers to user inbox, and forwards to group(s).
+    """
+    bot_start_time = time.time()
+    logger.info("⚡ Integrated Thirdwave OTP Engine polling loop started.")
+    while True:
+        try:
+            if not thirdwave_client.api_key:
+                await asyncio.sleep(5.0)
+                continue
+
+            messages = await thirdwave_client.fetch_incoming_messages(limit=30)
+            new_items = []
+            now_utc_epoch = datetime.now(timezone.utc).timestamp()
+            cutoff_28h = now_utc_epoch - (28 * 3600)
+
+            for m in messages:
+                mid = str(m.get("id") or "").strip()
+                if not mid or is_message_duplicate(mid, m):
+                    continue
+
+                raw_t = str(m.get("received_at") or m.get("receivedAt") or m.get("messageTime") or m.get("createdAt") or "")
+                msg_ts = parse_message_timestamp(raw_t)
+                if msg_ts > 0 and (msg_ts < (bot_start_time - 15.0) or msg_ts < cutoff_28h):
+                    seen_message_ids.add(mid)
+                    seen_timestamps[mid] = msg_ts
+                    continue
+
+                new_items.append(m)
+                seen_message_ids.add(mid)
+                ts_seen = msg_ts if msg_ts > 0 else now_utc_epoch
+                seen_timestamps[mid] = ts_seen
+                raw_n = str(m.get("number") or m.get("destinationNumber") or m.get("range_template") or m.get("rangeTemplate") or m.get("dst") or "")
+                dig = re.sub(r"\D", "", raw_n)
+                raw_m_text = str(m.get("sms") or m.get("messageBody") or m.get("message") or m.get("text") or m.get("body") or m.get("otp") or "").strip()
+                otp_c = extract_otp_code(raw_m_text)
+                if dig and otp_c:
+                    seen_content_signatures[f"otp:{dig}:{otp_c}"] = ts_seen
+                if dig and raw_m_text:
+                    clean_b = re.sub(r"\s+", " ", raw_m_text).strip()
+                    seen_content_signatures[f"body:{dig}:{clean_b}"] = ts_seen
+
+            if new_items:
+                logger.info(f"🔔 {len(new_items)} new SMS/OTP traffic item(s) detected!")
+                for item in reversed(new_items):
+                    try:
+                        await deliver_otp_item(application.bot, item)
+                    except Exception as de:
+                        logger.warning(f"Delivery exception: {de}")
+                    await asyncio.sleep(0.05)
+
+        except (TimedOut, NetworkError) as net_err:
+            logger.debug(f"Network hiccup in OTP poll: {net_err}")
+            await asyncio.sleep(2.0)
+        except Exception as e:
+            logger.warning(f"Error in OTP polling loop: {e}")
+            await asyncio.sleep(2.0)
+
+        await asyncio.sleep(max(1.0, POLL_INTERVAL_SECONDS))
+
+async def periodic_otp_cleanup_loop():
+    """Background task: periodically deletes expired records and cache items older than 28 hours."""
+    while True:
+        try:
+            await asyncio.sleep(60.0)
+            cleanup_old_otp_messages(max_age_hours=28)
+        except Exception as e:
+            logger.debug(f"Periodic OTP cleanup notice: {e}")
+
+# ==========================================
 # 6. Gist Persistent Storage Sync
 # ==========================================
 GIST_HEADERS = {
@@ -1717,6 +3184,9 @@ class GistStorage:
                     current_group_link = get_group_link()
                     current_group_name = get_group_name()
 
+                cutoff_seen = datetime.now(timezone.utc).timestamp() - (28 * 3600)
+                valid_seen = {k: v for k, v in seen_timestamps.items() if v >= cutoff_seen}
+
                 payload = {
                     "description": self.description,
                     "files": {
@@ -1732,6 +3202,7 @@ class GistStorage:
                                 "used_countries": used_data,
                                 "users": users_data,
                                 "admins": admins_data,
+                                "seen_otps": valid_seen,
                                 "handover": is_handover,
                                 "handover_epoch": datetime.now(timezone.utc).timestamp() if is_handover else 0.0,
                             }, indent=2)
@@ -1780,6 +3251,19 @@ class GistStorage:
                         if isinstance(saved_settings, dict):
                             for sk, sv in saved_settings.items():
                                 set_bot_setting(str(sk), str(sv))
+
+                        # Restore Seen OTPs from Gist cloud state
+                        saved_seen = parsed.get("seen_otps", {})
+                        if isinstance(saved_seen, dict):
+                            cutoff_s = datetime.now(timezone.utc).timestamp() - (28 * 3600)
+                            for smid, sts in saved_seen.items():
+                                try:
+                                    f_sts = float(sts)
+                                    if f_sts >= cutoff_s:
+                                        seen_message_ids.add(smid)
+                                        seen_timestamps[smid] = f_sts
+                                except Exception:
+                                    pass
 
                         # Restore Group Link & Button Name
                         saved_group = parsed.get("group_link") or parsed.get("otp_group_link")
@@ -2905,6 +4389,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     else:
         handover_info = "<code>Always-Online (Continuous)</code>"
 
+    inbox_status = "🟢 ON (Delivering to DMs)" if is_inbox_otp_enabled() else "🔕 OFF (Groups only)"
+    full_sms_status = "📜 Long (Shown)" if is_view_full_sms_enabled() else "⚡ Short (Removed)"
+    today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
+
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2914,6 +4402,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
         f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
+        f"• <b>Inbox OTP:</b> <code>{inbox_status}</code>\n"
+        f"• <b>Full SMS:</b> <code>{full_sms_status}</code>\n"
+        f"• <b>OTPs Today:</b> <code>{today_otps} received</code>\n"
+        f"• <b>28h OTP Records:</b> <code>{total_28h_otps} records</code>\n"
         f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Live Inventory:</b>\n"
@@ -2928,6 +4420,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     )
 
     keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"🔔 Inbox OTP: {'ON ✅' if is_inbox_otp_enabled() else 'OFF ❌'}", callback_data="toggle_inbox_otp"),
+            InlineKeyboardButton(f"📩 Full SMS: {'ON ✅' if is_view_full_sms_enabled() else 'OFF ❌'}", callback_data="toggle_view_full_sms"),
+        ],
         [
             InlineKeyboardButton("➕ Add Numbers", callback_data="admin_upload_prompt"),
             InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")
@@ -2945,10 +4441,11 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
         ],
         [
-            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
-            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt")
+            InlineKeyboardButton("🧹 Clear History", callback_data="admin_clear_otp_history"),
+            InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt")
         ],
         [
+            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt"),
             InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash")
         ],
     ])
@@ -4718,6 +6215,44 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=kb
         )
+
+    # OTP Controls Callbacks
+    elif data == "toggle_inbox_otp" and user_admin:
+        current = is_inbox_otp_enabled()
+        new_val = not current
+        set_inbox_otp_enabled(new_val)
+        if gist_storage.enabled:
+            gist_storage.mark_dirty()
+        alert_msg = "🔔 Inbox OTP receiving turned ON!" if new_val else "🔕 Inbox OTP receiving turned OFF (Groups only)!"
+        await query.answer(alert_msg, show_alert=False)
+        admin_text, keyboard = build_admin_dashboard(user.id)
+        try:
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception:
+            pass
+
+    elif data == "toggle_view_full_sms" and user_admin:
+        current = is_view_full_sms_enabled()
+        new_val = not current
+        set_view_full_sms_enabled(new_val)
+        if gist_storage.enabled:
+            gist_storage.mark_dirty()
+        alert_msg = "📜 View Full SMS enabled (Expandable blockquote)" if new_val else "⚡ View Full SMS removed (Clean Short card)"
+        await query.answer(alert_msg, show_alert=False)
+        admin_text, keyboard = build_admin_dashboard(user.id)
+        try:
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception:
+            pass
+
+    elif data == "admin_clear_otp_history" and user_admin:
+        cleared_cnt = clear_otp_history(max_age_hours=0)
+        await query.answer(f"🧹 Cleared {cleared_cnt} OTP records from history!", show_alert=True)
+        admin_text, keyboard = build_admin_dashboard(user.id)
+        try:
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except Exception:
+            pass
 
     # 6. Admin Panel / Refresh Dashboard
     elif (data == "admin_panel" or data == "admin_refresh_dash") and user_admin:
@@ -6581,6 +8116,13 @@ def main():
 
         # Start background Gist sync debounce loop
         asyncio.create_task(periodic_gist_sync_loop())
+
+        # Preload seen OTPs from SQLite into memory for instant duplicate prevention
+        preload_seen_otps_from_db()
+
+        # Start Thirdwave Integrated Polling Loop and 28h Cleanup Pruner
+        asyncio.create_task(poll_thirdwave_otp_loop(application))
+        asyncio.create_task(periodic_otp_cleanup_loop())
 
     app.post_init = post_init
 

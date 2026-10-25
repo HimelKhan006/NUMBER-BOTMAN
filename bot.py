@@ -2829,7 +2829,7 @@ def format_inbox_otp_message(
                 break
 
     if iso_clean and iso_clean != "XX":
-        country_part = f"{c_flag} #{iso_clean}"
+        country_part = f"{c_flag} {iso_clean}"
     elif c_name and c_name != "Global":
         country_part = f"{c_flag} {html.escape(c_name)}"
     else:

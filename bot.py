@@ -2836,6 +2836,20 @@ def format_inbox_otp_message(
                 iso_clean = code
                 break
 
+    # If flag is plain text (like "VN") instead of an emoji, resolve emoji flag
+    if not any(ord(ch) > 127 for ch in c_flag):
+        iso_lookup = (iso_clean or "").lower()
+        if iso_lookup in COUNTRY_FLAGS:
+            c_flag = COUNTRY_FLAGS[iso_lookup]
+        elif iso_lookup in COUNTRY_ISO_DATA:
+            c_flag = COUNTRY_ISO_DATA[iso_lookup][0]
+        elif c_name.lower() in COUNTRY_FLAGS:
+            c_flag = COUNTRY_FLAGS[c_name.lower()]
+        elif c_name.lower() in COUNTRY_ISO_DATA:
+            c_flag = COUNTRY_ISO_DATA[c_name.lower()][0]
+        else:
+            c_flag = "🌐"
+
     if iso_clean and iso_clean != "XX":
         country_part = f"({iso_clean} {c_flag})"
     elif c_name and c_name != "Global":
@@ -2846,7 +2860,6 @@ def format_inbox_otp_message(
     svc_display = html.escape(service or "SMS Service")
     lines = [
         "📩 <b>New SMS Received</b>",
-        "",
         f"💬 <b>{svc_display}</b> {country_part}",
         f"📱 <b>{html.escape(num_display)}</b>",
     ]

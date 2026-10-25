@@ -4882,10 +4882,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
-            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash")
+            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt")
         ],
         [
-            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart_prompt"),
+            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh_dash"),
         ],
     ])
     return admin_text, keyboard

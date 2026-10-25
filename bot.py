@@ -4544,7 +4544,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(f"📩 Full SMS: {'ON ✅' if is_view_full_sms_enabled() else 'OFF ❌'}", callback_data="toggle_view_full_sms"),
         ],
         [
-            InlineKeyboardButton("👁️ SMS Format & Preview", callback_data="admin_sms_format_menu"),
+            InlineKeyboardButton("📋 SMS Format", callback_data="admin_sms_format_menu"),
             InlineKeyboardButton("🧹 Clear History", callback_data="admin_clear_otp_history"),
         ],
         [

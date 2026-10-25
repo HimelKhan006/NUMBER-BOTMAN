@@ -193,7 +193,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "2.0"))
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "1.8"))
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -203,6 +203,7 @@ bot_process_start_time: float = time.time()
 
 USER_STATES: Dict[int, Dict[str, Any]] = {}
 ADMIN_STATES: Dict[int, Dict[str, Any]] = {}
+CLAIMED_NUMBER_OWNER_CACHE: Dict[str, Tuple[int, float]] = {}
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MAIN_DB_FILE    = os.getenv("DB_FILE", os.path.join(BASE_DIR, "bot4_database.db"))
@@ -1349,6 +1350,11 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
                     INSERT INTO user_claimed_numbers (number, user_id, country_id, is_secret, claimed_at)
                     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP);
                 """, (num, user_id, country_id, secret_val))
+                dig = re.sub(r"\D", "", str(num))
+                if dig:
+                    c_now = time.time()
+                    CLAIMED_NUMBER_OWNER_CACHE[dig] = (user_id, c_now)
+                    CLAIMED_NUMBER_OWNER_CACHE[f"+{dig}"] = (user_id, c_now)
             mconn.commit()
     except Exception as e:
         logger.warning(f"Error logging delivery: {e}")
@@ -1686,8 +1692,8 @@ def set_view_full_sms_enabled(enabled: bool):
 def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int]:
     """
     Finds which user claimed this phone number within the active retention window.
-    Checks user_claimed_numbers table with phone number variants (+prefix, no prefix, digits only).
-    Also checks country databases' used_numbers table as a fallback.
+    First checks the ultra-fast in-memory cache (< 0.01ms), then queries user_claimed_numbers,
+    with a fallback check to country databases' used_numbers table.
     """
     if not phone_number:
         return None
@@ -1695,6 +1701,17 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
     digits = re.sub(r"\D", "", raw_num)
     if not digits:
         return None
+
+    now_t = time.time()
+    cutoff_epoch = now_t - (max_age_hours * 3600)
+
+    # 1. Ultra-fast in-memory lookup (< 0.01ms)
+    for k in (digits, f"+{digits}", raw_num):
+        if k in CLAIMED_NUMBER_OWNER_CACHE:
+            uid, ctime = CLAIMED_NUMBER_OWNER_CACHE[k]
+            if ctime >= cutoff_epoch:
+                return uid
+
     candidates = [raw_num, f"+{digits}", digits]
     cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1709,7 +1726,10 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
             )
             row = cur.fetchone()
             if row and row["user_id"]:
-                return int(row["user_id"])
+                uid = int(row["user_id"])
+                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
+                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
+                return uid
     except Exception as e:
         logger.debug(f"Error checking user_claimed_numbers owner: {e}")
 
@@ -1728,7 +1748,10 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
                             )
                             r = cur.fetchone()
                             if r and r[0]:
-                                return int(r[0])
+                                uid = int(r[0])
+                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
+                                return uid
                     except Exception:
                         pass
     except Exception as e:
@@ -2385,6 +2408,28 @@ def preload_seen_otps_from_db():
                         clean_b = re.sub(r"\s+", " ", raw_m).strip()
                         seen_content_signatures[f"body:{num_digits}:{clean_b}"] = epoch_v
                     count += 1
+
+            # Also preload active claimed numbers into instant owner cache
+            try:
+                cur_claims = conn.execute("""
+                    SELECT number, user_id FROM user_claimed_numbers
+                    WHERE datetime(claimed_at) >= datetime(?);
+                """, ((datetime.now(timezone.utc) - timedelta(hours=28)).strftime("%Y-%m-%d %H:%M:%S"),))
+                claim_cnt = 0
+                for row in cur_claims.fetchall():
+                    c_num = str(row["number"] or "").strip()
+                    c_uid = int(row["user_id"] or 0)
+                    if c_num and c_uid:
+                        dig = re.sub(r"\D", "", c_num)
+                        if dig:
+                            CLAIMED_NUMBER_OWNER_CACHE[dig] = (c_uid, now_epoch)
+                            CLAIMED_NUMBER_OWNER_CACHE[f"+{dig}"] = (c_uid, now_epoch)
+                            claim_cnt += 1
+                if claim_cnt > 0:
+                    logger.info(f"⚡ Preloaded {claim_cnt} claimed numbers into instant in-memory owner cache.")
+            except Exception as ce:
+                logger.debug(f"Claimed numbers preload note: {ce}")
+
         logger.info(f"Preloaded {count} active seen OTPs & signatures from SQLite database.")
     except Exception as e:
         logger.warning(f"Error preloading seen OTPs: {e}")
@@ -2410,6 +2455,10 @@ def cleanup_old_otp_messages(max_age_hours: int = 28):
         expired_sigs = [sig for sig, ts in list(seen_content_signatures.items()) if ts < cutoff_epoch]
         for sig in expired_sigs:
             seen_content_signatures.pop(sig, None)
+
+        expired_owners = [k for k, v in list(CLAIMED_NUMBER_OWNER_CACHE.items()) if v[1] < cutoff_epoch]
+        for k in expired_owners:
+            CLAIMED_NUMBER_OWNER_CACHE.pop(k, None)
 
         with get_main_db() as conn:
             cur1 = conn.execute(
@@ -2458,6 +2507,7 @@ def clear_otp_history(max_age_hours: int = 0) -> int:
             seen_message_ids.clear()
             seen_timestamps.clear()
             seen_content_signatures.clear()
+            CLAIMED_NUMBER_OWNER_CACHE.clear()
     except Exception as e:
         logger.warning(f"Error clearing OTP history: {e}")
     return deleted
@@ -2737,7 +2787,7 @@ class ThirdwaveClient:
             )
         return self._client
 
-    async def fetch_incoming_messages(self, limit: int = 30) -> List[Dict[str, Any]]:
+    async def fetch_incoming_messages(self, limit: int = 60) -> List[Dict[str, Any]]:
         now = time.time()
         if now < self.cooldown_until:
             return []
@@ -2959,7 +3009,7 @@ async def poll_thirdwave_otp_loop(application: Application):
                 await asyncio.sleep(5.0)
                 continue
 
-            messages = await thirdwave_client.fetch_incoming_messages(limit=30)
+            messages = await thirdwave_client.fetch_incoming_messages(limit=60)
             new_items = []
             now_utc_epoch = datetime.now(timezone.utc).timestamp()
             cutoff_28h = now_utc_epoch - (28 * 3600)
@@ -2971,7 +3021,8 @@ async def poll_thirdwave_otp_loop(application: Application):
 
                 raw_t = str(m.get("received_at") or m.get("receivedAt") or m.get("messageTime") or m.get("createdAt") or "")
                 msg_ts = parse_message_timestamp(raw_t)
-                if msg_ts > 0 and (msg_ts < (bot_start_time - 15.0) or msg_ts < cutoff_28h):
+                # If message is genuinely older than 28 hours or arrived more than 120s before bot start, archive it silently
+                if msg_ts > 0 and (msg_ts < (bot_start_time - 120.0) or msg_ts < cutoff_28h):
                     seen_message_ids.add(mid)
                     seen_timestamps[mid] = msg_ts
                     continue
@@ -3006,7 +3057,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(1.0, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(0.5, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""

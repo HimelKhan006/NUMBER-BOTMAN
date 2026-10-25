@@ -2868,8 +2868,11 @@ def format_inbox_otp_message(
         styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=20)
         lines.append("")
         lines.append(
-            f"<blockquote expandable>{COLLAPSED_SMS_HINT}\n"
+            f"<blockquote expandable>⠀\n"
+            f"{COLLAPSED_SMS_HINT}\n"
+            f"⠀\n"
             f"{QUOTE_DIVIDER}\n"
+            f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
 

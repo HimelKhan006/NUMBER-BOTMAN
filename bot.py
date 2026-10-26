@@ -196,7 +196,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "1.0"))
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "2.0"))
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -3115,7 +3115,7 @@ def build_otp_button_row(
 
 class ThirdwaveClient:
     """Client for Thirdwave SMS API (GET https://thirdwave.im/api/v1/traffic) with 30 req/min rate limit protection."""
-    def __init__(self, base_url: str, api_key: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 8.0):
         self.base_url = self.clean_base_url(base_url)
         self.api_key = api_key.strip()
         self.timeout = timeout
@@ -3230,11 +3230,11 @@ class ThirdwaveClient:
             elif res.status_code == 429:
                 retry_header = res.headers.get("Retry-After", "")
                 try:
-                    retry_wait = float(retry_header) if retry_header else 20.0
+                    retry_wait = min(float(retry_header), 6.0) if retry_header else 2.5
                 except Exception:
-                    retry_wait = 20.0
+                    retry_wait = 2.5
                 self.cooldown_until = time.time() + retry_wait
-                logger.warning(f"⚠️ Thirdwave 429 Rate Limit. Waiting {retry_wait:.1f}s...")
+                logger.warning(f"⚠️ Thirdwave 429 Rate Limit. Backing off {retry_wait:.1f}s...")
                 return []
 
             elif res.status_code in (401, 403):
@@ -3412,7 +3412,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(0.5, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(2.0, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""
@@ -4087,7 +4087,7 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
         for cb in custom_buttons:
             keyboard.append([KeyboardButton(cb["text"])])
 
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool = False, is_secret_mode: bool = False) -> InlineKeyboardMarkup:
     countries = get_all_countries_with_stock(only_active=(not is_admin_mode), secret_mode=is_secret_mode)
@@ -5907,7 +5907,8 @@ async def render_prompt_response(
     prompt_msg_id: Optional[int],
     user_msg,
     text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    sync_keyboard_user_id: Optional[int] = None
 ):
     """Deletes the admin's raw typed message and edits the prompt card in-place (or sends new if edit fails)."""
     if user_msg:
@@ -5925,21 +5926,43 @@ async def render_prompt_response(
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup
             )
-            return
         except Exception as e:
-            if "not modified" in str(e).lower():
-                return
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
-            except Exception:
-                pass
+            if "not modified" not in str(e).lower():
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup
-    )
+    if sync_keyboard_user_id:
+        try:
+            m = await context.bot.send_message(
+                chat_id=chat_id,
+                text="⌨️ <i>Menu keyboard updated.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(sync_keyboard_user_id)
+            )
+            async def _cleanup(msg_to_del):
+                await asyncio.sleep(1.5)
+                try:
+                    await msg_to_del.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_cleanup(m))
+        except Exception:
+            pass
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6189,7 +6212,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"• <b>New:</b> <code>{html.escape(text)}</code>\n"
                     f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>"
                 )
-                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb, sync_keyboard_user_id=user.id)
                 return
 
         elif action == "reurl" and target_id:
@@ -6218,7 +6241,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
                     f"• <b>New URL:</b> <code>{html.escape(clean_url)}</code>"
                 )
-                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb, sync_keyboard_user_id=user.id)
                 return
 
         elif action == "add":
@@ -6260,7 +6283,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"• <b>Link:</b> <code>{html.escape(clean_url)}</code>\n"
                 f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)"
             )
-            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb, sync_keyboard_user_id=user.id)
             return
 
     if admin_state.get("awaiting_api_url"):
@@ -7448,6 +7471,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=kb
         )
+        try:
+            m = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="⌨️ <i>Menu keyboard updated.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id)
+            )
+            async def _cleanup(msg_to_del):
+                await asyncio.sleep(1.5)
+                try:
+                    await msg_to_del.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_cleanup(m))
+        except Exception:
+            pass
 
     elif data == "link_clear_all_confirm" and user_admin:
         msg_text, markup = build_buttons_clear_all_confirm_view()
@@ -7479,6 +7518,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=kb
         )
+        try:
+            m = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="⌨️ <i>Menu keyboard updated.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id)
+            )
+            async def _cleanup(msg_to_del):
+                await asyncio.sleep(1.5)
+                try:
+                    await msg_to_del.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_cleanup(m))
+        except Exception:
+            pass
 
     elif data.startswith("link_rename_") and user_admin:
         btn_id = data.replace("link_rename_", "").strip()

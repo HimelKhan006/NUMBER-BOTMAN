@@ -196,7 +196,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "3.0"))
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "3.5"))
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -3412,7 +3412,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(3.0, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(3.5, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""

@@ -1826,11 +1826,8 @@ def set_view_full_sms_enabled(enabled: bool):
 def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int]:
     """
     Finds which user claimed this phone number within the active retention window.
-    Strictly verifies that:
-    1. The country still exists in the active countries table.
-    2. The country stock database file exists on disk.
-    3. The number has NOT been removed or deleted by an admin.
-    If the number or country was removed by an admin, returns None to block SMS delivery.
+    Guarantees that active numbers delivered from the pool route incoming OTPs
+    directly to that user's private inbox on Number Bot.
     """
     if not phone_number:
         return None
@@ -1842,94 +1839,44 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
     now_t = time.time()
     cutoff_epoch = now_t - (max_age_hours * 3600)
 
-    # 1. Fast in-memory lookup (< 0.01ms)
+    # 1. Ultra-fast in-memory cache (< 0.01ms)
     for k in (digits, f"+{digits}", raw_num):
         if k in CLAIMED_NUMBER_OWNER_CACHE:
             entry = CLAIMED_NUMBER_OWNER_CACHE[k]
-            if len(entry) == 3:
-                uid, cid, ctime = entry
-            else:
-                uid, ctime = entry
-                cid = None
-
-            if ctime < cutoff_epoch:
-                CLAIMED_NUMBER_OWNER_CACHE.pop(k, None)
-                continue
-
-            # Verify that the country database still exists on disk
-            if cid is not None:
-                c_db = os.path.join(STOCKS_DIR, f"country_{cid}.db")
-                if not os.path.exists(c_db):
-                    CLAIMED_NUMBER_OWNER_CACHE.pop(k, None)
-                    continue
-
-            return uid
+            uid = entry[0] if isinstance(entry, (tuple, list)) else entry
+            ctime = entry[-1] if isinstance(entry, (tuple, list)) else now_t
+            if ctime >= cutoff_epoch:
+                return uid
 
     candidates = [raw_num, f"+{digits}", digits]
     cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2. Query user_claimed_numbers with INNER JOIN on active countries table
+    # 2. Query user_claimed_numbers
     try:
         with get_main_db() as conn:
             placeholders = ",".join(["?"] * len(candidates))
             cur = conn.execute(
-                f"""SELECT ucn.user_id, ucn.country_id 
-                    FROM user_claimed_numbers ucn
-                    INNER JOIN countries c ON c.id = ucn.country_id
-                    WHERE ucn.number IN ({placeholders}) AND datetime(ucn.claimed_at) >= datetime(?)
-                    ORDER BY ucn.id DESC LIMIT 1;""",
+                f"""SELECT user_id FROM user_claimed_numbers
+                    WHERE number IN ({placeholders}) AND datetime(claimed_at) >= datetime(?)
+                    ORDER BY id DESC LIMIT 1;""",
                 (*candidates, cutoff_dt)
             )
             row = cur.fetchone()
             if row and row["user_id"]:
                 uid = int(row["user_id"])
-                cid = int(row["country_id"])
-                c_path = os.path.join(STOCKS_DIR, f"country_{cid}.db")
-                if os.path.exists(c_path):
-                    # Verify number is still present in country database (not deleted by admin)
-                    try:
-                        with sqlite3.connect(c_path, timeout=5.0) as cconn:
-                            found = cconn.execute(
-                                f"SELECT 1 FROM used_numbers WHERE number IN ({placeholders}) "
-                                f"UNION ALL SELECT 1 FROM available_numbers WHERE number IN ({placeholders}) LIMIT 1;",
-                                (*candidates, *candidates)
-                            ).fetchone()
-                            if found:
-                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, cid, now_t)
-                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, cid, now_t)
-                                return uid
-                            else:
-                                # Number was deleted by admin from this country! Delete from claimed numbers
-                                conn.execute(f"DELETE FROM user_claimed_numbers WHERE number IN ({placeholders});", candidates)
-                                conn.commit()
-                                CLAIMED_NUMBER_OWNER_CACHE.pop(digits, None)
-                                CLAIMED_NUMBER_OWNER_CACHE.pop(f"+{digits}", None)
-                                return None
-                    except Exception:
-                        pass
-                else:
-                    # Country database was deleted! Clean up dead records
-                    conn.execute("DELETE FROM user_claimed_numbers WHERE country_id = ?;", (cid,))
-                    conn.commit()
+                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
+                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
+                return uid
     except Exception as e:
         logger.debug(f"Error checking user_claimed_numbers owner: {e}")
 
-    # Fallback: check individual country databases used_numbers ONLY for active countries
+    # 3. Fallback: check country databases used_numbers
     try:
         if os.path.exists(STOCKS_DIR):
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
-                    cid_str = f.replace("country_", "").replace(".db", "")
-                    cid = int(cid_str) if cid_str.isdigit() else 0
-                    if not cid:
-                        continue
+                    c_path = os.path.join(STOCKS_DIR, f)
                     try:
-                        with get_main_db() as mconn:
-                            c_exists = mconn.execute("SELECT 1 FROM countries WHERE id = ?;", (cid,)).fetchone()
-                        if not c_exists:
-                            continue
-
-                        c_path = os.path.join(STOCKS_DIR, f)
                         with sqlite3.connect(c_path, timeout=5.0) as cconn:
                             placeholders = ",".join(["?"] * len(candidates))
                             cur = cconn.execute(
@@ -1939,13 +1886,13 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
                             r = cur.fetchone()
                             if r and r[0]:
                                 uid = int(r[0])
-                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, cid, now_t)
-                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, cid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
                                 return uid
                     except Exception:
                         pass
     except Exception as e:
-        logger.debug(f"Fallback country used_numbers check notice: {e}")
+        logger.debug(f"Country stock owner check fallback note: {e}")
 
     return None
 

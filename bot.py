@@ -3999,10 +3999,17 @@ def format_delivered_numbers(
 ) -> str:
     """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
     display_cname = format_country_name(country_name)
+    grp_link = get_group_link()
+    if grp_link:
+        otp_note = f"<i>💡 If the OTP is not received here, please check the <a href=\"{html.escape(grp_link)}\">OTP Group</a>.</i>"
+    else:
+        otp_note = "<i>💡 If the OTP is not received here, please check the OTP Group.</i>"
+
     lines = [
         f"<b>{html.escape(display_cname)} Allocated For You</b>",
         "",
         "🕒 <b>Waiting for OTP...</b> ⏳",
+        otp_note,
     ]
     if available_count is not None and available_count > 0:
         lines.append("")
@@ -4030,7 +4037,8 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
     Bottom reply keyboard:
     Row 1: ⚡ Get Number | 🔒 Secret Numbers (if secret access or admin)
     Row 2: 👤 My Account | 👑 Admin Panel (if admin)
-    Row 3+: Custom buttons
+    Row 3: 🔄 Restart (if admin)
+    Row 4+: Custom buttons
     """
     has_secret = bool(user_id and (is_admin(user_id) or user_has_secret_access(user_id)))
     admin = bool(user_id and is_admin(user_id))
@@ -4046,6 +4054,7 @@ def get_user_reply_keyboard(user_id: int = 0) -> ReplyKeyboardMarkup:
 
     if admin:
         keyboard.append([KeyboardButton("👤 My Account"), KeyboardButton("👑 Admin Panel")])
+        keyboard.append([KeyboardButton("🔄 Restart")])
     elif has_secret:
         keyboard.append([KeyboardButton("👤 My Account")])
 
@@ -6034,6 +6043,27 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"Your administrator privileges on <b>{html.escape(bot_name)}</b> have been revoked.\n"
                 "You no longer have access to the Admin Dashboard.\n\n"
                 "<i>Your menu has been updated to Standard User mode.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id)
+            )
+        return
+
+    if text in ["🔄 Restart", "Restart"]:
+        if is_admin(user.id):
+            status_msg = await update.message.reply_text(
+                "🔄 <b>Restarting Bot Engine...</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ <i>Saving state and rebooting cleanly...</i>\n"
+                "<i>You will receive a confirmation message once online.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            await perform_zero_restart_handover(status_msg)
+        else:
+            bot_name = get_bot_name()
+            await update.message.reply_text(
+                "⛔ <b>Access Restricted</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"You do not have administrator permissions on <b>{html.escape(bot_name)}</b>.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_user_reply_keyboard(user.id)
             )
@@ -9291,11 +9321,10 @@ def main():
                 logger.debug(f"Default commands register notice: {cmd_err}")
 
             # 2. Wipe commands from groups ONLY (groups will have 0 commands and default menu)
-            for sc in (BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
-                try:
-                    await application.bot.set_my_commands([], scope=sc)
-                except Exception:
-                    pass
+            try:
+                await application.bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+            except Exception:
+                pass
 
             # 3. For all users and admins: strictly ONLY /start command in [≡ Menu]
             for aid in get_all_admin_ids():

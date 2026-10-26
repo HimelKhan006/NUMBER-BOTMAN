@@ -4420,15 +4420,13 @@ async def show_user_help(update: Update, user_id: int):
         "❓ <b>NUMBER BOTMAN User Guide:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>How to use:</b>\n"
-        "1. Tap <b>⚡ Get Number</b> or send <code>/getnumber</code>\n"
+        "1. Tap <b>⚡ Get Number</b> button below or in your menu.\n"
         "2. Select a country from the available inventory.\n"
         "3. You will receive exclusive numbers with 1-tap copy buttons.\n"
         "4. Tap <b>🔄 Next Number</b> to rotate to new numbers instantly.\n"
         "5. Toggle '+' prefix on/off anytime with <b>➖ Remove '+'</b> / <b>➕ Add '+'</b>.\n\n"
-        "<b>Available Commands:</b>\n"
-        "• <code>/start</code> — Open Main Menu & Interactive Dashboard\n"
-        "• <code>/getnumber</code> — Choose a country and receive numbers\n"
-        "• <code>/history</code> — View your account statistics"
+        "<b>Bot Menu:</b>\n"
+        "• <code>/start</code> — Open Main Menu & Interactive Dashboard"
     )
     buttons = [
         [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")]
@@ -9234,51 +9232,8 @@ def main():
         .build()
     )
 
+    # Strictly ONLY /start is registered as a slash command. All other interactions are button-driven.
     app.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("getnumber", getnumber_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("secretnumbers", secretnumbers_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("inventory", inventory_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("history", history_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("stats", stats_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("admins", admins_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("addadmin", addadmin_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("adduser", adduser_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler(["removeuser", "deleteuser"], removeuser_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setlink", setlink_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("removelink", removelink_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setbtnurl", setbtnurl_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setgroup", setgroup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setgroupname", setgroupname_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setbtnname", setbtnname_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("grantsecret", grantsecret_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("revokesecret", revokesecret_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("user", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("find", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("search", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("finduser", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("users", admin_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setname", setname_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("resetname", resetname_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("seturl", seturl_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setkey", setkey_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setquantity", setquantity_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("setqty", setquantity_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("status", status_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("restart", restart_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("reboot", restart_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("account", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("myaccount", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("me", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("profile", user_lookup_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("ban", ban_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("unban", unban_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("broadcast", broadcast_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("sendto", sendto_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("recall", recall_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("delbroadcast", recall_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler(["format", "preview"], format_command, filters=filters.ChatType.PRIVATE))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, handle_document_upload))

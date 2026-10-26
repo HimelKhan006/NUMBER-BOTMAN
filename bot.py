@@ -4559,9 +4559,7 @@ def build_buttons_list_view() -> Tuple[str, InlineKeyboardMarkup]:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "ℹ️ <i>No custom buttons are currently configured.</i>\n\n"
             "Custom buttons appear side-by-side on all delivered number screens.\n\n"
-            "Tap <b>➕ Add New Button</b> below to create one, or use:\n"
-            "<code>/setlink Button Name | @bot_username</code>\n"
-            "<i>or:</i> <code>/setlink Button Name | https://yourlink.com</code>"
+            "Tap <b>➕ Add New Button</b> below to configure your link and button label."
         )
         kb = [
             [InlineKeyboardButton("➕ Add New Button", callback_data="link_add_prompt")],
@@ -5027,9 +5025,7 @@ def build_api_url_view() -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Default System URL:</b> <code>https://thirdwave.im</code>\n"
         f"• <b>Cloud Database:</b> <code>Synced & Encrypted 🔒</code>\n\n"
         "💬 <b>How to update:</b>\n"
-        "• Click <b>✏️ Enter New URL</b> below to type in chat.\n"
-        "• Or send: <code>/seturl &lt;new_url&gt;</code>\n"
-        "<i>Example:</i> <code>/seturl https://thirdwave.im</code>"
+        "• Tap <b>✏️ Enter New URL</b> below to type in chat."
     )
     kb = [
         [
@@ -5051,9 +5047,7 @@ def build_api_key_view() -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Status:</b> <code>{'Configured ✅' if current_key else 'Missing ⚠️'}</code>\n"
         f"• <b>Cloud Database:</b> <code>Synced & Encrypted 🔒</code>\n\n"
         "💬 <b>How to update:</b>\n"
-        "• Click <b>✏️ Enter New Key</b> below to type in chat.\n"
-        "• Or send: <code>/setkey &lt;your_api_key&gt;</code>\n"
-        "<i>Example:</i> <code>/setkey tw_live_1234567890abcdef</code>"
+        "• Tap <b>✏️ Enter New Key</b> below to type in chat."
     )
     kb = [
         [InlineKeyboardButton("✏️ Enter New Key", callback_data="prompt_set_key")],
@@ -5723,7 +5717,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚡ <b>{current_bot_name} — Live Engine Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
-        f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
+        f"• <b>Bot Name:</b> <code>{current_bot_name}</code>\n"
         f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
         f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
@@ -7361,8 +7355,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• <b>Current Name:</b> <code>{html.escape(found['text'])}</code>\n"
                 f"• <b>Target URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
-                f"💬 <b>Send the new button name</b> directly in this chat, or use:\n"
-                f"<code>/setbtnname {found['id']} &lt;New Name&gt;</code>",
+                f"💬 <b>Send the new button name</b> directly in this chat:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
@@ -7383,9 +7376,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
                 f"• <b>Current URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
                 f"💬 <b>Send the new link URL or bot username</b> directly in this chat:\n"
-                f"<code>https://...</code> or <code>@bot_username</code>\n\n"
-                f"<b>Or use command:</b>\n"
-                f"<code>/setbtnurl {found['id']} &lt;New URL or @bot_username&gt;</code>",
+                f"<code>https://...</code> or <code>@bot_username</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
@@ -7403,8 +7394,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "💬 <b>Send button name and link or bot username</b> in chat using this format:\n"
             "<code>Button Name | @bot_username</code>\n"
             "<i>or:</i> <code>Button Name | https://yourlink.com</code>\n\n"
-            "<b>Or run command:</b>\n"
-            "<code>/setlink Button Name | @bot_username</code>\n\n"
             "<i>Examples:</i>\n"
             "• <code>🤖 Thirdwave OTP Bot | @my_otp_bot</code>\n"
             "• <code>📢 Join Channel | https://t.me/mychannel</code>",
@@ -8078,9 +8067,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• <b>Secret Whitelisted Users:</b> <code>{stats['total_secret_users']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔍 <b>Find & Manage User by Account ID:</b>\n"
-            f"Tap the button below or type an Account ID in chat to search, grant secret access, ban, message, or remove any user.\n"
+            f"Tap the buttons below to search, grant secret access, ban, message, or remove any user.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>Tip: You can also search directly by typing <code>/user &lt;id&gt;</code> or simply sending the ID in chat.</i>"
+            f"💡 <i>Tip: Tap 🔍 Search User by ID below or simply send an Account ID in chat.</i>"
         )
         buttons = [
             [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
@@ -8099,7 +8088,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"Please type the numerical Telegram <b>Account ID</b> in chat:\n\n"
             f"<i>Example: <code>8751050958</code></i>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>You can also search directly anytime by typing <code>/user &lt;id&gt;</code></i>"
+            f"💡 <i>Tip: You can search anytime by sending the Account ID directly in chat.</i>"
         )
         await query.edit_message_text(
             prompt_text,
@@ -8119,7 +8108,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"Please type the numerical Telegram <b>Account ID</b> to permanently remove from the database:\n\n"
             f"<i>Example: <code>8751050958</code></i>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>Tip: You can also remove directly anytime by typing <code>/removeuser &lt;id&gt;</code></i>"
+            f"💡 <i>Tip: Send the Account ID to view user details and confirmation before removal.</i>"
         )
         await query.edit_message_text(
             prompt_text,

@@ -4440,6 +4440,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>Use the menu buttons below to get started:</i>"
     )
 
+    # Ensure [≡ Menu] command button is locked and permanently visible in user's chat
+    try:
+        await context.bot.set_chat_menu_button(chat_id=user.id, menu_button=MenuButtonCommands())
+    except Exception:
+        pass
+
     await update.message.reply_text(
         main_text,
         parse_mode=ParseMode.HTML,
@@ -9132,27 +9138,37 @@ def main():
 
     async def setup_bot_commands(application: Application):
         try:
-            # 1. COMPLETELY WIPE commands from DEFAULT scope and ALL groups
-            for sc in (BotCommandScopeDefault(), BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
-                try:
-                    await application.bot.delete_my_commands(scope=sc)
-                except Exception:
-                    pass
-
-            # 2. Minimal command menu: ONLY /start across all private chats
             start_only = [
                 BotCommand("start", "🚀 Main Menu"),
             ]
-            await application.bot.set_my_commands(start_only, scope=BotCommandScopeAllPrivateChats())
-            await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            # 1. Lock command list and [≡ Menu] button permanently on Default and Private scopes (Zero flickering)
+            try:
+                await application.bot.set_my_commands(start_only, scope=BotCommandScopeDefault())
+                await application.bot.set_my_commands(start_only, scope=BotCommandScopeAllPrivateChats())
+                await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            except Exception as cmd_err:
+                logger.debug(f"Default commands register notice: {cmd_err}")
 
+            # 2. Wipe commands from groups ONLY (groups will have 0 commands and default menu)
+            for sc in (BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
+                try:
+                    await application.bot.set_my_commands([], scope=sc)
+                except Exception:
+                    pass
+
+            # 3. For admins: provide /start and /admin in their personal command menu
+            admin_cmds = [
+                BotCommand("start", "🚀 Main Menu"),
+                BotCommand("admin", "👑 Admin Dashboard"),
+            ]
             for aid in get_all_admin_ids():
                 if aid:
                     try:
-                        await application.bot.set_my_commands(start_only, scope=BotCommandScopeChat(aid))
+                        await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(aid))
+                        await application.bot.set_chat_menu_button(chat_id=aid, menu_button=MenuButtonCommands())
                     except Exception:
                         pass
-            logger.info("✅ Telegram Bot Command Menu: ONLY /start in DM, 0 commands in groups.")
+            logger.info("✅ Telegram Bot Command Menu: Permanently active in private chat (Zero flickering); groups wiped (0 commands).")
         except Exception as e:
             logger.warning(f"Could not configure Bot Command Menu: {e}")
 

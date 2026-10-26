@@ -9156,15 +9156,11 @@ def main():
                 except Exception:
                     pass
 
-            # 3. For admins: provide /start and /admin in their personal command menu
-            admin_cmds = [
-                BotCommand("start", "🚀 Main Menu"),
-                BotCommand("admin", "👑 Admin Dashboard"),
-            ]
+            # 3. For all users and admins: strictly ONLY /start command in [≡ Menu]
             for aid in get_all_admin_ids():
                 if aid:
                     try:
-                        await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(aid))
+                        await application.bot.set_my_commands(start_only, scope=BotCommandScopeChat(aid))
                         await application.bot.set_chat_menu_button(chat_id=aid, menu_button=MenuButtonCommands())
                     except Exception:
                         pass

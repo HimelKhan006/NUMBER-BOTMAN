@@ -3927,16 +3927,16 @@ async def send_startup_announcement(application: Application):
     manual_restart = get_bot_setting("manual_restart", "0") == "1"
     admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
 
-    # A new update is detected if the git commit changed, STARTUP_TYPE is "push", or manual restart
+    # Scheduled safety-net triggers and routine session handovers must NEVER announce (100% silent continuation)
+    if STARTUP_TYPE == "schedule" or _is_handover:
+        logger.info(f"🤫 Automated session continuation (trigger={STARTUP_TYPE or 'none'}, handover={_is_handover}): startup notification suppressed.")
+        return
+
+    # A new update is ONLY if git commit actually changed, or manual restart was triggered
     is_new_update = bool(
         (current_commit and current_commit != last_notified_commit)
-        or (STARTUP_TYPE == "push")
+        or manual_restart
     )
-
-    # Completely suppress on routine automated handover sessions unless an actual new update was pushed or admin manually restarted
-    if _is_handover and not is_new_update and not manual_restart:
-        logger.info(f"🤫 Automated session handover continuation (commit: {current_commit or 'unknown'}): restart notification suppressed (zero-restart mode).")
-        return
 
     if not is_new_update and not manual_restart and not admin_alert_enabled:
         logger.info("ℹ️ NUMBER BOTMAN started cleanly in background (no new update to alert).")
@@ -3967,9 +3967,16 @@ async def send_startup_announcement(application: Application):
             except Exception as e:
                 logger.warning(f"Initial alert failed for admin {aid}: {e}")
 
-    # Record this commit in database so subsequent routine 24/7 handover sessions remain silent
+    # Record this commit in database and Gist so subsequent routine 24/7 handover sessions remain silent
     if current_commit:
         set_bot_setting("last_notified_commit", current_commit)
+        try:
+            with get_main_db() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
 # ==========================================
 # 9. Keyboards & Views

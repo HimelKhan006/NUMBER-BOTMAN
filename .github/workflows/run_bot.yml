@@ -10,13 +10,14 @@ on:
         required: false
         default: 'false'
   schedule:
-    # Backup safety net — fires every 6h if self-trigger ever fails
+    # Backup safety net — fires every 6h ONLY if bot ever stops
     - cron: '0 */6 * * *'
 
-# Only ONE bot instance ever runs. New run cancels the old one instantly.
+# Only ONE bot instance ever runs. New push/handover cancels old one instantly so updates apply with ZERO delay.
+# Scheduled backup uses a unique group so it NEVER cancels an active running bot!
 concurrency:
-  group: number-botman-single-instance
-  cancel-in-progress: true
+  group: number-botman-${{ github.event_name == 'schedule' && github.run_id || 'single-instance' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
   actions: write
@@ -32,6 +33,30 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Scheduled Safety-Net Check
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔍 Checking if bot is already running in 24/7 session..."
+          ACTIVE_RUNS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=20" \
+            | python3 -c "
+          import sys, json
+          runs = json.load(sys.stdin).get('workflow_runs', [])
+          active = [r for r in runs if str(r.get('id')) != '${{ github.run_id }}']
+          print(len(active))
+          ")
+          if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo "✅ Bot is already running healthy in 24/7 session ($ACTIVE_RUNS active runner). Backup schedule exiting cleanly without interrupting."
+            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel" || true
+            exit 0
+          fi
+          echo "⚠️ No active runner detected! Scheduled backup will start the bot now."
 
       # ─────────────────────────────────────────────────────────────────
       # Restore the database & stock pools from cache FIRST
@@ -53,6 +78,7 @@ jobs:
             bot4-database-
 
       - name: Cancel Any Other Running Instances
+        if: github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           ALT_TOKEN: ${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}

@@ -193,7 +193,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "1.8"))
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "1.0"))
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -675,7 +675,14 @@ def init_db():
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
 
+_RECENTLY_REGISTERED_USERS: Dict[int, float] = {}
+
 def register_user(user_id: int, username: str = "", first_name: str = ""):
+    now = time.time()
+    last = _RECENTLY_REGISTERED_USERS.get(user_id, 0.0)
+    if (now - last) < 600.0:
+        return
+    _RECENTLY_REGISTERED_USERS[user_id] = now
     try:
         with get_main_db() as conn:
             conn.execute("""
@@ -1434,12 +1441,7 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
         logger.warning(f"Error logging delivery: {e}")
 
     if "gist_storage" in globals() and gist_storage.enabled:
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                loop.create_task(gist_storage.export_and_sync(immediate=True))
-        except Exception:
-            gist_storage.mark_dirty()
+        gist_storage.mark_dirty()
 
     return numbers, remaining, country_name
 
@@ -6402,21 +6404,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.edit_message_text(
                         "⚠️ <b>Number Not Available</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"No numbers are currently available in stock for <b>{c_display}</b>.\n\n"
-                        "Please click <b>⚡ Get Number</b> below to choose an available country.",
+                        f"No numbers are currently available in stock for <b>{c_display}</b>.",
                         parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
-                            [InlineKeyboardButton("◀️ Back", callback_data="btn_get_number")]
-                        ])
+                        reply_markup=None
                     )
                 except BadRequest as br:
                     if "Message is not modified" not in str(br):
                         raise
                 return
-
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             pref_plus = get_user_plus_preference(user.id)
             response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
@@ -6476,21 +6471,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.edit_message_text(
                         "⚠️ <b>Number Not Available</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"No secret numbers are currently available in stock for <b>{c_display}</b>.\n\n"
-                        "Please click <b>🔒 Secret Numbers</b> below to choose an available country.",
+                        f"No secret numbers are currently available in stock for <b>{c_display}</b>.",
                         parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔒 Secret Numbers", callback_data="btn_get_secret_number")],
-                            [InlineKeyboardButton("◀️ Back", callback_data="btn_get_secret_number")]
-                        ])
+                        reply_markup=None
                     )
                 except BadRequest as br:
                     if "Message is not modified" not in str(br):
                         raise
                 return
-
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             pref_plus = get_user_plus_preference(user.id)
             response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)

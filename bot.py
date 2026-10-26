@@ -7423,7 +7423,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>Active Administrators:</b>\n"
             f"{admins_formatted}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>All administrators have full access to /admin, stock uploads, and bot management.</i>\n"
+            f"💡 <i>All administrators have full access to the Admin Panel, stock uploads, and bot management.</i>\n"
             f"<i>Super Admins are defined in GitHub Secrets / .env and cannot be removed via Telegram.</i>"
         )
         keyboard = InlineKeyboardMarkup([
@@ -7490,7 +7490,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>Active Administrators:</b>\n"
             f"{admins_formatted}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>All administrators have full access to /admin, stock uploads, and bot management.</i>"
+            f"💡 <i>All administrators have full access to the Admin Panel, stock uploads, and bot management.</i>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
@@ -9092,7 +9092,6 @@ def main():
     app.add_handler(CommandHandler("history", history_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", stats_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("admin", admin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("admins", admins_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("addadmin", addadmin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("removeadmin", removeadmin_command, filters=filters.ChatType.PRIVATE))

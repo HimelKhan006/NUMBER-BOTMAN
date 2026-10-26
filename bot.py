@@ -6326,7 +6326,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_name = text.strip()[:64]
         default_name = get_default_bot_name()
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Rename Again", callback_data="admin_set_bot_name_prompt")],
+            [InlineKeyboardButton("✏️ Rename Again", callback_data="admin_set_name_prompt")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         if new_name.lower() in ("default", "reset"):
@@ -6358,7 +6358,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         admin_state.pop("awaiting_qty_val", None)
         admin_state.pop("awaiting_fixed_quantity", None)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔢 Fixed Quantity Settings", callback_data="admin_fixed_qty_menu")],
+            [InlineKeyboardButton("🔢 Fixed Quantity Settings", callback_data="admin_qty_menu")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         if text.isdigit() and 1 <= int(text) <= 1000:
@@ -6381,7 +6381,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         admin_state.pop("awaiting_group_link", None)
         admin_state.pop("awaiting_otp_group_link", None)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Channel Settings", callback_data="admin_channel_menu")],
+            [InlineKeyboardButton("🔗 Custom Buttons", callback_data="link_list")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         if text.lower() in ("none", "remove", "clear"):
@@ -6419,7 +6419,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             asyncio.create_task(gist_storage.export_and_sync())
         resp_text = f"✅ Channel Button Name updated: <code>{html.escape(text)}</code>"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Channel Settings", callback_data="admin_channel_menu")],
+            [InlineKeyboardButton("🔗 Custom Buttons", callback_data="link_list")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
         await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, kb)
@@ -7281,7 +7281,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # 5a-2. Refresh User Profile Callback
-    elif data == "btn_refresh_profile":
+    elif data in ("btn_refresh_profile", "btn_my_account"):
         await query.answer("🔄 Profile refreshed!")
         await show_user_profile(update, target_user_id=user.id, viewer_user_id=user.id)
 

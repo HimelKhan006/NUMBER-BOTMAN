@@ -90,12 +90,14 @@ def get_current_commit() -> str:
     if sha:
         return sha[:7]
     try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
         res = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=3
+            timeout=3,
+            cwd=repo_dir
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -1646,8 +1648,12 @@ def normalize_button_url(raw_url: str) -> Optional[str]:
 def get_custom_link_buttons() -> List[Dict[str, str]]:
     """
     Returns list of custom buttons for Number Bot: [{"id": "1", "text": "...", "url": "..."}, ...]
-    Backwards compatible with legacy group_link / otp_group_link only if custom_link_buttons was never configured.
+    Backwards compatible with legacy group_link / otp_group_link only if custom_link_buttons was never configured or cleared.
     """
+    # If explicitly cleared by admin, return [] immediately
+    if get_bot_setting("custom_link_buttons_cleared", "0") == "1":
+        return []
+
     buttons = []
     has_explicit_setting = False
     try:
@@ -1655,7 +1661,9 @@ def get_custom_link_buttons() -> List[Dict[str, str]]:
         if raw_val is not None:
             has_explicit_setting = True
             raw_str = str(raw_val).strip()
-            if raw_str and raw_str != "[]":
+            if raw_str == "[]":
+                return []
+            if raw_str:
                 parsed = json.loads(raw_str)
                 if isinstance(parsed, list):
                     for idx, item in enumerate(parsed):
@@ -1664,10 +1672,11 @@ def get_custom_link_buttons() -> List[Dict[str, str]]:
                             b_url  = str(item["url"]).strip()
                             b_id   = str(item.get("id") or (idx + 1))
                             buttons.append({"id": b_id, "text": b_text, "url": b_url})
+                    return buttons
     except Exception as e:
         logger.warning(f"Error reading custom_link_buttons: {e}")
 
-    # Backwards compatibility with legacy single group link only if never explicitly configured
+    # Backwards compatibility with legacy single group link only if never explicitly configured or cleared
     if not buttons and not has_explicit_setting:
         legacy_url = get_group_link()
         legacy_name = get_group_name()
@@ -1687,20 +1696,39 @@ def save_custom_link_buttons(buttons: List[Dict[str, str]]):
             "url": str(b.get("url", "")).strip(),
         })
     try:
-        set_bot_setting("custom_link_buttons", json.dumps(normalized))
+        if normalized:
+            set_bot_setting("custom_link_buttons", json.dumps(normalized))
+            set_bot_setting("custom_link_buttons_cleared", "0")
+            set_group_link(normalized[0]["url"])
+            set_group_name(normalized[0]["text"])
+        else:
+            set_bot_setting("custom_link_buttons", "[]")
+            set_bot_setting("custom_link_buttons_cleared", "1")
+            set_group_link("")
+            set_group_name("")
+            # Purge legacy rows from bot_settings
+            try:
+                with get_main_db() as conn:
+                    conn.execute("DELETE FROM bot_settings WHERE key IN ('group_link', 'otp_group_link', 'group_name', 'otp_group_name');")
+                    conn.commit()
+            except Exception:
+                pass
+            # Also clear backup disk files
+            for bf in [os.path.join(BASE_DIR, "group_link.txt"), os.path.join(BASE_DIR, "otp_group_link.txt")]:
+                try:
+                    if os.path.exists(bf):
+                        with open(bf, "w", encoding="utf-8") as f:
+                            f.write("")
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning(f"Error saving custom_link_buttons: {e}")
 
-    if normalized:
-        set_group_link(normalized[0]["url"])
-        set_group_name(normalized[0]["text"])
-    else:
-        set_group_link("")
-
     if "gist_storage" in globals() and gist_storage.enabled:
         try:
-            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
-        except Exception:
+            loop = asyncio.get_running_loop()
+            loop.create_task(gist_storage.export_and_sync(immediate=True))
+        except (RuntimeError, Exception):
             pass
 
 DEFAULT_BOT_NAME = "NUMBER BOTMAN"
@@ -3607,9 +3635,15 @@ class GistStorage:
                                 except Exception:
                                     pass
 
-                        # Restore Group Link & Button Name ONLY if custom_link_buttons not configured
+                        # Restore Group Link & Button Name ONLY if custom_link_buttons not configured or cleared
+                        cleared_flag = saved_settings.get("custom_link_buttons_cleared") if isinstance(saved_settings, dict) else None
                         saved_buttons = saved_settings.get("custom_link_buttons") if isinstance(saved_settings, dict) else None
-                        if not saved_buttons:
+                        if str(cleared_flag) == "1" or str(saved_buttons).strip() == "[]":
+                            set_bot_setting("custom_link_buttons", "[]")
+                            set_bot_setting("custom_link_buttons_cleared", "1")
+                            set_group_link("")
+                            set_group_name("")
+                        elif not saved_buttons and str(cleared_flag) != "1":
                             saved_group = parsed.get("group_link") or parsed.get("otp_group_link")
                             if saved_group:
                                 set_group_link(str(saved_group).strip())

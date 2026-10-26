@@ -3819,6 +3819,76 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
             return False
     return False
 
+async def notify_admin_revocation(bot: Bot, target_id: int):
+    """
+    Sends a professional confirmation message to the removed administrator
+    informing them that their privileges have been revoked, and automatically
+    resets their reply keyboard to standard user mode.
+    """
+    try:
+        bot_name = get_bot_name()
+        notification_text = (
+            "⛔ <b>Administrator Privileges Revoked</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Your administrator access on <b>{html.escape(bot_name)}</b> has been revoked by the Super Administrator.\n\n"
+            "• <b>Account Status:</b> <code>Standard User Account</code>\n"
+            "• <b>Admin Privileges:</b> <code>Disabled</code>\n"
+            "• <b>Dashboard Access:</b> <code>Cleared & Deactivated</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Your menu has been updated to Standard User mode. You can continue using the bot to request numbers and manage your account.</i>"
+        )
+        markup = get_user_reply_keyboard(target_id)
+        await send_with_retry(bot, target_id, notification_text, reply_markup=markup)
+        logger.info(f"Delivered admin revocation notification to user {target_id}")
+    except Exception as e:
+        logger.warning(f"Could not deliver admin revocation notice to {target_id}: {e}")
+
+async def notify_admin_promoted(bot: Bot, target_id: int):
+    """Sends a professional notification when a user is promoted to Administrator."""
+    try:
+        bot_name = get_bot_name()
+        notification_text = (
+            "👑 <b>Administrator Privileges Granted</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"You have been granted Administrator privileges on <b>{html.escape(bot_name)}</b>!\n\n"
+            "• <b>Account Status:</b> <code>Administrator</code>\n"
+            "• <b>Admin Dashboard:</b> <code>Active & Unlocked</code>\n"
+            "• <b>Permissions:</b> <code>Stock pools, user management & bot controls</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Your menu has been updated with Admin controls. Tap below to access the Admin Panel:</i>"
+        )
+        markup = get_user_reply_keyboard(target_id)
+        await send_with_retry(bot, target_id, notification_text, reply_markup=markup)
+        logger.info(f"Delivered admin promotion notification to user {target_id}")
+    except Exception as e:
+        logger.warning(f"Could not deliver admin promotion notice to {target_id}: {e}")
+
+def is_admin_action_callback(data: str) -> bool:
+    """Returns True if the callback data belongs to an administrator action or panel."""
+    if not data:
+        return False
+    if data.startswith("bcast_getnum_"):
+        return False
+    if data.startswith("copy_num_") or data.startswith("apply_stock_") or data.startswith("sec_") or data.startswith("toggle_plus_") or data.startswith("ui_lang_"):
+        return False
+    if data.startswith("btn_"):
+        return False
+    if data.startswith("c_") or data.startswith("page_std_") or data.startswith("page_sec_"):
+        return False
+    if data in (
+        "admin_panel", "admin_refresh_dash", "admin_stock_pools", "admin_uploaded_files",
+        "toggle_inbox_otp", "toggle_view_full_sms", "reset_url_default", "cancel_upload",
+        "confirm_restart", "upload_use_filename", "link_list", "admin_api_url_menu",
+        "admin_api_key_menu", "admin_manage_admins", "admin_broadcast_menu", "admin_sms_format_menu",
+        "admin_live_status", "admin_qty_menu", "admin_users"
+    ):
+        return True
+    admin_prefixes = (
+        "admin_", "adm_", "bcast_", "link_", "fmt_", "sel_upload_", "u_del_",
+        "u_inspect_", "u_toggle_", "page_users_", "prompt_set_", "prompt_new_"
+    )
+    return any(data.startswith(p) for p in admin_prefixes)
+
 # ==========================================
 # 8. Startup Announcement System
 # ==========================================
@@ -5067,7 +5137,16 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        await update.message.reply_text("⛔ <b>Access Restricted.</b> This command is not available.", parse_mode=ParseMode.HTML)
+        bot_name = get_bot_name()
+        await update.message.reply_text(
+            "⛔ <b>Access Restricted</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Your administrator privileges on <b>{html.escape(bot_name)}</b> have been revoked or you are not an administrator.\n"
+            "You do not have access to the Admin Dashboard.\n\n"
+            "<i>Your menu has been updated to Standard User mode.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_user_reply_keyboard(user.id if user else 0)
+        )
         return
 
     admin_text, keyboard = build_admin_dashboard(user.id)
@@ -5424,6 +5503,7 @@ async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(f"✅ User <code>{target_id}</code> is now an Administrator!", parse_mode=ParseMode.HTML)
+        asyncio.create_task(notify_admin_promoted(context.bot, target_id))
     else:
         await update.message.reply_text("❌ Failed to add administrator.", parse_mode=ParseMode.HTML)
 
@@ -5444,6 +5524,7 @@ async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         await update.message.reply_text(f"✅ Admin privileges revoked from <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
+        asyncio.create_task(notify_admin_revocation(context.bot, target_id))
     else:
         await update.message.reply_text("❌ Could not remove admin.", parse_mode=ParseMode.HTML)
 
@@ -5517,23 +5598,13 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"⚠️ User <code>{target_id}</code> was not found in the database.", parse_mode=ParseMode.HTML)
 
 async def perform_zero_restart_handover(target_message):
-    """Executes the clean zero-restart session handover for Number Bot."""
+    """Executes the clean zero-restart session handover for Number Bot matching OTP bot behavior."""
+    global _is_handover
+    _is_handover = True
     try:
         set_bot_setting("manual_restart", "1")
     except Exception:
         pass
-
-    try:
-        msg = await target_message.reply_text(
-            "🔄 <b>Zero-Restart Handover Triggered</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💾 <i>Flushing SQLite database checkpoints...</i>\n"
-            "☁️ <i>Syncing continuous state & stock pools to GitHub Gist...</i>\n"
-            "🚀 <i>Triggering clean session handover...</i>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        msg = target_message
 
     try:
         with get_main_db() as conn:
@@ -5555,15 +5626,16 @@ async def perform_zero_restart_handover(target_message):
         except Exception as e:
             logger.warning(f"Handover Gist save notice: {e}")
 
-    try:
-        await msg.edit_text(
-            "✅ <b>Zero-Restart Handover State Committed!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🔄 <i>Session handover completed cleanly. Runner continuing seamlessly.</i>",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        pass
+    if target_message:
+        try:
+            await target_message.edit_text(
+                "🔄 <b>Restarting Bot Engine...</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ <i>State saved securely. Starting new server session now...</i>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
     logger.info("Admin triggered zero-restart handover. Exiting cleanly (code 0)...")
     os._exit(0)
@@ -5576,7 +5648,14 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Direct force restart if argument passed: /restart force
     if context and context.args and context.args[0].lower() in ("force", "yes", "now"):
-        await perform_zero_restart_handover(update.effective_message)
+        status_msg = await update.message.reply_text(
+            "🔄 <b>Restarting Bot Engine...</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "⏳ <i>Saving state and rebooting cleanly...</i>\n"
+            "<i>You will receive a confirmation message once online.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        await perform_zero_restart_handover(status_msg)
         return
 
     confirm_kb = InlineKeyboardMarkup([
@@ -5947,6 +6026,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text in ["👑 Admin Panel", "Admin Panel"]:
         if is_admin(user.id):
             await admin_command(update, context)
+        else:
+            bot_name = get_bot_name()
+            await update.message.reply_text(
+                "⛔ <b>Access Restricted</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Your administrator privileges on <b>{html.escape(bot_name)}</b> have been revoked.\n"
+                "You no longer have access to the Admin Dashboard.\n\n"
+                "<i>Your menu has been updated to Standard User mode.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id)
+            )
         return
 
     # Handle Custom Button tapped from Bottom Reply Keyboard
@@ -6212,6 +6302,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if gist_storage.enabled:
                     asyncio.create_task(gist_storage.export_and_sync())
                 await update.message.reply_text(f"✅ Added user <code>{aid}</code> as Administrator!", parse_mode=ParseMode.HTML)
+                asyncio.create_task(notify_admin_promoted(context.bot, aid))
             else:
                 await update.message.reply_text("❌ Failed to add administrator.", parse_mode=ParseMode.HTML)
         else:
@@ -6527,6 +6618,53 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         return
+
+    # Intercept non-admin trying to execute admin actions or refresh/interact with an old admin dashboard
+    if not user_admin and is_admin_action_callback(data):
+        try:
+            await query.answer("⛔ Access Denied: Administrator privileges revoked.", show_alert=True)
+        except Exception:
+            pass
+
+        bot_name = get_bot_name()
+        revoked_msg = (
+            "⛔ <b>Administrator Access Revoked</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Your administrator privileges on <b>{html.escape(bot_name)}</b> have been revoked.\n"
+            "You no longer have permission to view or manage the Admin Dashboard.\n\n"
+            "• <b>Account Status:</b> <code>Standard User Account</code>\n"
+            "• <b>Admin Privileges:</b> <code>Disabled</code>\n"
+            "• <b>Dashboard Access:</b> <code>Cleared & Deactivated</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Your menu has been updated to Standard User mode. Tap below to access user services:</i>"
+        )
+        revoked_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number"),
+                InlineKeyboardButton("👤 My Account", callback_data="btn_my_account")
+            ]
+        ])
+        try:
+            await query.edit_message_text(
+                text=revoked_msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=revoked_markup
+            )
+        except Exception:
+            pass
+
+        # Also push standard user reply keyboard to clear '👑 Admin Panel' from user client
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="🔄 <i>Your menu has been updated to Standard User mode.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id)
+            )
+        except Exception:
+            pass
+        return
+
     register_user(user.id, user.username, user.first_name)
     if data != "admin_search_user_prompt" and user.id in ADMIN_STATES:
         ADMIN_STATES[user.id].pop("awaiting_user_search", None)
@@ -7342,7 +7480,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Restarting engine 🔄")
         try:
             await query.edit_message_text(
-                "⏳ <i>Zero-restart session handover initiated...</i>",
+                "🔄 <b>Restarting Bot Engine...</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ <i>Saving state and rebooting cleanly...</i>\n"
+                "<i>You will receive a confirmation message once online.</i>",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -7473,6 +7614,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
             await query.answer(f"✅ Admin privileges revoked for {target_id}!", show_alert=True)
+            asyncio.create_task(notify_admin_revocation(context.bot, target_id))
         else:
             await query.answer(f"❌ Could not remove {target_id}.", show_alert=True)
 

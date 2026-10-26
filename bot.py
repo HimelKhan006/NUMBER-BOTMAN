@@ -3113,6 +3113,16 @@ class ThirdwaveClient:
             clean = f"https://{clean}"
         return clean or "https://thirdwave.im"
 
+    def update_base_url(self, new_url: str) -> str:
+        self.base_url = self.clean_base_url(new_url)
+        self._client = None
+        return self.base_url
+
+    def update_api_key(self, new_key: str) -> str:
+        self.api_key = new_key.strip()
+        self._client = None
+        return self.api_key
+
     def _get_http_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
@@ -3227,7 +3237,23 @@ class ThirdwaveClient:
             logger.debug(f"Thirdwave fetch error: {e}")
         return []
 
-thirdwave_client = ThirdwaveClient(base_url=THIRDWAVE_BASE_URL, api_key=THIRDWAVE_API_KEY)
+def get_effective_base_url() -> str:
+    # 1. First prioritize custom URL configured by admin in SQLite so it never reverts
+    db_custom = get_bot_setting("thirdwave_base_url", "")
+    if db_custom and db_custom.strip():
+        return ThirdwaveClient.clean_base_url(db_custom.strip())
+    # 2. Fall back to environment variable / default
+    return THIRDWAVE_BASE_URL or "https://thirdwave.im"
+
+def get_effective_api_key() -> str:
+    # 1. First prioritize custom API key configured by admin in SQLite so it never reverts
+    db_custom = get_bot_setting("thirdwave_api_key", "")
+    if db_custom and db_custom.strip():
+        return db_custom.strip()
+    # 2. Fall back to environment variable
+    return THIRDWAVE_API_KEY
+
+thirdwave_client = ThirdwaveClient(base_url=get_effective_base_url(), api_key=get_effective_api_key())
 
 async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
     """Delivers incoming OTP directly to the user who claimed this phone number.
@@ -3621,6 +3647,10 @@ class GistStorage:
                         if isinstance(saved_settings, dict):
                             for sk, sv in saved_settings.items():
                                 set_bot_setting(str(sk), str(sv))
+                            if "thirdwave_base_url" in saved_settings and "thirdwave_client" in globals():
+                                thirdwave_client.update_base_url(str(saved_settings["thirdwave_base_url"]))
+                            if "thirdwave_api_key" in saved_settings and "thirdwave_client" in globals():
+                                thirdwave_client.update_api_key(str(saved_settings["thirdwave_api_key"]))
 
                         # Restore Seen OTPs from Gist cloud state
                         saved_seen = parsed.get("seen_otps", {})
@@ -4887,6 +4917,51 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
+def build_api_url_view() -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds interactive configuration panel for Thirdwave API Base URL."""
+    masked_url = thirdwave_client.base_url
+    msg = (
+        "🌐 <b>Thirdwave API URL Configuration</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Active Base URL:</b> <code>{html.escape(masked_url)}</code>\n"
+        f"• <b>Traffic Endpoint:</b> <code>{html.escape(masked_url)}/api/v1/traffic</code>\n"
+        f"• <b>Default System URL:</b> <code>https://thirdwave.im</code>\n"
+        f"• <b>Cloud Database:</b> <code>Synced & Encrypted 🔒</code>\n\n"
+        "💬 <b>How to update:</b>\n"
+        "• Click <b>✏️ Enter New URL</b> below to type in chat.\n"
+        "• Or send: <code>/seturl &lt;new_url&gt;</code>\n"
+        "<i>Example:</i> <code>/seturl https://thirdwave.im</code>"
+    )
+    kb = [
+        [
+            InlineKeyboardButton("✏️ Enter New URL", callback_data="prompt_set_url"),
+            InlineKeyboardButton("🔄 Reset to Default", callback_data="reset_url_default"),
+        ],
+        [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
+    ]
+    return msg, InlineKeyboardMarkup(kb)
+
+def build_api_key_view() -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds interactive configuration panel for Thirdwave API Key."""
+    current_key = thirdwave_client.api_key
+    masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>None</i>")
+    msg = (
+        "🔑 <b>Thirdwave API Key Configuration</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Active API Key:</b> <code>{masked_key}</code>\n"
+        f"• <b>Status:</b> <code>{'Configured ✅' if current_key else 'Missing ⚠️'}</code>\n"
+        f"• <b>Cloud Database:</b> <code>Synced & Encrypted 🔒</code>\n\n"
+        "💬 <b>How to update:</b>\n"
+        "• Click <b>✏️ Enter New Key</b> below to type in chat.\n"
+        "• Or send: <code>/setkey &lt;your_api_key&gt;</code>\n"
+        "<i>Example:</i> <code>/setkey tw_live_1234567890abcdef</code>"
+    )
+    kb = [
+        [InlineKeyboardButton("✏️ Enter New Key", callback_data="prompt_set_key")],
+        [InlineKeyboardButton("👑 Back to Admin Panel", callback_data="admin_panel")]
+    ]
+    return msg, InlineKeyboardMarkup(kb)
+
 def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     stats = get_system_stats()
     current_bot_name = get_bot_name()
@@ -4917,6 +4992,8 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     inbox_status = "🟢 ON (Delivering to DMs)" if is_inbox_otp_enabled() else "🔕 OFF (Groups only)"
     full_sms_status = "📜 Long (Shown)" if is_view_full_sms_enabled() else "⚡ Short (Removed)"
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
+    current_key = thirdwave_client.api_key
+    masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>Missing</i>")
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
@@ -4926,6 +5003,8 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
         f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
+        f"• <b>API Base:</b> <code>{html.escape(thirdwave_client.base_url)}</code>\n"
+        f"• <b>API Key:</b> <code>{masked_key}</code>\n"
         f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
         f"• <b>Inbox OTP:</b> <code>{inbox_status}</code>\n"
         f"• <b>Full SMS:</b> <code>{full_sms_status}</code>\n"
@@ -4964,6 +5043,10 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         [
             InlineKeyboardButton(f"🔔 Inbox OTP: {'ON ✅' if is_inbox_otp_enabled() else 'OFF ❌'}", callback_data="toggle_inbox_otp"),
             InlineKeyboardButton("⚡ Live Status", callback_data="admin_live_status")
+        ],
+        [
+            InlineKeyboardButton("🌐 API URL", callback_data="admin_api_url_menu"),
+            InlineKeyboardButton("🔑 API Key", callback_data="admin_api_key_menu")
         ],
         [
             InlineKeyboardButton("✏️ Bot Name", callback_data="admin_set_name_prompt"),
@@ -5047,6 +5130,78 @@ async def resetname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Default Name:</b> <code>{html.escape(default_name)}</code>\n"
         f"• <b>Database:</b> <code>Saved to Persistent Storage 🔒</code>",
         parse_mode=ParseMode.HTML
+    )
+
+async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id) or not msg_obj:
+        if msg_obj:
+            await msg_obj.reply_text("⛔ <b>Access Restricted</b>: Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    if not context.args:
+        if user.id in ADMIN_STATES:
+            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
+            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
+        text, markup = build_api_url_view()
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    raw_input = " ".join(context.args).strip()
+    new_url = thirdwave_client.update_base_url(raw_input)
+
+    set_bot_setting("thirdwave_base_url", new_url)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    await msg_obj.reply_text(
+        f"✅ <b>API Base URL Successfully Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>New Active URL:</b> <code>{html.escape(new_url)}</code>\n"
+        f"• <b>Endpoint:</b> <code>{html.escape(new_url)}/api/v1/traffic</code>\n\n"
+        f"The bot is now requesting OTP traffic from this URL in real-time.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 API URL Settings", callback_data="admin_api_url_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+    )
+
+async def setkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg_obj = update.effective_message
+    if not user or not is_admin(user.id) or not msg_obj:
+        if msg_obj:
+            await msg_obj.reply_text("⛔ <b>Access Restricted</b>: Admins only.", parse_mode=ParseMode.HTML)
+        return
+
+    if not context.args:
+        if user.id in ADMIN_STATES:
+            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
+            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
+        text, markup = build_api_key_view()
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    raw_input = context.args[0].strip()
+    new_key = thirdwave_client.update_api_key(raw_input)
+
+    set_bot_setting("thirdwave_api_key", new_key)
+    if gist_storage.enabled:
+        asyncio.create_task(gist_storage.export_and_sync())
+
+    new_masked = f"{new_key[:8]}...{new_key[-4:]}" if len(new_key) > 12 else new_key
+    await msg_obj.reply_text(
+        f"✅ <b>Thirdwave API Key Successfully Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>New Active Key:</b> <code>{new_masked}</code>\n\n"
+        f"The bot is now requesting OTP traffic with this key in real-time.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 API Key Settings", callback_data="admin_api_key_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
     )
 
 async def setquantity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5903,6 +6058,56 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=detail_kb
             )
             return
+
+    if admin_state.get("awaiting_api_url"):
+        del admin_state["awaiting_api_url"]
+        clean_input = text.strip()
+        if clean_input.lower() in ("cancel", "/cancel", "❌ cancel"):
+            await update.message.reply_text("❌ <b>Operation Cancelled.</b> No changes were made.", parse_mode=ParseMode.HTML)
+            return
+        new_url = thirdwave_client.update_base_url(clean_input)
+        set_bot_setting("thirdwave_base_url", new_url)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await update.message.reply_text(
+            f"✅ <b>API Base URL Successfully Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>New Active URL:</b> <code>{html.escape(new_url)}</code>\n"
+            f"• <b>Endpoint:</b> <code>{html.escape(new_url)}/api/v1/traffic</code>\n"
+            f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>\n\n"
+            f"The bot is now requesting OTP traffic from this URL in real-time.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 API URL Settings", callback_data="admin_api_url_menu")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+        return
+
+    if admin_state.get("awaiting_api_key"):
+        del admin_state["awaiting_api_key"]
+        clean_input = text.strip()
+        if clean_input.lower() in ("cancel", "/cancel", "❌ cancel"):
+            await update.message.reply_text("❌ <b>Operation Cancelled.</b> No changes were made.", parse_mode=ParseMode.HTML)
+            return
+        new_key = thirdwave_client.update_api_key(clean_input)
+        set_bot_setting("thirdwave_api_key", new_key)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        new_masked = f"{new_key[:8]}...{new_key[-4:]}" if len(new_key) > 12 else new_key
+        await update.message.reply_text(
+            f"✅ <b>Thirdwave API Key Successfully Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>New Active Key:</b> <code>{new_masked}</code>\n"
+            f"• <b>Status:</b> <code>Active & Forwarding OTPs ⚡</code>\n"
+            f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 API Key Settings", callback_data="admin_api_key_menu")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+        )
+        return
 
     if admin_state.get("awaiting_bot_name"):
         del admin_state["awaiting_bot_name"]
@@ -7014,6 +7219,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 6. Admin Panel / Refresh Dashboard
     elif (data == "admin_panel" or data == "admin_refresh_dash") and user_admin:
+        if user.id in ADMIN_STATES:
+            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
+            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
+            ADMIN_STATES[user.id].pop("awaiting_bot_name", None)
         admin_text, keyboard = build_admin_dashboard(user.id)
         try:
             await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -7025,6 +7234,67 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.answer("✅ Already up to date")
             else:
                 await query.answer("🔄 Dashboard Refreshed")
+
+    # 6-a0. Admin API Base URL & API Key Menus
+    elif data == "admin_api_url_menu" and user_admin:
+        if user.id in ADMIN_STATES:
+            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
+            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
+        text_view, markup = build_api_url_view()
+        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data == "prompt_set_url" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_api_url": True}
+        await query.answer("Send new API URL 💬")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_api_url_menu")]
+        ])
+        await query.edit_message_text(
+            f"🌐 <b>Update API Base URL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current URL:</b> <code>{html.escape(thirdwave_client.base_url)}</code>\n\n"
+            f"💬 <b>Please send the new API URL</b> directly in this chat:\n"
+            f"<i>Example:</i> <code>https://thirdwave.im</code>\n\n"
+            f"Or click <b>❌ Cancel</b> below to abort.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
+        )
+
+    elif data == "reset_url_default" and user_admin:
+        default_url = "https://thirdwave.im"
+        thirdwave_client.update_base_url(default_url)
+        set_bot_setting("thirdwave_base_url", default_url)
+        if gist_storage.enabled:
+            asyncio.create_task(gist_storage.export_and_sync())
+        await query.answer("API URL Reset to Default ✅")
+        text_view, markup = build_api_url_view()
+        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data == "admin_api_key_menu" and user_admin:
+        if user.id in ADMIN_STATES:
+            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
+            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
+        text_view, markup = build_api_key_view()
+        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    elif data == "prompt_set_key" and user_admin:
+        ADMIN_STATES[user.id] = {"awaiting_api_key": True}
+        await query.answer("Send new API Key 💬")
+        current_key = thirdwave_client.api_key
+        masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>None</i>")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_api_key_menu")]
+        ])
+        await query.edit_message_text(
+            f"🔑 <b>Update Thirdwave API Key</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Current Key:</b> <code>{masked_key}</code>\n\n"
+            f"💬 <b>Please send your new API Key</b> directly in this chat:\n"
+            f"<i>Example:</i> <code>tw_live_1234567890abcdef</code>\n\n"
+            f"Or click <b>❌ Cancel</b> below to abort.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
+        )
 
     # 6-a. Bot Display Name Prompt
     elif data == "admin_set_name_prompt" and user_admin:
@@ -8837,6 +9107,8 @@ def main():
     app.add_handler(CommandHandler("users", admin_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setname", setname_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("resetname", resetname_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("seturl", seturl_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("setkey", setkey_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setquantity", setquantity_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setqty", setquantity_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("status", status_command, filters=filters.ChatType.PRIVATE))

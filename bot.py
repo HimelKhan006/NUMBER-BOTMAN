@@ -971,12 +971,29 @@ def get_all_admin_details() -> List[Dict[str, Any]]:
                 uid = r["user_id"]
                 if uid not in seen:
                     seen.add(uid)
+                    u = get_user_details(uid)
+                    uname = r["username"] or (u.get("username", "") if u else "")
+                    fname = r["first_name"] or (u.get("first_name", "") if u else "Administrator")
                     results.append({
                         "user_id": uid,
-                        "username": r["username"] or "",
-                        "first_name": r["first_name"] or "Admin",
+                        "username": uname,
+                        "first_name": fname,
                         "is_super": False,
                         "added_by": r["added_by"] or 0,
+                    })
+
+            # 3. Any user records marked is_admin = 1
+            admin_users = conn.execute("SELECT user_id, username, first_name FROM users WHERE is_admin = 1;").fetchall()
+            for au in admin_users:
+                auid = au["user_id"]
+                if auid not in seen:
+                    seen.add(auid)
+                    results.append({
+                        "user_id": auid,
+                        "username": au["username"] or "",
+                        "first_name": au["first_name"] or "Administrator",
+                        "is_super": False,
+                        "added_by": 0,
                     })
     except Exception:
         pass
@@ -3735,11 +3752,12 @@ class GistStorage:
                             # Reconcile admin revocations: remove revoked admins present in SQLite but absent from cloud Gist
                             if isinstance(admins_data, list):
                                 cloud_aids = {int(a["user_id"]) for a in admins_data if a.get("user_id")}
-                                local_admins = [r[0] for r in mconn.execute("SELECT user_id FROM bot_admins;").fetchall()]
-                                for l_aid in local_admins:
-                                    if l_aid not in cloud_aids and l_aid not in ADMIN_USER_IDS:
-                                        mconn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (l_aid,))
-                                        mconn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (l_aid,))
+                                if cloud_aids:
+                                    local_admins = [r[0] for r in mconn.execute("SELECT user_id FROM bot_admins;").fetchall()]
+                                    for l_aid in local_admins:
+                                        if l_aid not in cloud_aids and l_aid not in ADMIN_USER_IDS:
+                                            mconn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (l_aid,))
+                                            mconn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (l_aid,))
 
                             mconn.commit()
 
@@ -6300,18 +6318,122 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if admin_state.get("awaiting_admin_id") or admin_state.get("awaiting_add_admin"):
         admin_state.pop("awaiting_admin_id", None)
         admin_state.pop("awaiting_add_admin", None)
-        if text.isdigit():
-            aid = int(text)
-            success = add_admin(aid, added_by=user.id)
+        prompt_msg_id = admin_state.pop("prompt_msg_id", None)
+        prompt_chat_id = admin_state.pop("prompt_chat_id", None) or (update.effective_chat.id if update.effective_chat else user.id)
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        clean_text = text.strip()
+        if clean_text.isdigit():
+            aid = int(clean_text)
+            uname = ""
+            fname = ""
+            try:
+                target_chat = await context.bot.get_chat(aid)
+                if target_chat:
+                    uname = target_chat.username or ""
+                    fname = target_chat.first_name or ""
+            except Exception:
+                pass
+
+            if not uname or not fname:
+                u_rec = get_user_details(aid)
+                if u_rec:
+                    uname = uname or u_rec.get("username", "")
+                    fname = fname or u_rec.get("first_name", "")
+
+            success = add_admin(aid, added_by=user.id, username=uname, first_name=fname)
             if success:
                 if gist_storage.enabled:
-                    asyncio.create_task(gist_storage.export_and_sync())
-                await update.message.reply_text(f"✅ Added user <code>{aid}</code> as Administrator!", parse_mode=ParseMode.HTML)
+                    asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+                u_tag = f"@{html.escape(uname)}" if uname else "<i>None</i>"
+                disp_name = html.escape(fname or "Administrator")
+                confirm_text = (
+                    "✅ <b>Administrator Successfully Added!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>User ID:</b> <code>{aid}</code>\n"
+                    f"• <b>Name:</b> <code>{disp_name}</code>\n"
+                    f"• <b>Username:</b> {u_tag}\n"
+                    "• <b>Role:</b> <code>🛡️ Administrator</code>\n"
+                    "• <b>Status:</b> <code>Active & Authorized</code>\n"
+                    "• <b>Cloud Sync:</b> <code>Synced & Encrypted 🔒</code>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>The user has been promoted and notified in private chat.</i>"
+                )
+                confirm_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"👑 Manage ID: {aid}", callback_data=f"admin_inspect_{aid}")],
+                    [InlineKeyboardButton("📋 Active Admin List", callback_data="admin_manage_admins")],
+                    [InlineKeyboardButton("➕ Add Another Admin", callback_data="admin_add_admin_prompt")],
+                    [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
+                ])
+
+                edited = False
+                if prompt_msg_id and prompt_chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=prompt_chat_id,
+                            message_id=prompt_msg_id,
+                            text=confirm_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=confirm_kb
+                        )
+                        edited = True
+                    except Exception:
+                        pass
+                if not edited:
+                    await context.bot.send_message(
+                        chat_id=prompt_chat_id,
+                        text=confirm_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=confirm_kb
+                    )
                 asyncio.create_task(notify_admin_promoted(context.bot, aid))
             else:
-                await update.message.reply_text("❌ Failed to add administrator.", parse_mode=ParseMode.HTML)
+                fail_text = "❌ <b>Failed to add administrator.</b> Database write error."
+                fail_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Try Again", callback_data="admin_add_admin_prompt")],
+                    [InlineKeyboardButton("📋 Admin List", callback_data="admin_manage_admins")]
+                ])
+                if prompt_msg_id and prompt_chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=prompt_chat_id,
+                            message_id=prompt_msg_id,
+                            text=fail_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=fail_kb
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id=prompt_chat_id, text=fail_text, parse_mode=ParseMode.HTML, reply_markup=fail_kb)
+                else:
+                    await context.bot.send_message(chat_id=prompt_chat_id, text=fail_text, parse_mode=ParseMode.HTML, reply_markup=fail_kb)
         else:
-            await update.message.reply_text("❌ Invalid user ID. Please send digits only.", parse_mode=ParseMode.HTML)
+            err_text = (
+                "❌ <b>Invalid Account ID</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Please enter digits only (e.g. <code>6798979733</code>).\n\n"
+                "💡 <i>Tip: The user can check their ID via @userinfobot or in 👥 User Manager.</i>"
+            )
+            err_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", callback_data="admin_add_admin_prompt")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_admins")]
+            ])
+            if prompt_msg_id and prompt_chat_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=prompt_chat_id,
+                        message_id=prompt_msg_id,
+                        text=err_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=err_kb
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id=prompt_chat_id, text=err_text, parse_mode=ParseMode.HTML, reply_markup=err_kb)
+            else:
+                await context.bot.send_message(chat_id=prompt_chat_id, text=err_text, parse_mode=ParseMode.HTML, reply_markup=err_kb)
         return
 
     # Broadcast to All Users
@@ -7553,44 +7675,91 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
-    # 6-c. SMS Controls & Linked Provider APIs
+    # 6-c. Administrator Management & Access Control
     elif data == "admin_manage_admins" and user_admin:
         admins = get_all_admin_details()
-        admin_lines = []
-        for a in admins:
-            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Added via Bot)"
-            u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
-            admin_lines.append(f"• <code>{a['user_id']}</code> — {u_tag} [{role}]")
+        super_count = sum(1 for a in admins if a.get("is_super"))
+        db_count = len(admins) - super_count
 
-        admins_formatted = "\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
+        admin_lines = []
+        buttons = []
+        for idx, a in enumerate(admins, start=1):
+            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Database)"
+            u_name = html.escape(a.get("first_name") or "Administrator")
+            u_tag = f"@{html.escape(a['username'])}" if a.get("username") else u_name
+            admin_lines.append(
+                f"{idx}. <b>{u_name}</b> ({u_tag})\n"
+                f"   🆔 <code>{a['user_id']}</code> | 🔰 Role: {role}"
+            )
+            btn_icon = "👑" if a["is_super"] else "🛡️"
+            buttons.append([InlineKeyboardButton(
+                f"{btn_icon} Manage ID: {a['user_id']} ({u_tag[:14]})",
+                callback_data=f"admin_inspect_{a['user_id']}"
+            )])
+
+        admins_formatted = "\n\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
         text = (
-            f"👑 <b>Administrator Management</b>\n"
+            f"👑 <b>Administrator Management & Access Control</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Active Administrators:</b>\n"
+            f"• <b>Total Administrators:</b> <code>{len(admins)}</code>\n"
+            f"• <b>Super Administrators:</b> <code>{super_count}</code>\n"
+            f"• <b>Database Administrators:</b> <code>{db_count}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{admins_formatted}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>All administrators have full access to the Admin Panel, stock uploads, and bot management.</i>\n"
-            f"<i>Super Admins are defined in GitHub Secrets / .env and cannot be removed via Telegram.</i>"
+            f"💡 <i>Tap any administrator button below to view details or revoke privileges.</i>"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
-            [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
-            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
-        ])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        buttons.append([InlineKeyboardButton("➕ Add New Administrator", callback_data="admin_add_admin_prompt")])
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data == "admin_add_admin_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_add_admin": True}
+        ADMIN_STATES[user.id] = {
+            "awaiting_add_admin": True,
+            "prompt_msg_id": query.message.message_id,
+            "prompt_chat_id": query.message.chat_id
+        }
         text = (
             "➕ <b>Add New Administrator</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Send the **Telegram User ID** (numbers only) of the user you wish to promote to Admin.\n\n"
-            "💡 <i>Tip: The user can check their ID via @userinfobot or you can look them up via /users.</i>"
+            "Send the numerical <b>Telegram User ID</b> of the user you wish to promote to Admin.\n\n"
+            "💡 <i>Tip: The user can check their ID via @userinfobot or you can look them up in 👥 User Manager.</i>"
         )
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_admins")]
         ])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+    elif data.startswith("admin_inspect_") and user_admin:
+        target_id = int(data.split("_")[2])
+        admins = get_all_admin_details()
+        admin_info = next((a for a in admins if a["user_id"] == target_id), None)
+        u_rec = get_user_details(target_id)
+
+        fname = (admin_info.get("first_name") if admin_info else "") or (u_rec.get("first_name") if u_rec else "") or "Administrator"
+        uname = (admin_info.get("username") if admin_info else "") or (u_rec.get("username") if u_rec else "")
+        u_tag = f"@{html.escape(uname)}" if uname else "<i>None</i>"
+        is_super = admin_info.get("is_super", False) if admin_info else (target_id in ADMIN_USER_IDS)
+        role_badge = "👑 <b>Super Administrator</b> (Configured via .env)" if is_super else "🛡️ <b>Administrator</b> (Added via Bot)"
+
+        profile_text = (
+            f"👑 <b>Administrator Profile & Access Control</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Admin ID:</b> <code>{target_id}</code>\n"
+            f"📛 <b>Name:</b> <code>{html.escape(fname)}</code>\n"
+            f"🔗 <b>Username:</b> {u_tag}\n"
+            f"🔰 <b>Role & Tier:</b> {role_badge}\n"
+            f"🛡️ <b>Account Status:</b> <code>Active & Verified</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        buttons = []
+        if not is_super:
+            buttons.append([InlineKeyboardButton("🗑️ Revoke Administrator Privileges", callback_data=f"admin_rm_admin_{target_id}")])
+        if u_rec:
+            buttons.append([InlineKeyboardButton("👤 View in User Manager", callback_data=f"u_inspect_{target_id}")])
+        buttons.append([InlineKeyboardButton("📋 Back to Admin List", callback_data="admin_manage_admins")])
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data == "admin_remove_admin_menu" and user_admin:
         admins = get_all_admin_details()
@@ -7617,34 +7786,48 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ok = remove_admin(target_id)
         if ok:
             if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
             await query.answer(f"✅ Admin privileges revoked for {target_id}!", show_alert=True)
             asyncio.create_task(notify_admin_revocation(context.bot, target_id))
         else:
             await query.answer(f"❌ Could not remove {target_id}.", show_alert=True)
 
+        # Re-render the admin management list with updated buttons
         admins = get_all_admin_details()
-        admin_lines = []
-        for a in admins:
-            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Added via Bot)"
-            u_tag = f"@{a['username']}" if a["username"] else a["first_name"]
-            admin_lines.append(f"• <code>{a['user_id']}</code> — {u_tag} [{role}]")
+        super_count = sum(1 for a in admins if a.get("is_super"))
+        db_count = len(admins) - super_count
 
-        admins_formatted = "\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
+        admin_lines = []
+        buttons = []
+        for idx, a in enumerate(admins, start=1):
+            role = "👑 <b>Super Admin</b> (Env)" if a["is_super"] else "🛡️ <b>Admin</b> (Database)"
+            u_name = html.escape(a.get("first_name") or "Administrator")
+            u_tag = f"@{html.escape(a['username'])}" if a.get("username") else u_name
+            admin_lines.append(
+                f"{idx}. <b>{u_name}</b> ({u_tag})\n"
+                f"   🆔 <code>{a['user_id']}</code> | 🔰 Role: {role}"
+            )
+            btn_icon = "👑" if a["is_super"] else "🛡️"
+            buttons.append([InlineKeyboardButton(
+                f"{btn_icon} Manage ID: {a['user_id']} ({u_tag[:14]})",
+                callback_data=f"admin_inspect_{a['user_id']}"
+            )])
+
+        admins_formatted = "\n\n".join(admin_lines) if admin_lines else "<i>No administrators found.</i>"
         text = (
-            f"👑 <b>Administrator Management</b>\n"
+            f"👑 <b>Administrator Management & Access Control</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Active Administrators:</b>\n"
+            f"• <b>Total Administrators:</b> <code>{len(admins)}</code>\n"
+            f"• <b>Super Administrators:</b> <code>{super_count}</code>\n"
+            f"• <b>Database Administrators:</b> <code>{db_count}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{admins_formatted}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>All administrators have full access to the Admin Panel, stock uploads, and bot management.</i>"
+            f"💡 <i>Tap any administrator button below to view details or revoke privileges.</i>"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_admin_prompt")],
-            [InlineKeyboardButton("🗑️ Remove Admin", callback_data="admin_remove_admin_menu")],
-            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")]
-        ])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        buttons.append([InlineKeyboardButton("➕ Add New Administrator", callback_data="admin_add_admin_prompt")])
+        buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_panel")])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data == "admin_live_status" and user_admin:
         stats = get_system_stats()

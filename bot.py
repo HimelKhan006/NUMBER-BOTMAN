@@ -109,6 +109,7 @@ import httpx
 from telegram import (
     Update,
     Bot,
+    Message,
     InlineKeyboardButton,
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
@@ -4277,7 +4278,7 @@ def get_admin_quantity_keyboard() -> InlineKeyboardMarkup:
 # ==========================================
 # 10. Reply Keyboard Views & Action Handlers
 # ==========================================
-async def show_user_profile(update: Update, target_user_id: int, viewer_user_id: int = 0):
+async def show_user_profile(update: Update, target_user_id: int, viewer_user_id: int = 0, prompt_msg_id: Optional[int] = None):
     """Professional account profile display for users and administrators."""
     viewer_admin = is_admin(viewer_user_id)
     u = get_user_details(target_user_id)
@@ -4287,15 +4288,33 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
             await update.callback_query.answer(msg, show_alert=True)
         elif update.message:
             if viewer_admin:
+                err_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
+                    [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                ])
+                if prompt_msg_id and update.effective_chat:
+                    try:
+                        await update.message.delete()
+                    except Exception:
+                        pass
+                    try:
+                        bot = update.get_bot()
+                        await bot.edit_message_text(
+                            chat_id=update.effective_chat.id,
+                            message_id=prompt_msg_id,
+                            text=f"⚠️ <b>User Not Found:</b>\nNo account record found for ID: <code>{target_user_id}</code>.\n\n<i>The user may have not started or joined the bot yet.</i>",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=err_kb
+                        )
+                        return
+                    except Exception:
+                        pass
                 await update.message.reply_text(
                     f"⚠️ <b>User Not Found:</b>\n"
                     f"No account record found for ID: <code>{target_user_id}</code>.\n\n"
                     f"<i>The user may have not started or joined the bot yet.</i>",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Search User by ID", callback_data="admin_search_user_prompt")],
-                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
-                    ])
+                    reply_markup=err_kb
                 )
             else:
                 await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -4364,6 +4383,25 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
         buttons.append([InlineKeyboardButton("👥 Back to User Manager", callback_data="admin_users")])
 
     keyboard = InlineKeyboardMarkup(buttons)
+    if prompt_msg_id and update.effective_chat:
+        if update.message:
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+        try:
+            bot = update.get_bot()
+            await bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=prompt_msg_id,
+                text=profile_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
+
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(profile_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -5862,6 +5900,48 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"Error handling file upload: {e}")
         await msg.edit_text(f"❌ <b>Error processing file:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
 
+
+async def render_prompt_response(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    prompt_msg_id: Optional[int],
+    user_msg,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None
+):
+    """Deletes the admin's raw typed message and edits the prompt card in-place (or sends new if edit fails)."""
+    if user_msg:
+        try:
+            await user_msg.delete()
+        except Exception:
+            pass
+
+    if prompt_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=prompt_msg_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
+            return
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
+            except Exception:
+                pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup
+    )
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip() if (update.message and update.message.text) else ""
@@ -5893,6 +5973,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_admin(user.id):
         admin_state = ADMIN_STATES.get(user.id)
         if admin_state and admin_state.get("awaiting_user_search"):
+            prompt_msg_id = admin_state.get("prompt_msg_id")
+            prompt_chat_id = admin_state.get("prompt_chat_id") or (update.effective_chat.id if update.effective_chat else user.id)
             clean_text = text.strip()
             custom_btn_texts = [cb["text"] for cb in get_custom_link_buttons()]
             if clean_text.startswith("/") or clean_text in [
@@ -5903,36 +5985,36 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 del admin_state["awaiting_user_search"]
                 if not clean_text.isdigit():
-                    await update.message.reply_text(
-                        "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
-                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
-                        ])
-                    )
+                    err_text = "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>)."
+                    err_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Try Again", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, err_text, err_kb)
                     return
 
                 target_uid = int(clean_text)
                 u = get_user_details(target_uid)
                 if not u:
-                    await update.message.reply_text(
+                    not_found_text = (
                         f"⚠️ <b>User Not Found:</b>\n"
                         f"No account record found for ID: <code>{target_uid}</code>.\n\n"
-                        f"<i>The user has not joined or started the bot yet.</i>",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
-                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
-                            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                        ])
+                        f"<i>The user has not joined or started the bot yet.</i>"
                     )
+                    not_found_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 Search Another ID", callback_data="admin_search_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, not_found_text, not_found_kb)
                     return
 
-                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id)
+                await show_user_profile(update, target_user_id=target_uid, viewer_user_id=user.id, prompt_msg_id=prompt_msg_id)
                 return
 
         if admin_state and admin_state.get("awaiting_user_remove"):
+            prompt_msg_id = admin_state.get("prompt_msg_id")
+            prompt_chat_id = admin_state.get("prompt_chat_id") or (update.effective_chat.id if update.effective_chat else user.id)
             clean_text = text.strip()
             custom_btn_texts = [cb["text"] for cb in get_custom_link_buttons()]
             if clean_text.startswith("/") or clean_text in [
@@ -5943,34 +6025,36 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 del admin_state["awaiting_user_remove"]
                 if not clean_text.isdigit():
-                    await update.message.reply_text(
-                        "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>).",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🗑️ Try Again", callback_data="admin_remove_user_prompt")],
-                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
-                        ])
-                    )
+                    err_text = "❌ <b>Invalid Account ID:</b>\nPlease enter digits only (e.g. <code>8751050958</code>)."
+                    err_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑️ Try Again", callback_data="admin_remove_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, err_text, err_kb)
                     return
 
                 target_uid = int(clean_text)
                 if target_uid in ADMIN_USER_IDS:
-                    await update.message.reply_text("⛔ Cannot remove Super Admin defined in environment variables.", parse_mode=ParseMode.HTML)
+                    deny_text = "⛔ Cannot remove Super Admin defined in environment variables."
+                    deny_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, deny_text, deny_kb)
                     return
 
                 u = get_user_details(target_uid)
                 if not u:
-                    await update.message.reply_text(
+                    not_found_text = (
                         f"⚠️ <b>User Not Found:</b>\n"
                         f"No account record found for ID: <code>{target_uid}</code>.\n\n"
-                        f"<i>The user has not joined or started the bot yet.</i>",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🗑️ Try Another ID", callback_data="admin_remove_user_prompt")],
-                            [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
-                            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                        ])
+                        f"<i>The user has not joined or started the bot yet.</i>"
                     )
+                    not_found_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑️ Try Another ID", callback_data="admin_remove_user_prompt")],
+                        [InlineKeyboardButton("👥 User Manager", callback_data="admin_users")],
+                        [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, not_found_text, not_found_kb)
                     return
 
                 uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
@@ -5989,7 +6073,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     [InlineKeyboardButton("🗑️ Yes, Permanently Remove User", callback_data=f"u_del_do_{target_uid}")],
                     [InlineKeyboardButton("❌ Cancel", callback_data=f"u_inspect_{target_uid}")]
                 ])
-                await update.message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, confirm_text, keyboard)
                 return
 
         # Direct User ID lookup if admin sends an Account ID directly in chat
@@ -6081,6 +6165,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not admin_state or not is_admin(user.id):
         return
 
+    prompt_msg_id = admin_state.get("prompt_msg_id")
+    prompt_chat_id = admin_state.get("prompt_chat_id") or (update.effective_chat.id if update.effective_chat else user.id)
+
     btn_action = admin_state.get("awaiting_btn_action")
     if btn_action and isinstance(btn_action, dict):
         action = btn_action.get("action")
@@ -6095,15 +6182,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 found["text"] = text
                 save_custom_link_buttons(buttons)
                 _, detail_kb = build_button_detail_view(found["id"])
-                await update.message.reply_text(
+                resp_text = (
                     f"✅ <b>Button Renamed!</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• <b>Old:</b> <code>{html.escape(old_name)}</code>\n"
                     f"• <b>New:</b> <code>{html.escape(text)}</code>\n"
-                    f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=detail_kb
+                    f"• <b>URL:</b> <code>{html.escape(found['url'])}</code>"
                 )
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
                 return
 
         elif action == "reurl" and target_id:
@@ -6111,29 +6197,28 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if found:
                 clean_url = normalize_button_url(text)
                 if not clean_url:
-                    await update.message.reply_text(
+                    err_text = (
                         "❌ <b>Invalid URL or Bot Username</b>\n"
                         "Link must start with <code>https://</code>, <code>http://</code>, or be a bot username like <code>@bot_username</code>.\n"
-                        "Please send a valid link or click Cancel:",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ Cancel", callback_data=f"link_view_{found['id']}")]
-                        ])
+                        "Please send a valid link or click Cancel:"
                     )
+                    err_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"link_view_{found['id']}")]
+                    ])
+                    await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, err_text, err_kb)
                     return
                 del admin_state["awaiting_btn_action"]
                 old_url = found["url"]
                 found["url"] = clean_url
                 save_custom_link_buttons(buttons)
                 _, detail_kb = build_button_detail_view(found["id"])
-                await update.message.reply_text(
+                resp_text = (
                     f"✅ <b>Button URL Updated!</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"• <b>Button:</b> <code>{html.escape(found['text'])}</code>\n"
-                    f"• <b>New URL:</b> <code>{html.escape(clean_url)}</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=detail_kb
+                    f"• <b>New URL:</b> <code>{html.escape(clean_url)}</code>"
                 )
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
                 return
 
         elif action == "add":
@@ -6150,17 +6235,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             clean_url = normalize_button_url(raw_url)
             if not b_name or not clean_url:
-                await update.message.reply_text(
+                err_text = (
                     "❌ <b>Invalid Format</b>\n"
                     "Please provide button name and link or bot username separated by <code>|</code>:\n"
                     "<code>Button Name | @bot_username</code>\n"
                     "<i>or:</i> <code>Button Name | https://yourlink.com</code>\n\n"
-                    "<i>Example:</i> <code>🤖 OTP Bot | @my_otp_bot</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("❌ Cancel", callback_data="link_list")]
-                    ])
+                    "<i>Example:</i> <code>🤖 OTP Bot | @my_otp_bot</code>"
                 )
+                err_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data="link_list")]
+                ])
+                await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, err_text, err_kb)
                 return
 
             del admin_state["awaiting_btn_action"]
@@ -6168,121 +6253,140 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             buttons.append({"id": new_id, "text": b_name, "url": clean_url})
             save_custom_link_buttons(buttons)
             _, detail_kb = build_button_detail_view(new_id)
-            await update.message.reply_text(
+            resp_text = (
                 f"✅ <b>New Custom Button Added!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• <b>Label:</b> <code>{html.escape(b_name)}</code>\n"
                 f"• <b>Link:</b> <code>{html.escape(clean_url)}</code>\n"
-                f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)",
-                parse_mode=ParseMode.HTML,
-                reply_markup=detail_kb
+                f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)"
             )
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, detail_kb)
             return
 
     if admin_state.get("awaiting_api_url"):
         del admin_state["awaiting_api_url"]
         clean_input = text.strip()
         if clean_input.lower() in ("cancel", "/cancel", "❌ cancel"):
-            await update.message.reply_text("❌ <b>Operation Cancelled.</b> No changes were made.", parse_mode=ParseMode.HTML)
+            cancel_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 API URL Settings", callback_data="admin_api_url_menu")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, "❌ <b>Operation Cancelled.</b> No changes were made.", cancel_kb)
             return
         new_url = thirdwave_client.update_base_url(clean_input)
         set_bot_setting("thirdwave_base_url", new_url)
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
-        await update.message.reply_text(
+        resp_text = (
             f"✅ <b>API Base URL Successfully Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>New Active URL:</b> <code>{html.escape(new_url)}</code>\n"
             f"• <b>Endpoint:</b> <code>{html.escape(new_url)}/api/v1/traffic</code>\n"
             f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>\n\n"
-            f"The bot is now requesting OTP traffic from this URL in real-time.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 API URL Settings", callback_data="admin_api_url_menu")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
+            f"The bot is now requesting OTP traffic from this URL in real-time."
         )
+        resp_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 API URL Settings", callback_data="admin_api_url_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, resp_kb)
         return
 
     if admin_state.get("awaiting_api_key"):
         del admin_state["awaiting_api_key"]
         clean_input = text.strip()
         if clean_input.lower() in ("cancel", "/cancel", "❌ cancel"):
-            await update.message.reply_text("❌ <b>Operation Cancelled.</b> No changes were made.", parse_mode=ParseMode.HTML)
+            cancel_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 API Key Settings", callback_data="admin_api_key_menu")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, "❌ <b>Operation Cancelled.</b> No changes were made.", cancel_kb)
             return
         new_key = thirdwave_client.update_api_key(clean_input)
         set_bot_setting("thirdwave_api_key", new_key)
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
         new_masked = f"{new_key[:8]}...{new_key[-4:]}" if len(new_key) > 12 else new_key
-        await update.message.reply_text(
+        resp_text = (
             f"✅ <b>Thirdwave API Key Successfully Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>New Active Key:</b> <code>{new_masked}</code>\n"
             f"• <b>Status:</b> <code>Active & Forwarding OTPs ⚡</code>\n"
-            f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 API Key Settings", callback_data="admin_api_key_menu")],
-                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-            ])
+            f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>"
         )
+        resp_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 API Key Settings", callback_data="admin_api_key_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, resp_kb)
         return
 
     if admin_state.get("awaiting_bot_name"):
         del admin_state["awaiting_bot_name"]
         new_name = text.strip()[:64]
         default_name = get_default_bot_name()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Rename Again", callback_data="admin_set_bot_name_prompt")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
         if new_name.lower() in ("default", "reset"):
             set_bot_name(default_name)
             try:
                 await context.bot.set_my_name(name=default_name)
             except Exception:
                 pass
-            await update.message.reply_text(f"✅ Bot display name reset to default: <code>{html.escape(default_name)}</code>", parse_mode=ParseMode.HTML)
+            resp_text = f"✅ Bot display name reset to default: <code>{html.escape(default_name)}</code>"
         else:
             set_bot_name(new_name)
             try:
                 await context.bot.set_my_name(name=new_name)
             except Exception:
                 pass
-            await update.message.reply_text(
+            resp_text = (
                 f"✅ <b>Bot Display Name Updated!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• <b>New Name:</b> <code>{html.escape(new_name)}</code>\n"
                 f"• <b>Default Name:</b> <code>{html.escape(new_name)} (Saved as permanent default)</code>\n"
-                f"• <b>Database:</b> <code>Saved & Synced 🔒</code>",
-                parse_mode=ParseMode.HTML
+                f"• <b>Database:</b> <code>Saved & Synced 🔒</code>"
             )
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, kb)
         return
 
     if admin_state.get("awaiting_qty_val") or admin_state.get("awaiting_fixed_quantity"):
         admin_state.pop("awaiting_qty_val", None)
         admin_state.pop("awaiting_fixed_quantity", None)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔢 Fixed Quantity Settings", callback_data="admin_fixed_qty_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
         if text.isdigit() and 1 <= int(text) <= 1000:
             val = int(text)
             set_admin_fixed_quantity(str(val))
             if gist_storage.enabled:
                 asyncio.create_task(gist_storage.export_and_sync())
-            await update.message.reply_text(
+            resp_text = (
                 f"✅ <b>Fixed Quantity Applied Globally!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"• <b>Fixed Count:</b> <code>{val} numbers</code>\n"
-                f"• <b>Rule:</b> All users will now receive exactly <code>{val}</code> numbers when choosing a country.",
-                parse_mode=ParseMode.HTML
+                f"• <b>Rule:</b> All users will now receive exactly <code>{val}</code> numbers when choosing a country."
             )
         else:
-            await update.message.reply_text("❌ Please enter a valid number between 1 and 1000.", parse_mode=ParseMode.HTML)
+            resp_text = "❌ Please enter a valid number between 1 and 1000."
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, kb)
         return
 
     if admin_state.get("awaiting_group_link") or admin_state.get("awaiting_otp_group_link"):
         admin_state.pop("awaiting_group_link", None)
         admin_state.pop("awaiting_otp_group_link", None)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Channel Settings", callback_data="admin_channel_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
         if text.lower() in ("none", "remove", "clear"):
             set_group_link("")
-            await update.message.reply_text("✅ Channel Link removed.", parse_mode=ParseMode.HTML)
+            resp_text = "✅ Channel Link removed."
         elif "|" in text:
             parts = text.split("|", 1)
             bname = parts[0].strip()
@@ -6291,20 +6395,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 set_group_name(bname)
             clean_l = blink if blink.startswith("http") else f"https://{blink}"
             set_group_link(clean_l)
-            await update.message.reply_text(
+            resp_text = (
                 f"✅ <b>Channel Link & Button Saved!</b>\n"
                 f"• <b>Button Name:</b> <code>{html.escape(bname)}</code>\n"
-                f"• <b>Link:</b> <code>{clean_l}</code>",
-                parse_mode=ParseMode.HTML
+                f"• <b>Link:</b> <code>{clean_l}</code>"
             )
         elif text.startswith("http") or text.startswith("t.me"):
             clean_l = text if text.startswith("http") else f"https://{text}"
             set_group_link(clean_l)
-            await update.message.reply_text(f"✅ Channel Link saved: <code>{clean_l}</code>", parse_mode=ParseMode.HTML)
+            resp_text = f"✅ Channel Link saved: <code>{clean_l}</code>"
         else:
-            await update.message.reply_text("❌ Invalid link format. Must start with https://t.me/ or t.me/", parse_mode=ParseMode.HTML)
+            resp_text = "❌ Invalid link format. Must start with https://t.me/ or t.me/"
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, kb)
         return
 
     if admin_state.get("awaiting_group_name") or admin_state.get("awaiting_otp_group_name"):
@@ -6313,7 +6417,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         set_group_name(text)
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
-        await update.message.reply_text(f"✅ Channel Button Name updated: <code>{html.escape(text)}</code>", parse_mode=ParseMode.HTML)
+        resp_text = f"✅ Channel Button Name updated: <code>{html.escape(text)}</code>"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Channel Settings", callback_data="admin_channel_menu")],
+            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, kb)
         return
 
     if admin_state.get("awaiting_admin_id") or admin_state.get("awaiting_add_admin"):
@@ -6440,6 +6549,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Broadcast to All Users
     if admin_state.get("awaiting_broadcast_all"):
         del admin_state["awaiting_broadcast_all"]
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         bcast_id = f"bc_{int(time.time())}"
         all_uids = get_all_user_ids()
         total_sent = 0
@@ -6452,7 +6565,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        progress_msg = await update.message.reply_text("⏳ <i>Broadcasting message to all users...</i>", parse_mode=ParseMode.HTML)
+        progress_text = "⏳ <i>Broadcasting message to all users...</i>"
+        if prompt_msg_id and prompt_chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=prompt_chat_id,
+                    message_id=prompt_msg_id,
+                    text=progress_text,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
 
         for uid in all_uids:
             if uid == user.id or is_user_banned(uid):
@@ -6473,11 +6596,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if gist_storage.enabled:
             asyncio.create_task(gist_storage.export_and_sync())
 
-        try:
-            await progress_msg.delete()
-        except Exception:
-            pass
-
         report_text = (
             f"✅ <b>Broadcast Completed!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -6492,33 +6610,43 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("📢 Broadcast Hub", callback_data="admin_broadcast_menu")],
             [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
         ])
-        await update.message.reply_text(report_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, None, report_text, keyboard)
         return
 
     # Broadcast Target User ID Prompt
     if admin_state.get("awaiting_target_user_id"):
         del admin_state["awaiting_target_user_id"]
         if not text.isdigit():
-            await update.message.reply_text("❌ Invalid User ID. Please send digits only.", parse_mode=ParseMode.HTML)
+            err_text = "❌ Invalid User ID. Please send digits only."
+            err_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
+            ])
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, err_text, err_kb)
             return
         target_uid = int(text)
         admin_state["awaiting_broadcast_single"] = target_uid
+        admin_state["prompt_msg_id"] = prompt_msg_id
+        admin_state["prompt_chat_id"] = prompt_chat_id
         target_info = get_user_details(target_uid)
         t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
-        await update.message.reply_text(
+        step_text = (
             f"👤 <b>Target User:</b> <code>{t_name}</code> (<code>{target_uid}</code>)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Please send the message you wish to deliver to this user in chat:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
-            ])
+            f"Please send the message you wish to deliver to this user in chat:"
         )
+        step_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_broadcast_menu")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, step_text, step_kb)
         return
 
     # Broadcast to Specific User
     if admin_state.get("awaiting_broadcast_single"):
         target_uid = admin_state.pop("awaiting_broadcast_single")
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         bcast_id = f"bc_u_{int(time.time())}"
         single_msg_text = (
             f"💬 <b>Direct Message from Administrator:</b>\n"
@@ -6550,10 +6678,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("👥 User Manager", callback_data=f"u_inspect_{target_uid}")],
                 [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
             ])
-            await update.message.reply_text(report_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, None, report_text, keyboard)
         except Exception as e:
             record_broadcast_history(bcast_id, user.id, "single", target_uid, text, 0, 1)
-            await update.message.reply_text(f"❌ Failed to deliver message to user <code>{target_uid}</code>: {e}", parse_mode=ParseMode.HTML)
+            err_text = f"❌ Failed to deliver message to user <code>{target_uid}</code>: {e}"
+            err_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("👥 User Manager", callback_data=f"u_inspect_{target_uid}")],
+                [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
+            ])
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, None, err_text, err_kb)
         return
 
     # Rename Country Button Name
@@ -6566,19 +6699,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
-        await update.message.reply_text(
+        resp_text = (
             f"✅ <b>Button Name Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 Country: <code>{c_name}</code>\n"
             f"🏷️ New Button Name: <code>{new_name}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>This custom label will now be displayed on country buttons and broadcasts!</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")],
-                [InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")]
-            ])
+            f"<i>This custom label will now be displayed on country buttons and broadcasts!</i>"
         )
+        resp_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")],
+            [InlineKeyboardButton("📁 Stock Pools", callback_data="admin_uploaded_files")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, resp_kb)
         return
 
     # Set Country Service Name
@@ -6591,17 +6724,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
-        await update.message.reply_text(
+        resp_text = (
             f"✅ <b>Service Name Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 Country: <code>{c_name}</code>\n"
             f"📱 Service: <code>{new_srv}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")]
-            ])
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
+        resp_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⚙️ Manage {c_name}", callback_data=f"adm_country_{cid}")]
+        ])
+        await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, resp_text, resp_kb)
         return
 
     # Country Broadcast Custom Text Edit
@@ -6611,7 +6744,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if bcast_data:
             bcast_data["custom_text"] = text.strip()
             ov_text, kb = render_country_broadcast_panel(bcast_data)
-            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, ov_text, kb)
         return
 
     # Country Broadcast Button Label Edit
@@ -6621,7 +6754,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if bcast_data:
             bcast_data["button_label"] = text.strip()
             ov_text, kb = render_country_broadcast_panel(bcast_data)
-            await update.message.reply_text(ov_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, ov_text, kb)
         return
 
     if admin_state.get("awaiting_country_name"):
@@ -7352,7 +7485,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = get_custom_link_buttons()
         found = next((b for b in buttons if str(b["id"]) == btn_id), None)
         if found:
-            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "rename", "id": found["id"]}}
+            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "rename", "id": found["id"]}, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
             await query.answer("Send new name in chat 💬")
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ Cancel / Back", callback_data=f"link_view_{found['id']}")]
@@ -7372,7 +7505,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = get_custom_link_buttons()
         found = next((b for b in buttons if str(b["id"]) == btn_id), None)
         if found:
-            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "reurl", "id": found["id"]}}
+            ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "reurl", "id": found["id"]}, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
             await query.answer("Send new URL or bot username 💬")
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ Cancel / Back", callback_data=f"link_view_{found['id']}")]
@@ -7389,7 +7522,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
     elif data == "link_add_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "add"}}
+        ADMIN_STATES[user.id] = {"awaiting_btn_action": {"action": "add"}, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.answer("Send new button details 💬")
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ Cancel / Back", callback_data="link_list")]
@@ -7511,7 +7644,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     elif data == "prompt_set_url" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_api_url": True}
+        ADMIN_STATES[user.id] = {"awaiting_api_url": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.answer("Send new API URL 💬")
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_api_url_menu")]
@@ -7545,7 +7678,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     elif data == "prompt_set_key" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_api_key": True}
+        ADMIN_STATES[user.id] = {"awaiting_api_key": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.answer("Send new API Key 💬")
         current_key = thirdwave_client.api_key
         masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>None</i>")
@@ -7565,7 +7698,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 6-a. Bot Display Name Prompt
     elif data == "admin_set_name_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_bot_name": True}
+        ADMIN_STATES[user.id] = {"awaiting_bot_name": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         curr = get_bot_name()
         await query.edit_message_text(
             f"✏️ <b>Change Bot Display Name</b>\n"
@@ -7659,7 +7792,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "admin_set_qty_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_fixed_quantity": True}
+        ADMIN_STATES[user.id] = {"awaiting_fixed_quantity": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.edit_message_text(
             "✏️ <b>Set Custom Fixed Number Quantity (1–1000)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -8088,7 +8221,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 9a. Search User by ID Prompt
     elif data == "admin_search_user_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_user_search": True}
+        ADMIN_STATES[user.id] = {"awaiting_user_search": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         prompt_text = (
             f"🔍 <b>Search User by Account ID:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8108,7 +8241,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 9a-2. Remove User by ID Prompt
     elif data == "admin_remove_user_prompt" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_user_remove": True}
+        ADMIN_STATES[user.id] = {"awaiting_user_remove": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         prompt_text = (
             f"🗑️ <b>Remove User by Account ID:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8424,7 +8557,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     elif data == "bcast_start_all" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_broadcast_all": True}
+        ADMIN_STATES[user.id] = {"awaiting_broadcast_all": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         text = (
             "📢 <b>Broadcast to All Users</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -8437,7 +8570,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     elif data == "bcast_start_single" and user_admin:
-        ADMIN_STATES[user.id] = {"awaiting_target_user_id": True}
+        ADMIN_STATES[user.id] = {"awaiting_target_user_id": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         text = (
             "👤 <b>Send Direct Message to User</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -8451,7 +8584,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data.startswith("bcast_prompt_user_") and user_admin:
         target_uid = int(data.split("_")[3])
-        ADMIN_STATES[user.id] = {"awaiting_broadcast_single": target_uid}
+        ADMIN_STATES[user.id] = {"awaiting_broadcast_single": target_uid, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         target_info = get_user_details(target_uid)
         t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
         text = (
@@ -8842,7 +8975,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         c_name = c_info.get("name", "Unknown")
         current_btn = c_info.get("button_name") or c_name
 
-        ADMIN_STATES[user.id] = {"awaiting_rename_country_btn": cid}
+        ADMIN_STATES[user.id] = {"awaiting_rename_country_btn": cid, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.edit_message_text(
             f"✏️ <b>Rename Button Name for {c_name}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8880,6 +9013,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("bcast_c_edit_text_") and user_admin:
         cid = int(data.split("_")[4])
         ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_custom_text"] = cid
+        ADMIN_STATES[user.id]["prompt_msg_id"] = query.message.message_id
+        ADMIN_STATES[user.id]["prompt_chat_id"] = query.message.chat_id
         await query.edit_message_text(
             "✏️ <b>Enter Custom Broadcast Message Text:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -8894,6 +9029,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("bcast_c_edit_btn_") and user_admin:
         cid = int(data.split("_")[4])
         ADMIN_STATES.setdefault(user.id, {})["awaiting_bcast_btn_label"] = cid
+        ADMIN_STATES[user.id]["prompt_msg_id"] = query.message.message_id
+        ADMIN_STATES[user.id]["prompt_chat_id"] = query.message.chat_id
         await query.edit_message_text(
             "🏷️ <b>Enter Broadcast Action Button Label:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"

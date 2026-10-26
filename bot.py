@@ -665,6 +665,11 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_recv_epoch ON processed_otps(received_at_epoch);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_expires_epoch ON processed_otps(expires_at_epoch);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_otps_user_id ON processed_otps(user_id);")
+        # Purge any orphaned claimed numbers from deleted countries
+        try:
+            conn.execute("DELETE FROM user_claimed_numbers WHERE country_id NOT IN (SELECT id FROM countries);")
+        except Exception:
+            pass
 
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
@@ -1287,12 +1292,38 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
                 "DELETE FROM available_numbers WHERE number IN (?, ?, ?);",
                 (num, plain, plus)
             )
+            conn.execute(
+                "DELETE FROM used_numbers WHERE number IN (?, ?, ?);",
+                (num, plain, plus)
+            )
             removed += cur.rowcount
         conn.commit()
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         except Exception:
             pass
+
+    # Purge deleted numbers from user_claimed_numbers in main database & in-memory owner cache
+    try:
+        with get_main_db() as mconn:
+            for raw_num in numbers:
+                num = sanitize_phone_number(raw_num)
+                if not num:
+                    continue
+                plain = num.lstrip("+")
+                plus = f"+{plain}"
+                mconn.execute(
+                    "DELETE FROM user_claimed_numbers WHERE number IN (?, ?, ?);",
+                    (num, plain, plus)
+                )
+                dig = re.sub(r"\D", "", num)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(dig, None)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(f"+{dig}", None)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(num, None)
+            mconn.commit()
+    except Exception as e:
+        logger.warning(f"Error purging removed numbers from user_claimed_numbers: {e}")
+
     invalidate_countries_cache()
     return removed
 
@@ -1309,8 +1340,20 @@ def delete_country_and_stock(country_id: int):
 
     _INITIALIZED_COUNTRY_DBS.discard(country_id)
 
-    # 2. Delete country record from main database
+    # 2. Delete country record and all user_claimed_numbers from main database
     with get_main_db() as conn:
+        try:
+            cur = conn.execute("SELECT number FROM user_claimed_numbers WHERE country_id = ?;", (country_id,))
+            for r in cur.fetchall():
+                raw_n = str(r[0])
+                dig = re.sub(r"\D", "", raw_n)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(dig, None)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(f"+{dig}", None)
+                CLAIMED_NUMBER_OWNER_CACHE.pop(raw_n, None)
+            conn.execute("DELETE FROM user_claimed_numbers WHERE country_id = ?;", (country_id,))
+        except Exception as e:
+            logger.warning(f"Error purging claimed numbers for country {country_id}: {e}")
+
         conn.execute("DELETE FROM countries WHERE id = ?;", (country_id,))
         conn.execute("DELETE FROM delivery_log WHERE country_id = ?;", (country_id,))
         conn.commit()
@@ -1384,8 +1427,8 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
                 dig = re.sub(r"\D", "", str(num))
                 if dig:
                     c_now = time.time()
-                    CLAIMED_NUMBER_OWNER_CACHE[dig] = (user_id, c_now)
-                    CLAIMED_NUMBER_OWNER_CACHE[f"+{dig}"] = (user_id, c_now)
+                    CLAIMED_NUMBER_OWNER_CACHE[dig] = (user_id, country_id, c_now)
+                    CLAIMED_NUMBER_OWNER_CACHE[f"+{dig}"] = (user_id, country_id, c_now)
             mconn.commit()
     except Exception as e:
         logger.warning(f"Error logging delivery: {e}")
@@ -1783,8 +1826,11 @@ def set_view_full_sms_enabled(enabled: bool):
 def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int]:
     """
     Finds which user claimed this phone number within the active retention window.
-    First checks the ultra-fast in-memory cache (< 0.01ms), then queries user_claimed_numbers,
-    with a fallback check to country databases' used_numbers table.
+    Strictly verifies that:
+    1. The country still exists in the active countries table.
+    2. The country stock database file exists on disk.
+    3. The number has NOT been removed or deleted by an admin.
+    If the number or country was removed by an admin, returns None to block SMS delivery.
     """
     if not phone_number:
         return None
@@ -1796,41 +1842,94 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
     now_t = time.time()
     cutoff_epoch = now_t - (max_age_hours * 3600)
 
-    # 1. Ultra-fast in-memory lookup (< 0.01ms)
+    # 1. Fast in-memory lookup (< 0.01ms)
     for k in (digits, f"+{digits}", raw_num):
         if k in CLAIMED_NUMBER_OWNER_CACHE:
-            uid, ctime = CLAIMED_NUMBER_OWNER_CACHE[k]
-            if ctime >= cutoff_epoch:
-                return uid
+            entry = CLAIMED_NUMBER_OWNER_CACHE[k]
+            if len(entry) == 3:
+                uid, cid, ctime = entry
+            else:
+                uid, ctime = entry
+                cid = None
+
+            if ctime < cutoff_epoch:
+                CLAIMED_NUMBER_OWNER_CACHE.pop(k, None)
+                continue
+
+            # Verify that the country database still exists on disk
+            if cid is not None:
+                c_db = os.path.join(STOCKS_DIR, f"country_{cid}.db")
+                if not os.path.exists(c_db):
+                    CLAIMED_NUMBER_OWNER_CACHE.pop(k, None)
+                    continue
+
+            return uid
 
     candidates = [raw_num, f"+{digits}", digits]
     cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # 2. Query user_claimed_numbers with INNER JOIN on active countries table
     try:
         with get_main_db() as conn:
             placeholders = ",".join(["?"] * len(candidates))
             cur = conn.execute(
-                f"""SELECT user_id FROM user_claimed_numbers
-                    WHERE number IN ({placeholders}) AND datetime(claimed_at) >= datetime(?)
-                    ORDER BY id DESC LIMIT 1;""",
+                f"""SELECT ucn.user_id, ucn.country_id 
+                    FROM user_claimed_numbers ucn
+                    INNER JOIN countries c ON c.id = ucn.country_id
+                    WHERE ucn.number IN ({placeholders}) AND datetime(ucn.claimed_at) >= datetime(?)
+                    ORDER BY ucn.id DESC LIMIT 1;""",
                 (*candidates, cutoff_dt)
             )
             row = cur.fetchone()
             if row and row["user_id"]:
                 uid = int(row["user_id"])
-                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
-                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
-                return uid
+                cid = int(row["country_id"])
+                c_path = os.path.join(STOCKS_DIR, f"country_{cid}.db")
+                if os.path.exists(c_path):
+                    # Verify number is still present in country database (not deleted by admin)
+                    try:
+                        with sqlite3.connect(c_path, timeout=5.0) as cconn:
+                            found = cconn.execute(
+                                f"SELECT 1 FROM used_numbers WHERE number IN ({placeholders}) "
+                                f"UNION ALL SELECT 1 FROM available_numbers WHERE number IN ({placeholders}) LIMIT 1;",
+                                (*candidates, *candidates)
+                            ).fetchone()
+                            if found:
+                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, cid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, cid, now_t)
+                                return uid
+                            else:
+                                # Number was deleted by admin from this country! Delete from claimed numbers
+                                conn.execute(f"DELETE FROM user_claimed_numbers WHERE number IN ({placeholders});", candidates)
+                                conn.commit()
+                                CLAIMED_NUMBER_OWNER_CACHE.pop(digits, None)
+                                CLAIMED_NUMBER_OWNER_CACHE.pop(f"+{digits}", None)
+                                return None
+                    except Exception:
+                        pass
+                else:
+                    # Country database was deleted! Clean up dead records
+                    conn.execute("DELETE FROM user_claimed_numbers WHERE country_id = ?;", (cid,))
+                    conn.commit()
     except Exception as e:
         logger.debug(f"Error checking user_claimed_numbers owner: {e}")
 
-    # Fallback: check individual country databases used_numbers
+    # Fallback: check individual country databases used_numbers ONLY for active countries
     try:
         if os.path.exists(STOCKS_DIR):
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
-                    c_path = os.path.join(STOCKS_DIR, f)
+                    cid_str = f.replace("country_", "").replace(".db", "")
+                    cid = int(cid_str) if cid_str.isdigit() else 0
+                    if not cid:
+                        continue
                     try:
+                        with get_main_db() as mconn:
+                            c_exists = mconn.execute("SELECT 1 FROM countries WHERE id = ?;", (cid,)).fetchone()
+                        if not c_exists:
+                            continue
+
+                        c_path = os.path.join(STOCKS_DIR, f)
                         with sqlite3.connect(c_path, timeout=5.0) as cconn:
                             placeholders = ",".join(["?"] * len(candidates))
                             cur = cconn.execute(
@@ -1840,13 +1939,13 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
                             r = cur.fetchone()
                             if r and r[0]:
                                 uid = int(r[0])
-                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, now_t)
-                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[digits] = (uid, cid, now_t)
+                                CLAIMED_NUMBER_OWNER_CACHE[f"+{digits}"] = (uid, cid, now_t)
                                 return uid
                     except Exception:
                         pass
     except Exception as e:
-        logger.debug(f"Country stock owner check fallback note: {e}")
+        logger.debug(f"Fallback country used_numbers check notice: {e}")
 
     return None
 
@@ -6352,11 +6451,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             if not numbers:
                 try:
+                    c_display = country_name if country_name and country_name != "Unknown" else "this country"
                     await query.edit_message_text(
-                        f"⚠️ <b>No more numbers available in stock for {country_name}.</b>\n"
-                        f"All available numbers have been consumed. Please select another country.",
+                        "⚠️ <b>Number Not Available</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"No numbers are currently available in stock for <b>{c_display}</b>.\n\n"
+                        "Please click <b>⚡ Get Number</b> below to choose an available country.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⚡ Get Number", callback_data="btn_get_number")],
                             [InlineKeyboardButton("◀️ Back", callback_data="btn_get_number")]
                         ])
                     )
@@ -6422,11 +6525,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             if not numbers:
                 try:
+                    c_display = country_name if country_name and country_name != "Unknown" else "this country"
                     await query.edit_message_text(
-                        f"⚠️ <b>No more secret numbers available for {country_name}.</b>\n"
-                        f"Please select another country from the Secret Pool.",
+                        "⚠️ <b>Number Not Available</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"No secret numbers are currently available in stock for <b>{c_display}</b>.\n\n"
+                        "Please click <b>🔒 Secret Numbers</b> below to choose an available country.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔒 Secret Numbers", callback_data="btn_get_secret_number")],
                             [InlineKeyboardButton("◀️ Back", callback_data="btn_get_secret_number")]
                         ])
                     )

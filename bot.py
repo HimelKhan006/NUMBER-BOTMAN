@@ -3928,8 +3928,8 @@ async def send_startup_announcement(application: Application):
     manual_restart = get_bot_setting("manual_restart", "0") == "1"
     admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
 
-    # Scheduled safety-net triggers and routine session handovers must NEVER announce (100% silent continuation)
-    if STARTUP_TYPE == "schedule" or _is_handover:
+    # Scheduled safety-net triggers and routine session handovers must NEVER announce unless manually restarted
+    if (STARTUP_TYPE == "schedule" or _is_handover) and not manual_restart:
         logger.info(f"🤫 Automated session continuation (trigger={STARTUP_TYPE or 'none'}, handover={_is_handover}): startup notification suppressed.")
         return
 

@@ -9,6 +9,10 @@ on:
         description: 'Internal zero-restart handover flag (true/false)'
         required: false
         default: 'false'
+      is_manual_restart:
+        description: 'Manual admin restart flag (true/false)'
+        required: false
+        default: 'false'
   schedule:
     # Backup safety net — fires every 6h ONLY if bot ever stops
     - cron: '0 */6 * * *'
@@ -217,7 +221,12 @@ jobs:
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
           GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IS_HANDOVER: ${{ github.event.inputs.is_handover || 'false' }}
+          IS_MANUAL_RESTART: ${{ github.event.inputs.is_manual_restart || 'false' }}
+          GH_TOKEN: ${{ github.token }}
+          PAT: ${{ secrets.PAT }}
           SESSION_TIMEOUT: "19500"
           POLL_INTERVAL_SECONDS: ${{ secrets.POLL_INTERVAL_SECONDS || '4.0' }}
           PYTHONUNBUFFERED: "1"
@@ -346,13 +355,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 Triggering next session immediately..."
+          if [ -f ".handover_dispatched" ]; then
+            echo "✅ Proactive handover was already dispatched in advance by bot.py. Skipping duplicate trigger."
+            exit 0
+          fi
+
+          IS_MANUAL="false"
+          if [ -f ".manual_restart" ]; then
+            IS_MANUAL="true"
+          fi
+
+          echo "🔄 Triggering next session immediately (is_manual_restart=$IS_MANUAL)..."
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
-            -d '{"ref":"main","inputs":{"is_handover":"true"}}')
+            -d "{\"ref\":\"main\",\"inputs\":{\"is_handover\":\"true\",\"is_manual_restart\":\"$IS_MANUAL\"}}")
 
           if [ "$HTTP_CODE" != "204" ] && [ -n "$GIST_TOKEN" ]; then
             echo "ℹ️ Retrying with auxiliary token..."
@@ -361,7 +380,7 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches" \
-              -d '{"ref":"main","inputs":{"is_handover":"true"}}')
+              -d "{\"ref\":\"main\",\"inputs\":{\"is_handover\":\"true\",\"is_manual_restart\":\"$IS_MANUAL\"}}")
           fi
 
           if [ "$HTTP_CODE" = "204" ]; then

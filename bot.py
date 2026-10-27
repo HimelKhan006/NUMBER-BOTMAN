@@ -201,6 +201,7 @@ POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "4.0"))  # 4.0
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
 _is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
+_manual_restart: bool = os.getenv("IS_MANUAL_RESTART", "false").strip().lower() in ("true", "1", "yes")
 _handover_epoch: float = 0.0
 bot_process_start_time: float = time.time()
 
@@ -3911,7 +3912,7 @@ async def send_startup_announcement(application: Application):
     initial deployment, or manual admin restart. Matching OTP bot format.
     COMPLETELY SILENT on routine 24/7 handover sessions (zero spam).
     """
-    global _is_handover
+    global _is_handover, _manual_restart
     silent_env = os.getenv("SILENT_STARTUP", "").strip().lower() in ("true", "1", "yes")
     if silent_env:
         logger.info("🤫 SILENT_STARTUP set: startup notification suppressed.")
@@ -3919,7 +3920,7 @@ async def send_startup_announcement(application: Application):
 
     current_commit = get_current_commit()
     last_notified_commit = get_bot_setting("last_notified_commit", "")
-    manual_restart = get_bot_setting("manual_restart", "0") == "1"
+    manual_restart = (get_bot_setting("manual_restart", "0") == "1") or _manual_restart
     admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
 
     # Scheduled safety-net triggers and routine session handovers must NEVER announce unless manually restarted
@@ -3927,19 +3928,27 @@ async def send_startup_announcement(application: Application):
         logger.info(f"🤫 Automated session continuation (trigger={STARTUP_TYPE or 'none'}, handover={_is_handover}): startup notification suppressed.")
         return
 
-    # A new update is ONLY if git commit actually changed, or manual restart was triggered
-    is_new_update = bool(
-        (current_commit and current_commit != last_notified_commit)
-        or manual_restart
-    )
+    # A git push event ALWAYS alerts (any push = update deployed)
+    is_git_push = (STARTUP_TYPE == "push")
+    # A new update if commit changed from last notified or this is a fresh push
+    is_commit_change = bool(current_commit and last_notified_commit and current_commit != last_notified_commit)
+    is_new_update = is_git_push or is_commit_change or manual_restart
 
-    if not is_new_update and not manual_restart and not admin_alert_enabled:
+    if not is_new_update and not admin_alert_enabled:
         logger.info("ℹ️ NUMBER BOTMAN started cleanly in background (no new update to alert).")
+        if current_commit and not last_notified_commit:
+            set_bot_setting("last_notified_commit", current_commit)
         return
 
     # Clear manual restart flag once handled
     if manual_restart:
+        _manual_restart = False
         set_bot_setting("manual_restart", "0")
+        try:
+            if os.path.exists(".manual_restart"):
+                os.remove(".manual_restart")
+        except Exception:
+            pass
 
     bot_name = get_bot_name()
     time_str, date_str = format_bangladesh_12h()
@@ -4950,7 +4959,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     msg = (
         "📋 <b>SMS Format & Live Preview</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>Active Mode:</b>   <code>{'Short ⚡ (Without View Full SMS)' if curr_fmt == 'short' else 'Long 📜 (With View Full SMS)'}</code>\n\n"
+        f"🟢 <b>Active Mode:</b>   {'Short ⚡ (Without View Full SMS)' if curr_fmt == 'short' else 'Long 📜 (With View Full SMS)'}\n\n"
         "<b>Available Modes:</b>\n"
         f"• <b>Short (Without View Full SMS)</b> {short_active}\n"
         "  Clean, compact card with Service, Country Flag & Name, Unmasked Number & Copy OTP button. No expandable blockquote.\n\n"
@@ -5037,8 +5046,8 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "✅ <b>SMS Delivery Format Updated!</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "• <b>Active Mode:</b> <code>Short ⚡ (Without View Full SMS)</code>\n"
-                    "• <b>Expandable Blockquote:</b> <code>Removed</code>",
+                    "• <b>Active Mode:</b> Short ⚡ (Without View Full SMS)\n"
+                    "• <b>Expandable Blockquote:</b> Removed",
                     parse_mode=ParseMode.HTML
                 )
             return
@@ -5050,8 +5059,8 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "✅ <b>SMS Delivery Format Updated!</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "• <b>Active Mode:</b> <code>Long 📜 (With View Full SMS)</code>\n"
-                    "• <b>Expandable Blockquote:</b> <code>Active</code>",
+                    "• <b>Active Mode:</b> Long 📜 (With View Full SMS)\n"
+                    "• <b>Expandable Blockquote:</b> Active",
                     parse_mode=ParseMode.HTML
                 )
             return
@@ -5108,7 +5117,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     qty_label = f"Fixed ({fixed_qty} numbers)" if fixed_qty else "Default (10 numbers)"
     custom_buttons = get_custom_link_buttons()
     if custom_buttons:
-        link_items = [f"<code>{html.escape(b['text'])}</code>" for b in custom_buttons]
+        link_items = [html.escape(b['text']) for b in custom_buttons]
         link_display = f"<b>{len(custom_buttons)} Active:</b> " + ", ".join(link_items)
     else:
         link_display = "<i>None configured</i>"
@@ -5124,9 +5133,9 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         handover_secs = max(0, session_timeout - uptime_secs)
         h_hours, h_rem = divmod(handover_secs, 3600)
         h_mins, _ = divmod(h_rem, 60)
-        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+        handover_info = f"{h_hours}h {h_mins}m remaining (Auto-Sync 🔄)"
     else:
-        handover_info = "<code>Always-Online (Continuous)</code>"
+        handover_info = "Always-Online (Continuous)"
 
     inbox_status = "🟢 ON (Delivering to DMs)" if is_inbox_otp_enabled() else "🔕 OFF (Groups only)"
     full_sms_status = "📜 Long (Shown)" if is_view_full_sms_enabled() else "⚡ Short (Removed)"
@@ -5138,28 +5147,28 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
-        f"• <b>Bot Name:</b> <code>{current_bot_name}</code>\n"
-        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
-        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Engine Status:</b> 100% Online ✅\n"
+        f"• <b>Bot Name:</b> {current_bot_name}\n"
+        f"• <b>Handover Mode:</b> Zero-Restart Handover Active 🔄\n"
+        f"• <b>Session Uptime:</b> {uptime_str}\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
-        f"• <b>API Base:</b> <code>{html.escape(thirdwave_client.base_url)}</code>\n"
-        f"• <b>API Key:</b> <code>{masked_key}</code>\n"
-        f"• <b>Poll Rate:</b> <code>every {effective_poll:.1f}s</code>\n"
-        f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
-        f"• <b>Inbox OTP:</b> <code>{inbox_status}</code>\n"
-        f"• <b>Full SMS:</b> <code>{full_sms_status}</code>\n"
-        f"• <b>OTPs Today:</b> <code>{today_otps} received</code>\n"
-        f"• <b>28h OTP Records:</b> <code>{total_28h_otps} records</code>\n"
-        f"• <b>Cloud Storage:</b> <code>{'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+        f"• <b>API Base:</b> {html.escape(thirdwave_client.base_url)}\n"
+        f"• <b>API Key:</b> {masked_key}\n"
+        f"• <b>Poll Rate:</b> every {effective_poll:.1f}s\n"
+        f"• <b>Quantity Policy:</b> {qty_label}\n"
+        f"• <b>Inbox OTP:</b> {inbox_status}\n"
+        f"• <b>Full SMS:</b> {full_sms_status}\n"
+        f"• <b>OTPs Today:</b> {today_otps} received\n"
+        f"• <b>28h OTP Records:</b> {total_28h_otps} records\n"
+        f"• <b>Cloud Storage:</b> {'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Live Inventory:</b>\n"
-        f"• <b>Standard:</b> <code>{stats['total_std_available']} available</code>\n"
-        f"• <b>Secret Pool:</b> <code>{stats['total_sec_available']} available 🔒</code>\n"
-        f"• <b>Total Consumed:</b> <code>{stats['total_consumed']} numbers</code>\n"
-        f"• <b>Active Pools:</b> <code>{stats['active_countries']} pools</code>\n"
-        f"• <b>Registered Users:</b> <code>{stats['total_users']} users</code>\n"
-        f"• <b>Secret Whitelisted:</b> <code>{stats['total_secret_users']} users</code>\n"
+        f"• <b>Standard:</b> {stats['total_std_available']} available\n"
+        f"• <b>Secret Pool:</b> {stats['total_sec_available']} available 🔒\n"
+        f"• <b>Total Consumed:</b> {stats['total_consumed']} numbers\n"
+        f"• <b>Active Pools:</b> {stats['active_countries']} pools\n"
+        f"• <b>Registered Users:</b> {stats['total_users']} users\n"
+        f"• <b>Secret Whitelisted:</b> {stats['total_secret_users']} users\n"
         f"• <b>Custom Buttons:</b> {link_display}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -5662,12 +5671,97 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(f"⚠️ User <code>{target_id}</code> was not found in the database.", parse_mode=ParseMode.HTML)
 
-async def perform_zero_restart_handover(target_message):
-    """Executes the clean zero-restart session handover for Number Bot matching OTP bot behavior."""
-    global _is_handover
-    _is_handover = True
+async def trigger_proactive_handover(manual_restart: bool = False) -> bool:
+    """
+    Proactively dispatches the next GitHub Actions workflow run in advance
+    so the incoming runner boots up, sets up Python, restores DB cache,
+    and installs packages while THIS current bot continues distributing numbers!
+    """
+    repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if not repo:
+        logger.info("ℹ️ Proactive handover dispatch skipped (no GITHUB_REPOSITORY).")
+        return False
+
+    candidate_tokens: List[str] = []
+    for t in [
+        os.getenv("PAT", "").strip(),
+        os.getenv("GIST_TOKEN", "").strip(),
+        os.getenv("GH_TOKEN", "").strip(),
+        os.getenv("GITHUB_TOKEN", "").strip(),
+    ]:
+        if t and t not in candidate_tokens and t.lower() != "true":
+            candidate_tokens.append(t)
+
+    if not candidate_tokens:
+        logger.info("ℹ️ Proactive handover dispatch skipped (no authentication token found).")
+        return False
+
     try:
-        set_bot_setting("manual_restart", "1")
+        with get_main_db() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        if os.path.exists(STOCKS_DIR):
+            for f in os.listdir(STOCKS_DIR):
+                if f.endswith(".db"):
+                    try:
+                        with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                            cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if gist_storage.enabled:
+        try:
+            await gist_storage.export_and_sync(is_handover=True)
+        except Exception:
+            pass
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/run_bot.yml/dispatches"
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "is_handover": "true",
+            "is_manual_restart": "true" if manual_restart else "false",
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as hclient:
+            for token in candidate_tokens:
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": "ThirdwaveNumberBotman",
+                }
+                res = await hclient.post(url, headers=headers, json=payload)
+                if res.status_code in (204, 201, 200):
+                    logger.info("🚀 [PROACTIVE HANDOVER] Next runner triggered in advance! Transition will have 0s downtime.")
+                    try:
+                        with open(".handover_dispatched", "w", encoding="utf-8") as hf:
+                            hf.write(str(time.time()))
+                    except Exception:
+                        pass
+                    return True
+                else:
+                    logger.warning(f"⚠️ Proactive handover with token ({token[:6]}...) returned HTTP {res.status_code}: {res.text[:100]}")
+    except Exception as e:
+        logger.warning(f"⚠️ Proactive handover dispatch error: {e}")
+    return False
+
+async def perform_zero_restart_handover(target_message=None, manual_restart: bool = False):
+    """Executes the clean zero-restart session handover for Number Bot matching OTP bot behavior."""
+    global _is_handover, _manual_restart
+    _is_handover = True
+    _manual_restart = manual_restart
+    try:
+        set_bot_setting("manual_restart", "1" if manual_restart else "0")
+        if manual_restart:
+            try:
+                with open(".manual_restart", "w", encoding="utf-8") as mf:
+                    mf.write("1")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -5702,8 +5796,14 @@ async def perform_zero_restart_handover(target_message):
         except Exception:
             pass
 
-    logger.info("Admin triggered zero-restart handover. Exiting cleanly (code 0)...")
-    os._exit(0)
+    # Proactively dispatch the new GitHub Actions workflow run session
+    try:
+        await trigger_proactive_handover(manual_restart=manual_restart)
+    except Exception as e:
+        logger.warning(f"Admin restart dispatch notice: {e}")
+
+    logger.info(f"Handover triggered (manual_restart={manual_restart}). Exiting cleanly (code 0)...")
+    sys.exit(0)
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command with confirmation prompt to trigger clean zero-restart session handover."""
@@ -5720,7 +5820,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<i>You will receive a confirmation message once online.</i>",
             parse_mode=ParseMode.HTML
         )
-        await perform_zero_restart_handover(status_msg)
+        await perform_zero_restart_handover(status_msg, manual_restart=True)
         return
 
     confirm_kb = InlineKeyboardMarkup([
@@ -5753,9 +5853,9 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
         handover_secs = max(0, session_timeout - uptime_secs)
         h_hours, h_rem = divmod(handover_secs, 3600)
         h_mins, _ = divmod(h_rem, 60)
-        handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
+        handover_info = f"{h_hours}h {h_mins}m remaining (Auto-Sync 🔄)"
     else:
-        handover_info = "<code>Always-Online (Continuous)</code>"
+        handover_info = "Always-Online (Continuous)"
 
     active_gist_id = getattr(gist_storage, "gist_id", "") or GIST_ID
     gist_status = (
@@ -5786,7 +5886,7 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
             tot = c.get("available_std", 0) + c.get("available_sec", 0)
             sec_note = f" (incl. {c['available_sec']} 🔒)" if c.get("available_sec", 0) > 0 else ""
             c_label = c.get("button_name") or c.get("name") or "Unknown"
-            pool_lines += f"  {idx}. {html.escape(c_label)} — <code>{tot} available</code>{sec_note}\n"
+            pool_lines += f"  {idx}. {html.escape(c_label)} — {tot} available{sec_note}\n"
         pool_lines += "━━━━━━━━━━━━━━━━━━━━\n"
     else:
         pool_lines = "\n🌍 <b>Number Pools:</b> <i>No active stock in pools</i>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -5795,25 +5895,25 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     inbox_status = "ON ✅ (Private Delivery)" if is_inbox_otp_enabled() else "OFF ❌"
 
     text = (
-        f"⚡ <b>{html.escape(current_bot_name)}</b>  •  <code>LIVE & ONLINE</code>\n"
+        f"⚡ <b>{html.escape(current_bot_name)} • LIVE & ONLINE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>Engine:</b>        <code>100% Online ✅</code>\n"
-        f"⏱️ <b>Uptime:</b>        <code>{uptime_str}</code>\n"
+        f"🟢 <b>Engine:</b>        100% Online ✅\n"
+        f"⏱️ <b>Uptime:</b>        {uptime_str}\n"
         f"🔄 <b>Handover:</b>      {handover_info}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 <b>API Base:</b>      <code>{html.escape(thirdwave_client.base_url)}</code>\n"
-        f"🔑 <b>API Key:</b>       <code>{masked_key}</code>\n"
-        f"🗄️ <b>Database:</b>     <code>{gist_status}</code>\n"
-        f"⚡ <b>Poll Rate:</b>     <code>every {effective_poll:.1f}s</code>\n"
+        f"🌐 <b>API Base:</b>      {html.escape(thirdwave_client.base_url)}\n"
+        f"🔑 <b>API Key:</b>       {masked_key}\n"
+        f"🗄️ <b>Database:</b>     {gist_status}\n"
+        f"⚡ <b>Poll Rate:</b>     every {effective_poll:.1f}s\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Inventory & Operations:</b>\n"
-        f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
-        f"• <b>Secret Numbers:</b>   <code>{stats['total_sec_available']} in stock 🔒</code>\n"
-        f"• <b>Delivered Numbers:</b><code>{stats['total_consumed']} total</code>\n"
-        f"• <b>Active Pools:</b>     <code>{stats['active_countries']} countries</code>\n"
-        f"• <b>Total Users:</b>      <code>{stats['total_users']}</code>\n"
-        f"• <b>Administrators:</b>   <code>{len(admins)} active</code>\n"
-        f"• <b>Inbox OTP:</b>        <code>{inbox_status}</code>\n"
+        f"• <b>Standard Numbers:</b> {stats['total_std_available']} in stock\n"
+        f"• <b>Secret Numbers:</b>   {stats['total_sec_available']} in stock 🔒\n"
+        f"• <b>Delivered Numbers:</b> {stats['total_consumed']} total\n"
+        f"• <b>Active Pools:</b>     {stats['active_countries']} countries\n"
+        f"• <b>Total Users:</b>      {stats['total_users']}\n"
+        f"• <b>Administrators:</b>   {len(admins)} active\n"
+        f"• <b>Inbox OTP:</b>        {inbox_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{pool_lines}"
         f"<i>🔔 Real-time number distribution & OTP polling active — zero restarts, always on.</i>"
@@ -7844,7 +7944,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception:
             pass
-        await perform_zero_restart_handover(query.message)
+        await perform_zero_restart_handover(query.message, manual_restart=True)
 
     # 6-b. Admin Quantity Management Menu
     elif data == "admin_qty_menu" and user_admin:
@@ -9691,13 +9791,18 @@ def main():
                 logger.info("☁️ Pre-handover Gist backup completed successfully.")
             except Exception as e:
                 logger.warning(f"Pre-handover Gist backup warning: {e}")
-        logger.info("✅ Pre-handover state snapshot saved. Exiting cleanly for next runner switch (exit 0)...")
+        logger.info("✅ Pre-handover state snapshot saved. Triggering next runner in advance...")
+        try:
+            await trigger_proactive_handover(manual_restart=False)
+        except Exception as e:
+            logger.warning(f"Proactive handover dispatch error: {e}")
+        logger.info("Exiting cleanly for next runner switch (exit 0)...")
         try:
             application.stop_running()
         except Exception as e:
             logger.warning(f"Notice calling stop_running: {e}")
         await asyncio.sleep(2.0)
-        os._exit(0)
+        sys.exit(0)
 
     async def periodic_gist_sync_loop():
         """Background task: flush dirty Gist state every 15 seconds."""

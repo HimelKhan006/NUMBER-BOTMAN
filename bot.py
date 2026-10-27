@@ -1219,11 +1219,11 @@ def invalidate_countries_cache() -> None:
     global _COUNTRIES_STOCK_CACHE_MAP
     _COUNTRIES_STOCK_CACHE_MAP.clear()
 
-def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = False) -> List[Dict[str, Any]]:
+def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = False, include_used: bool = False) -> List[Dict[str, Any]]:
     global _COUNTRIES_STOCK_CACHE_MAP
     import time as _time
 
-    cache_key = (only_active, secret_mode)
+    cache_key = (only_active, secret_mode, include_used)
     now_ts = _time.monotonic()
     cached = _COUNTRIES_STOCK_CACHE_MAP.get(cache_key)
     if cached is not None and (now_ts - cached[0]) < _COUNTRIES_STOCK_CACHE_TTL:
@@ -1241,8 +1241,7 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
             with get_country_db(cid) as cconn:
                 avail_std = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 0;").fetchone()[0]
                 avail_sec = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 1;").fetchone()[0]
-                # Only query used_numbers when we need admin stats (only_active=False)
-                if not only_active:
+                if include_used:
                     used_std = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 0;").fetchone()[0]
                     used_sec = cconn.execute("SELECT COUNT(*) FROM used_numbers WHERE is_secret = 1;").fetchone()[0]
                 else:
@@ -2685,10 +2684,6 @@ def clear_otp_history(max_age_hours: int = 0) -> int:
                 cur = conn.execute("DELETE FROM processed_otps;")
             deleted = cur.rowcount
             conn.commit()
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            except Exception:
-                pass
         if max_age_hours == 0:
             seen_message_ids.clear()
             seen_timestamps.clear()
@@ -2707,7 +2702,6 @@ def get_today_start_utc() -> str:
 
 def get_otp_stats(max_age_hours: int = 28) -> Tuple[int, int, Dict[str, int]]:
     """Computes exact OTP statistics from processed_otps: (today_total, total_28h, country_counts)."""
-    cleanup_old_otp_messages(max_age_hours=max_age_hours)
     cutoff_epoch = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
     cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     today_start_str = get_today_start_utc()
@@ -4572,11 +4566,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>Use the menu buttons below to get started:</i>"
     )
 
-    # Ensure [≡ Menu] command button is locked and permanently visible in user's chat
-    try:
-        await context.bot.set_chat_menu_button(chat_id=user.id, menu_button=MenuButtonCommands())
-    except Exception:
-        pass
+    # Ensure [≡ Menu] command button is locked and permanently visible in user's chat (backgrounded for instant reply)
+    async def _bg_menu():
+        try:
+            await context.bot.set_chat_menu_button(chat_id=user.id, menu_button=MenuButtonCommands())
+        except Exception:
+            pass
+    asyncio.create_task(_bg_menu())
 
     await update.message.reply_text(
         main_text,
@@ -8072,7 +8068,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # 6b. Admin View Uploaded Number Files & Stock Pools
     elif (data == "admin_uploaded_files" or data.startswith("page_upfiles_")) and user_admin:
         page = int(data.split("_")[2]) if data.startswith("page_upfiles_") else 0
-        countries = get_all_countries_with_stock(only_active=False)
+        countries = get_all_countries_with_stock(only_active=False, include_used=True)
         stats = get_system_stats()
 
         if not countries:

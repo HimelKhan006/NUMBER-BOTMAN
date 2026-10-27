@@ -5152,7 +5152,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Handover Mode:</b> Zero-Restart Handover Active 🔄\n"
         f"• <b>Session Uptime:</b> {uptime_str}\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
-        f"• <b>API Base:</b> {html.escape(thirdwave_client.base_url)}\n"
+        f"• <b>API Base:</b> <code>{html.escape(thirdwave_client.base_url)}</code>\n"
         f"• <b>API Key:</b> {masked_key}\n"
         f"• <b>Poll Rate:</b> every {effective_poll:.1f}s\n"
         f"• <b>Quantity Policy:</b> {qty_label}\n"
@@ -5224,7 +5224,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     admin_text, keyboard = build_admin_dashboard(user.id)
-    await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
 
 async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -5304,7 +5304,7 @@ async def seturl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ADMIN_STATES[user.id].pop("awaiting_api_url", None)
             ADMIN_STATES[user.id].pop("awaiting_api_key", None)
         text, markup = build_api_url_view()
-        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
         return
 
     raw_input = " ".join(context.args).strip()
@@ -5901,7 +5901,7 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
         f"⏱️ <b>Uptime:</b>        {uptime_str}\n"
         f"🔄 <b>Handover:</b>      {handover_info}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 <b>API Base:</b>      {html.escape(thirdwave_client.base_url)}\n"
+        f"🌐 <b>API Base:</b>      <code>{html.escape(thirdwave_client.base_url)}</code>\n"
         f"🔑 <b>API Key:</b>       {masked_key}\n"
         f"🗄️ <b>Database:</b>     {gist_status}\n"
         f"⚡ <b>Poll Rate:</b>     every {effective_poll:.1f}s\n"
@@ -7752,7 +7752,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(alert_msg, show_alert=False)
         admin_text, keyboard = build_admin_dashboard(user.id)
         try:
-            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -7766,7 +7766,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(alert_msg, show_alert=False)
         admin_text, keyboard = build_admin_dashboard(user.id)
         try:
-            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -7825,7 +7825,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ADMIN_STATES[user.id].pop("awaiting_bot_name", None)
         admin_text, keyboard = build_admin_dashboard(user.id)
         try:
-            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
             if data == "admin_refresh_dash":
                 await query.answer("🔄 Dashboard Refreshed")
         except Exception as e:
@@ -7841,7 +7841,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ADMIN_STATES[user.id].pop("awaiting_api_url", None)
             ADMIN_STATES[user.id].pop("awaiting_api_key", None)
         text_view, markup = build_api_url_view()
-        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
 
     elif data == "prompt_set_url" and user_admin:
         ADMIN_STATES[user.id] = {"awaiting_api_url": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
@@ -7857,7 +7857,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<i>Example:</i> <code>https://thirdwave.im</code>\n\n"
             f"Or click <b>❌ Cancel</b> below to abort.",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb
+            reply_markup=kb,
+            disable_web_page_preview=True
         )
 
     elif data == "reset_url_default" and user_admin:
@@ -7868,7 +7869,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             asyncio.create_task(gist_storage.export_and_sync())
         await query.answer("API URL Reset to Default ✅")
         text_view, markup = build_api_url_view()
-        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await query.edit_message_text(text=text_view, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
 
     elif data == "admin_api_key_menu" and user_admin:
         if user.id in ADMIN_STATES:

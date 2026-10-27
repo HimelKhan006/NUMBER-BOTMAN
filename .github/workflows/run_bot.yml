@@ -81,78 +81,44 @@ jobs:
         if: github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
-          ALT_TOKEN: ${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}
         run: |
-          for st in in_progress queued; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=$st&per_page=30" \
-              | python3 -c "
-            import sys, json
-            runs = json.load(sys.stdin).get('workflow_runs', [])
-            for r in runs:
-                if str(r.get('id')) != '${{ github.run_id }}':
-                    print(r['id'])
-            " | while read r_id; do
-              echo "🛑 Cancelling older run #$r_id ($st)..."
-              curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id/cancel" || true
-            done
-          done
-          echo "✅ Old runs cancelled."
-
-      - name: Clear Old Completed Workflow History
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ALT_TOKEN: ${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}
-        run: |
-          echo "🧹 Deleting old completed workflow run history..."
           curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=50" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=10" \
             | python3 -c "
-          import sys, json
-          runs = [r for r in json.load(sys.stdin).get('workflow_runs', []) if r.get('status') == 'completed' and str(r.get('id')) != '${{ github.run_id }}']
-          for r in runs:
-              print(r['id'])
-          " | while read r_id; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id")
-            if [ "$HTTP_CODE" = "204" ]; then
-              echo "  🗑️ Purged old completed run #$r_id"
-            elif [ -n "$ALT_TOKEN" ]; then
-              curl -s -X DELETE \
-                -H "Authorization: Bearer $ALT_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id" || true
-            fi
-          done
-          echo "✅ History cleaned."
+          import sys, json, urllib.request
+          token = '$GH_TOKEN'
+          repo = '${{ github.repository }}'
+          current_id = '${{ github.run_id }}'
+          try:
+              data = json.load(sys.stdin)
+              for r in data.get('workflow_runs', []):
+                  r_id = str(r.get('id'))
+                  if r_id != current_id:
+                      req = urllib.request.Request(
+                          f'https://api.github.com/repos/{repo}/actions/runs/{r_id}/cancel',
+                          method='POST',
+                          headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+                      )
+                      try:
+                          urllib.request.urlopen(req, timeout=3)
+                          print(f'🛑 Cancelled older run #{r_id}')
+                      except Exception:
+                          pass
+          except Exception:
+              pass
+          " || true
+          echo "✅ Active runner check complete."
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-bot4-ptb22-v1
-          restore-keys: pip-bot4-
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
-          pip install --quiet --upgrade pip
-          pip install --quiet \
-            python-telegram-bot==22.1 \
-            python-dotenv \
-            httpx \
-            aiohttp \
-            requests
+          pip install --quiet -r requirements.txt
           echo "✅ Dependencies ready."
 
       - name: Validate Required Secrets
@@ -201,6 +167,30 @@ jobs:
 
           # Instantly exit when GitHub sends cancellation signals (SIGTERM/SIGINT)
           trap "echo '🛑 Immediate cancellation signal received. Halting runner.'; exit 0" SIGTERM SIGINT
+
+          # Continuous background cleaner: deletes completed runs every 120s without blocking startup
+          (
+            CLEAN_TOKEN="${{ github.token }}"
+            CLEAN_ALT="${{ secrets.PAT || secrets.GH_TOKEN || secrets.GIST_TOKEN }}"
+            while true; do
+              sleep 120
+              curl -s -H "Authorization: Bearer $CLEAN_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=50" \
+                | python3 -c "
+              import sys, json
+              runs = json.load(sys.stdin).get('workflow_runs', [])
+              for r in runs:
+                  if str(r.get('id')) != '${{ github.run_id }}' and r.get('status') == 'completed':
+                      print(r['id'])
+              " 2>/dev/null | while read r_id; do
+                DEL_RES=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $CLEAN_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id")
+                if [ "$DEL_RES" != "204" ] && [ -n "$CLEAN_ALT" ]; then
+                  curl -s -X DELETE -H "Authorization: Bearer $CLEAN_ALT" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/$r_id" >/dev/null 2>&1 || true
+                fi
+              done
+            done
+          ) &
 
           while true; do
             REMAINING=$((END_TIME - SECONDS))

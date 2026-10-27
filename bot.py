@@ -9716,14 +9716,17 @@ def main():
                 await gist_storage.restore_from_gist()
             except Exception as e:
                 logger.warning(f"Gist startup sync notice: {e}")
-        # Restore active bot name from database to Telegram
-        current_name = get_bot_name()
-        try:
-            await application.bot.set_my_name(name=current_name)
-            logger.info(f"🤖 Applied active bot name from database: {current_name}")
-        except Exception as e:
-            logger.warning(f"Startup bot name restore notice: {e}")
-        await setup_bot_commands(application)
+        # Restore active bot name and configure command menus in background (Zero polling delay)
+        async def background_telegram_setup():
+            current_name = get_bot_name()
+            try:
+                await application.bot.set_my_name(name=current_name)
+                logger.info(f"🤖 Applied active bot name from database: {current_name}")
+            except Exception as e:
+                logger.warning(f"Startup bot name restore notice: {e}")
+            await setup_bot_commands(application)
+
+        asyncio.create_task(background_telegram_setup())
         asyncio.create_task(send_startup_announcement(application))
 
         is_cloud = bool(STARTUP_TYPE or os.getenv("GITHUB_ACTIONS"))

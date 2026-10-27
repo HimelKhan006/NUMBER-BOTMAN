@@ -196,7 +196,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "4.0"))  # 4.0s = 15 req/min, safe under shared 30 req/min ceiling
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "7.0"))  # 7.0s = ~8.5 req/min, 100% peace of mind under shared 30 req/min ceiling
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -3407,7 +3407,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(4.0, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(7.0, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""
@@ -5142,7 +5142,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
     current_key = thirdwave_client.api_key
     masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>Missing</i>")
-    effective_poll = max(4.0, POLL_INTERVAL_SECONDS)
+    effective_poll = max(7.0, POLL_INTERVAL_SECONDS)
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
@@ -5891,7 +5891,7 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     else:
         pool_lines = "\n🌍 <b>Number Pools:</b> <i>No active stock in pools</i>\n━━━━━━━━━━━━━━━━━━━━\n"
 
-    effective_poll = max(4.0, POLL_INTERVAL_SECONDS)
+    effective_poll = max(7.0, POLL_INTERVAL_SECONDS)
     inbox_status = "ON ✅ (Private Delivery)" if is_inbox_otp_enabled() else "OFF ❌"
 
     text = (

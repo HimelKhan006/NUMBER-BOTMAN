@@ -5137,6 +5137,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
     current_key = thirdwave_client.api_key
     masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>Missing</i>")
+    effective_poll = max(4.0, POLL_INTERVAL_SECONDS)
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
@@ -5148,6 +5149,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Next Handover:</b> {handover_info}\n"
         f"• <b>API Base:</b> <code>{html.escape(thirdwave_client.base_url)}</code>\n"
         f"• <b>API Key:</b> <code>{masked_key}</code>\n"
+        f"• <b>Poll Rate:</b> <code>every {effective_poll:.1f}s</code>\n"
         f"• <b>Quantity Policy:</b> <code>{qty_label}</code>\n"
         f"• <b>Inbox OTP:</b> <code>{inbox_status}</code>\n"
         f"• <b>Full SMS:</b> <code>{full_sms_status}</code>\n"

@@ -4025,17 +4025,11 @@ def format_delivered_numbers(
 ) -> str:
     """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
     display_cname = format_country_name(country_name)
-    grp_link = get_group_link()
-    if grp_link:
-        otp_note = f"<i>💡 If the OTP is not received here, please check the <a href=\"{html.escape(grp_link)}\">OTP Group</a>.</i>"
-    else:
-        otp_note = "<i>💡 If the OTP is not received here, please check the OTP Group.</i>"
-
     lines = [
         f"<b>{html.escape(display_cname)} Allocated For You</b>",
         "",
-        "🕒 <b>Waiting for OTP...</b> ⏳",
-        otp_note,
+        "🕒 <b>Waiting for OTP code...</b> ⏳",
+        "<i>⚡ Your OTP will be delivered directly here as soon as received.</i>",
     ]
     if available_count is not None and available_count > 0:
         lines.append("")
@@ -4748,8 +4742,19 @@ async def setlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>Total Active Buttons:</b> <code>{len(buttons)}</code> (displayed side-by-side)\n"
         f"• <b>Storage:</b> <code>Database & Cloud Gist ☁️</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=detail_kb
+        reply_markup=detail_kb,
+        disable_web_page_preview=True
     )
+    if user and user.id:
+        try:
+            await msg_obj.reply_text(
+                "⌨️ <i>Menu keyboard updated.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_user_reply_keyboard(user.id),
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
 
 async def removelink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -5924,7 +5929,8 @@ async def render_prompt_response(
                 message_id=prompt_msg_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
             )
         except Exception as e:
             if "not modified" not in str(e).lower():
@@ -5936,31 +5942,27 @@ async def render_prompt_response(
                     chat_id=chat_id,
                     text=text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
                 )
     else:
         await context.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
         )
 
     if sync_keyboard_user_id:
         try:
-            m = await context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat_id,
                 text="⌨️ <i>Menu keyboard updated.</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_user_reply_keyboard(sync_keyboard_user_id)
+                reply_markup=get_user_reply_keyboard(sync_keyboard_user_id),
+                disable_web_page_preview=True
             )
-            async def _cleanup(msg_to_del):
-                await asyncio.sleep(1.5)
-                try:
-                    await msg_to_del.delete()
-                except Exception:
-                    pass
-            asyncio.create_task(_cleanup(m))
         except Exception:
             pass
 
@@ -6179,7 +6181,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"👉 Open {cb['text']}", url=cb["url"])]
-                ])
+                ]),
+                disable_web_page_preview=True
             )
             return
 
@@ -7414,7 +7417,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         msg_text, markup = build_button_detail_view(btn_id)
         if msg_text and markup:
             try:
-                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
                 await query.answer()
             except Exception as e:
                 err_str = str(e).lower()
@@ -7423,14 +7426,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     await query.answer()
                     try:
-                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
                     except Exception:
                         pass
         else:
             await query.answer("Button not found", show_alert=True)
             msg_text, markup = build_buttons_list_view()
             try:
-                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
             except Exception:
                 pass
 
@@ -7439,7 +7442,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         msg_text, markup = build_button_delete_confirm_view(btn_id)
         if msg_text and markup:
             try:
-                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                await query.edit_message_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
                 await query.answer()
             except Exception as e:
                 err_str = str(e).lower()
@@ -7448,7 +7451,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     await query.answer()
                     try:
-                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                        await query.message.reply_text(text=msg_text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
                     except Exception:
                         pass
 
@@ -7469,22 +7472,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<code>{deleted_name}</code> has been removed.\n\n"
             f"• <b>Remaining Active Buttons:</b> <code>{len(new_list)}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb
+            reply_markup=kb,
+            disable_web_page_preview=True
         )
         try:
-            m = await context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text="⌨️ <i>Menu keyboard updated.</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_user_reply_keyboard(user.id)
+                reply_markup=get_user_reply_keyboard(user.id),
+                disable_web_page_preview=True
             )
-            async def _cleanup(msg_to_del):
-                await asyncio.sleep(1.5)
-                try:
-                    await msg_to_del.delete()
-                except Exception:
-                    pass
-            asyncio.create_task(_cleanup(m))
         except Exception:
             pass
 
@@ -7516,22 +7514,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "━━━━━━━━━━━━━━━━━━━━\n"
             "All custom buttons have been removed from number delivery messages.",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb
+            reply_markup=kb,
+            disable_web_page_preview=True
         )
         try:
-            m = await context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text="⌨️ <i>Menu keyboard updated.</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_user_reply_keyboard(user.id)
+                reply_markup=get_user_reply_keyboard(user.id),
+                disable_web_page_preview=True
             )
-            async def _cleanup(msg_to_del):
-                await asyncio.sleep(1.5)
-                try:
-                    await msg_to_del.delete()
-                except Exception:
-                    pass
-            asyncio.create_task(_cleanup(m))
         except Exception:
             pass
 
@@ -7552,7 +7545,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"• <b>Target URL:</b> <code>{html.escape(found['url'])}</code>\n\n"
                 f"💬 <b>Send the new button name</b> directly in this chat:",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb
+                reply_markup=kb,
+                disable_web_page_preview=True
             )
 
     elif data.startswith("link_reurl_") and user_admin:
@@ -7573,7 +7567,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"💬 <b>Send the new link URL or bot username</b> directly in this chat:\n"
                 f"<code>https://...</code> or <code>@bot_username</code>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb
+                reply_markup=kb,
+                disable_web_page_preview=True
             )
 
     elif data == "link_add_prompt" and user_admin:

@@ -196,7 +196,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "3.5"))
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "4.0"))  # 4.0s = 15 req/min, safe under shared 30 req/min ceiling
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -3412,7 +3412,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(3.5, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(4.0, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""
@@ -5742,16 +5742,13 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=confirm_kb,
     )
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
+def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     stats = get_system_stats()
     current_bot_name = get_bot_name()
     uptime_secs = int(time.time() - bot_process_start_time)
     hours, remainder = divmod(uptime_secs, 3600)
     mins, secs = divmod(remainder, 60)
-    uptime_str = f"{hours}h {mins}m {secs}s"
+    uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
 
     session_timeout = int(os.getenv("SESSION_TIMEOUT", "19500"))
     if session_timeout > 0:
@@ -5762,31 +5759,81 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         handover_info = "<code>Always-Online (Continuous)</code>"
 
+    active_gist_id = getattr(gist_storage, "gist_id", "") or GIST_ID
+    gist_status = (
+        f"Encrypted Cloud DB ({active_gist_id[:8]}...) 🔒"
+        if (gist_storage.enabled and active_gist_id)
+        else ("Connected to GitHub Gist ☁️" if gist_storage.enabled else "Local Storage")
+    )
+    masked_key = (
+        f"{thirdwave_client.api_key[:8]}...{thirdwave_client.api_key[-4:]}"
+        if (thirdwave_client.api_key and len(thirdwave_client.api_key) > 12)
+        else (thirdwave_client.api_key or "<i>Missing</i>")
+    )
     admins = get_all_admin_ids()
+
+    # Active Number Pools Breakdown (Top active pools with available numbers - like OTP bot's country breakdown)
+    all_countries_stock = [
+        c for c in get_all_countries_with_stock(only_active=True)
+        if (c.get("available_std", 0) + c.get("available_sec", 0)) > 0
+    ]
+    if all_countries_stock:
+        sorted_pools = sorted(
+            all_countries_stock,
+            key=lambda x: (x.get("available_std", 0) + x.get("available_sec", 0)),
+            reverse=True
+        )
+        pool_lines = "\n🌍 <b>Number Pools Stock (Active):</b>\n"
+        for idx, c in enumerate(sorted_pools[:12], 1):
+            tot = c.get("available_std", 0) + c.get("available_sec", 0)
+            sec_note = f" (incl. {c['available_sec']} 🔒)" if c.get("available_sec", 0) > 0 else ""
+            c_label = c.get("button_name") or c.get("name") or "Unknown"
+            pool_lines += f"  {idx}. {html.escape(c_label)} — <code>{tot} available</code>{sec_note}\n"
+        pool_lines += "━━━━━━━━━━━━━━━━━━━━\n"
+    else:
+        pool_lines = "\n🌍 <b>Number Pools:</b> <i>No active stock in pools</i>\n━━━━━━━━━━━━━━━━━━━━\n"
+
+    effective_poll = max(4.0, POLL_INTERVAL_SECONDS)
+    inbox_status = "ON ✅ (Private Delivery)" if is_inbox_otp_enabled() else "OFF ❌"
+
     text = (
-        f"⚡ <b>{current_bot_name} — Live Engine Status</b>\n"
+        f"⚡ <b>{html.escape(current_bot_name)}</b>  •  <code>LIVE & ONLINE</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
-        f"• <b>Bot Name:</b> <code>{current_bot_name}</code>\n"
-        f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
-        f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
-        f"• <b>Next Handover:</b> {handover_info}\n"
-        f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
+        f"🟢 <b>Engine:</b>        <code>100% Online ✅</code>\n"
+        f"⏱️ <b>Uptime:</b>        <code>{uptime_str}</code>\n"
+        f"🔄 <b>Handover:</b>      {handover_info}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>API Base:</b>      <code>{html.escape(thirdwave_client.base_url)}</code>\n"
+        f"🔑 <b>API Key:</b>       <code>{masked_key}</code>\n"
+        f"🗄️ <b>Database:</b>     <code>{gist_status}</code>\n"
+        f"⚡ <b>Poll Rate:</b>     <code>every {effective_poll:.1f}s</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Inventory & Operations:</b>\n"
         f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
-        f"• <b>Secret Numbers:</b> <code>{stats['total_sec_available']} in stock 🔒</code>\n"
-        f"• <b>Delivered Numbers:</b> <code>{stats['total_consumed']} total</code>\n"
-        f"• <b>Active Pools:</b> <code>{stats['active_countries']} countries</code>\n"
-        f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-        f"• <b>Administrators:</b> <code>{len(admins)} active</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"• <b>Secret Numbers:</b>   <code>{stats['total_sec_available']} in stock 🔒</code>\n"
+        f"• <b>Delivered Numbers:</b><code>{stats['total_consumed']} total</code>\n"
+        f"• <b>Active Pools:</b>     <code>{stats['active_countries']} countries</code>\n"
+        f"• <b>Total Users:</b>      <code>{stats['total_users']}</code>\n"
+        f"• <b>Administrators:</b>   <code>{len(admins)} active</code>\n"
+        f"• <b>Inbox OTP:</b>        <code>{inbox_status}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{pool_lines}"
+        f"<i>🔔 Real-time number distribution & OTP polling active — zero restarts, always on.</i>"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_live_status")],
         [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
     ])
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    return text, keyboard
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    text, keyboard = build_number_status_dashboard()
+    msg_obj = update.effective_message
+    if msg_obj:
+        await msg_obj.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
 # ==========================================
 # 11. Admin File (.txt) & Text Upload Handlers
 # ==========================================
@@ -6170,6 +6217,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_user_reply_keyboard(user.id)
             )
+        return
+
+    if text in ["📊 Status", "Status", "/status", "⚡ Live Status"]:
+        if is_admin(user.id):
+            await status_command(update, context)
         return
 
     # Handle Custom Button tapped from Bottom Reply Keyboard
@@ -8009,47 +8061,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data == "admin_live_status" and user_admin:
-        stats = get_system_stats()
-        uptime_secs = int(time.time() - bot_process_start_time)
-        hours, remainder = divmod(uptime_secs, 3600)
-        mins, secs = divmod(remainder, 60)
-        uptime_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
-
-        session_timeout = int(os.getenv("SESSION_TIMEOUT", "0"))
-        if session_timeout > 0:
-            handover_secs = max(0, session_timeout - uptime_secs)
-            h_hours, h_rem = divmod(handover_secs, 3600)
-            h_mins, _ = divmod(h_rem, 60)
-            handover_info = f"<code>{h_hours}h {h_mins}m remaining</code> (Auto-Sync 🔄)"
-        else:
-            handover_info = "<code>Always-Online (Continuous)</code>"
-
-        admins = get_all_admin_ids()
-        current_bot_name = get_bot_name()
-        text = (
-            f"⚡ <b>{current_bot_name} — Live Engine Status</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Engine Status:</b> <code>100% Online ✅</code>\n"
-            f"• <b>Bot Name:</b> <code>{current_bot_name}</code> (/setname)\n"
-            f"• <b>Handover Mode:</b> <code>Zero-Restart Handover Active 🔄</code>\n"
-            f"• <b>Session Uptime:</b> <code>{uptime_str}</code>\n"
-            f"• <b>Next Handover:</b> {handover_info}\n"
-            f"• <b>Cloud Storage:</b> <code>{'Connected to GitHub Gist ☁️' if gist_storage.enabled else 'Local SQLite'}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Inventory & Operations:</b>\n"
-            f"• <b>Standard Numbers:</b> <code>{stats['total_std_available']} in stock</code>\n"
-            f"• <b>Secret Numbers:</b> <code>{stats['total_sec_available']} in stock 🔒</code>\n"
-            f"• <b>Delivered Numbers:</b> <code>{stats['total_consumed']} total</code>\n"
-            f"• <b>Active Pools:</b> <code>{stats['active_countries']} countries</code>\n"
-            f"• <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-            f"• <b>Administrators:</b> <code>{len(admins)} active</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_live_status")],
-            [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-        ])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        text, keyboard = build_number_status_dashboard()
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+        except Exception:
+            pass
 
     # 6b. Admin View Uploaded Number Files & Stock Pools
     elif (data == "admin_uploaded_files" or data.startswith("page_upfiles_")) and user_admin:
@@ -9600,6 +9616,7 @@ def main():
 
     # Strictly ONLY /start is registered as a slash command. All other interactions are button-driven.
     app.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("status", status_command, filters=filters.ChatType.PRIVATE))
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, handle_document_upload))

@@ -4056,26 +4056,12 @@ def format_delivered_numbers(
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
 
-    # Resolve active OTP group link if configured
-    grp_link = get_group_link()
-    if not grp_link:
-        for cb in get_custom_link_buttons():
-            u = str(cb.get("url", "")).strip()
-            if u:
-                grp_link = u
-                break
-    if grp_link and grp_link.startswith(("http://", "https://", "tg://", "t.me/")):
-        target_url = grp_link if grp_link.startswith(("http://", "https://", "tg://")) else f"https://{grp_link}"
-        grp_html = f'<a href="{html.escape(target_url)}">OTP Group</a>'
-    else:
-        grp_html = "<b>OTP Group</b>"
-
     lines = [
         f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
         CARD_DIVIDER,
         f"👉 <b>{num_hint}</b>",
         "⚡ <i>Your OTP verification code will appear here instantly.</i>",
-        f"📢 <i>If your OTP is not received here, please check our {grp_html}.</i>",
+        "📢 <i>If your OTP is not received here, please check our OTP Group.</i>",
     ]
     if available_count is not None and available_count > 0:
         lines.append(f"📦 <b>Pool Stock:</b> {available_count} numbers remaining")
@@ -4603,7 +4589,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         msg,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
+                        reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers),
+                        disable_web_page_preview=True
                     )
                     if gist_storage.enabled:
                         gist_storage.mark_dirty()
@@ -7283,7 +7270,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.edit_message_text(
                     response_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=markup
+                    reply_markup=markup,
+                    disable_web_page_preview=True
                 )
             except BadRequest as br:
                 if "Message is not modified" in str(br):
@@ -7293,7 +7281,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         chat_id=user.id,
                         text=response_text,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=markup
+                        reply_markup=markup,
+                        disable_web_page_preview=True
                     )
         except Exception as e:
             logger.error(f"Error delivering numbers for user {user.id}: {e}", exc_info=True)
@@ -7350,7 +7339,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.edit_message_text(
                     response_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=markup
+                    reply_markup=markup,
+                    disable_web_page_preview=True
                 )
             except BadRequest as br:
                 if "Message is not modified" in str(br):
@@ -7360,7 +7350,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         chat_id=user.id,
                         text=response_text,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=markup
+                        reply_markup=markup,
+                        disable_web_page_preview=True
                     )
         except Exception as e:
             logger.error(f"Error delivering secret numbers for user {user.id}: {e}", exc_info=True)
@@ -7418,7 +7409,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 new_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=new_keyboard
+                reply_markup=new_keyboard,
+                disable_web_page_preview=True
             )
         except Exception as e:
             logger.warning(f"Toggle plus message update notice: {e}")
@@ -9385,7 +9377,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=user.id,
             text=response_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
+            reply_markup=get_numbers_view_keyboard(cid, is_secret=False, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers),
+            disable_web_page_preview=True
         )
         return
 

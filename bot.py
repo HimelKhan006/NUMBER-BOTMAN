@@ -4054,18 +4054,16 @@ def format_delivered_numbers(
     display_cname = format_country_name(country_name)
     title_icon = "🔒" if is_secret else "📲"
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
+    num_word = "numbers" if len(numbers) > 1 else "number"
     lines = [
         f"{title_icon} <b>{html.escape(display_cname)} — {assigned_label}</b>",
         CARD_DIVIDER,
-        "<b>Status:</b>  ✅ Active &amp; Monitoring",
-        "<b>Action:</b>  Use the number below to receive your OTP",
-        "",
+        f"Use the {num_word} below to receive your OTP.",
         "<i>⚡ OTP messages will appear here instantly once received.</i>",
     ]
     if available_count is not None and available_count > 0:
         lines.append("")
         lines.append(f"📦 <b>Pool Stock:</b>  {available_count} numbers remaining")
-    lines.append("")
     lines.append(CARD_DIVIDER)
     return "\n".join(lines)
 

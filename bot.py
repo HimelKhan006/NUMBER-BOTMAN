@@ -425,13 +425,34 @@ def sanitize_phone_number(raw_num: str) -> Optional[str]:
 # ==========================================
 # 5. Database Engine (Main DB + Per-Country Stocks)
 # ==========================================
+class ClosingConnection:
+    """Wraps an SQLite connection so context management commits/rollbacks and guarantees clean closing."""
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._conn.__enter__()
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._conn.close()
+
+    def close(self):
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
 def get_main_db():
     conn = sqlite3.connect(MAIN_DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000;")
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
-    return conn
+    return ClosingConnection(conn)
 
 # Track which country DBs have already had their schema set up this process run
 _INITIALIZED_COUNTRY_DBS: Set[int] = set()
@@ -480,7 +501,7 @@ def get_country_db(country_id: int):
     if country_id not in _INITIALIZED_COUNTRY_DBS:
         _ensure_country_db_schema(conn)
         _INITIALIZED_COUNTRY_DBS.add(country_id)
-    return conn
+    return ClosingConnection(conn)
 
 def init_db():
     with get_main_db() as conn:
@@ -3226,9 +3247,9 @@ class ThirdwaveClient:
             elif res.status_code == 429:
                 retry_header = res.headers.get("Retry-After", "")
                 try:
-                    retry_wait = min(float(retry_header), 6.0) if retry_header else 2.5
+                    retry_wait = max(5.0, min(float(retry_header), 60.0)) if retry_header else 10.0
                 except Exception:
-                    retry_wait = 2.5
+                    retry_wait = 10.0
                 self.cooldown_until = time.time() + retry_wait
                 logger.warning(f"⚠️ Thirdwave 429 Rate Limit. Backing off {retry_wait:.1f}s...")
                 return []
@@ -3319,14 +3340,16 @@ async def deliver_otp_item(bot: Bot, item: Dict[str, Any]) -> bool:
         )
         inbox_kb = build_otp_button_row(otp_code)
         try:
-            await bot.send_message(
+            inbox_delivered = await send_with_retry(
+                bot=bot,
                 chat_id=owner_id,
                 text=inbox_text,
-                parse_mode=ParseMode.HTML,
                 reply_markup=inbox_kb,
             )
-            inbox_delivered = True
-            logger.info(f"📬 Delivered Live OTP ({mid}) to User Inbox {owner_id} ({raw_number}) [{service_name}]")
+            if inbox_delivered:
+                logger.info(f"📬 Delivered Live OTP ({mid}) to User Inbox {owner_id} ({raw_number}) [{service_name}]")
+            else:
+                logger.warning(f"Could not deliver OTP to user inbox {owner_id}")
         except Exception as e:
             logger.warning(f"Could not deliver OTP to user inbox {owner_id}: {e}")
 
@@ -3813,11 +3836,12 @@ gist_storage = GistStorage(GIST_ID, GIST_TOKEN)
 async def send_with_retry(bot: Bot, chat_id: int, text: str,
                           reply_markup: Optional[InlineKeyboardMarkup] = None,
                           max_retries: int = 3) -> bool:
+    safe_text = text if len(text) <= 4090 else (text[:4080] + "...")
     for attempt in range(1, max_retries + 1):
         try:
             await bot.send_message(
                 chat_id=chat_id,
-                text=text,
+                text=safe_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
@@ -3829,6 +3853,20 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str,
         except (TimedOut, NetworkError) as e:
             logger.warning(f"Network error sending to {chat_id}: {e}. Retrying ({attempt}/{max_retries})...")
             await asyncio.sleep(2.0 * attempt)
+        except BadRequest as b_err:
+            logger.warning(f"⚠️ Telegram BadRequest ({b_err}) for {chat_id}. Falling back to plain text delivery...")
+            try:
+                plain_text = re.sub(r'<[^>]+>', '', safe_text)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=plain_text,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                return True
+            except Exception as fb_err:
+                logger.error(f"❌ Plain text fallback also failed for {chat_id}: {fb_err}")
+                return False
         except Exception as e:
             logger.error(f"Telegram error delivering to {chat_id}: {e}")
             return False
@@ -4195,14 +4233,14 @@ def render_country_broadcast_panel(bcast_data: Dict[str, Any]) -> Tuple[str, Inl
     overview = (
         f"📢 <b>Stock Broadcast Setup & Live Preview</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌍 <b>Target Country:</b> <code>{c_name}</code>\n"
+        f"🌍 <b>Target Country:</b> <code>{html.escape(c_name)}</code>\n"
         f"📦 <b>Stock Quantity:</b> <code>{qty} numbers</code>\n"
-        f"🏷️ <b>Action Button Name:</b> <code>[{btn_label}]</code>\n"
+        f"🏷️ <b>Action Button Name:</b> <code>[{html.escape(btn_label)}]</code>\n"
         f"👥 <b>Target Audience:</b> <code>All Registered Users</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👀 <b>USER BROADCAST PREVIEW:</b>\n\n"
         f"{custom_text}\n\n"
-        f"<i>[Button Attached]:</i> <code>[{btn_label}]</code>\n"
+        f"<i>[Button Attached]:</i> <code>[{html.escape(btn_label)}]</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -4539,7 +4577,7 @@ async def show_file_number_menu(update: Update, user_id: int):
     if countries:
         lines = []
         for c in countries[:6]:
-            lines.append(f"• <b>{c['name']}</b>: <code>{c['available']} available</code>")
+            lines.append(f"• <b>{html.escape(c['name'])}</b>: <code>{c['available']} available</code>")
         stock_summary = "\n".join(lines)
     else:
         stock_summary = "<i>No numbers in stock currently.</i>"
@@ -5513,7 +5551,7 @@ async def inventory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     for c in countries:
-        lines.append(f"• <b>{c['name']}</b>: <code>{c['available']} numbers</code>")
+        lines.append(f"• <b>{html.escape(c['name'])}</b>: <code>{c['available']} numbers</code>")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"📈 <b>Total Stock Available:</b> <code>{total} numbers</code>")
 
@@ -6037,7 +6075,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
             await msg.edit_text(
                 f"🗑️ <b>Remove Numbers from Pool:</b>\n"
-                f"📄 <b>File:</b> <code>{file_name}</code>\n"
+                f"📄 <b>File:</b> <code>{html.escape(file_name)}</code>\n"
                 f"🔢 <b>Numbers:</b> <code>{len(extracted_numbers)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Select the country pool to remove these numbers from:",
@@ -6067,7 +6105,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         await msg.edit_text(
             f"📄 <b>File Parsed Successfully!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 <b>Filename:</b> <code>{file_name}</code>\n"
+            f"📁 <b>Filename:</b> <code>{html.escape(file_name)}</code>\n"
             f"🔢 <b>Valid Numbers (with +):</b> <code>{len(extracted_numbers)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 <b>Step 1: Choose Country:</b>\n"
@@ -6357,7 +6395,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     for cb in custom_buttons:
         if text in [cb["text"], f"📢 {cb['text']}", f"🔗 {cb['text']}"]:
             await update.message.reply_text(
-                f"🔗 <b>{cb['text']}</b>\n\nTap below to open link:",
+                f"🔗 <b>{html.escape(cb['text'])}</b>\n\nTap below to open link:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"👉 Open {cb['text']}", url=cb["url"])]
@@ -6836,7 +6874,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         target_info = get_user_details(target_uid)
         t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
         step_text = (
-            f"👤 <b>Target User:</b> <code>{t_name}</code> (<code>{target_uid}</code>)\n"
+            f"👤 <b>Target User:</b> <code>{html.escape(t_name)}</code> (<code>{target_uid}</code>)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Please send the message you wish to deliver to this user in chat:"
         )
@@ -6908,8 +6946,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         resp_text = (
             f"✅ <b>Button Name Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 Country: <code>{c_name}</code>\n"
-            f"🏷️ New Button Name: <code>{new_name}</code>\n"
+            f"🌍 Country: <code>{html.escape(c_name)}</code>\n"
+            f"🏷️ New Button Name: <code>{html.escape(new_name)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>This custom label will now be displayed on country buttons and broadcasts!</i>"
         )
@@ -6933,8 +6971,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         resp_text = (
             f"✅ <b>Service Name Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 Country: <code>{c_name}</code>\n"
-            f"📱 Service: <code>{new_srv}</code>\n"
+            f"🌍 Country: <code>{html.escape(c_name)}</code>\n"
+            f"📱 Service: <code>{html.escape(new_srv)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         resp_kb = InlineKeyboardMarkup([
@@ -6998,8 +7036,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             removal_text = (
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>Country:</b> <code>{country_name}</code>\n"
-                f"📄 <b>Source File:</b> <code>{filename}</code>\n"
+                f"🌍 <b>Country:</b> <code>{html.escape(country_name)}</code>\n"
+                f"📄 <b>Source File:</b> <code>{html.escape(filename)}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━"
@@ -7025,8 +7063,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         choice_text = (
-            f"🌍 <b>Country Selected:</b> <code>{country_name}</code>\n"
-            f"📄 <b>File:</b> <code>{filename}</code> (<b>{len(numbers)}</b> numbers)\n"
+            f"🌍 <b>Country Selected:</b> <code>{html.escape(country_name)}</code>\n"
+            f"📄 <b>File:</b> <code>{html.escape(filename)}</code> (<b>{len(numbers)}</b> numbers)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
             f"• <b>Standard:</b> Available for anyone requesting numbers.\n"
@@ -7254,7 +7292,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.edit_message_text(
                         "⚠️ <b>Number Not Available</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"No numbers are currently available in stock for <b>{c_display}</b>.",
+                        f"No numbers are currently available in stock for <b>{html.escape(c_display)}</b>.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=None
                     )
@@ -7323,7 +7361,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.edit_message_text(
                         "⚠️ <b>Number Not Available</b>\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"No secret numbers are currently available in stock for <b>{c_display}</b>.",
+                        f"No secret numbers are currently available in stock for <b>{html.escape(c_display)}</b>.",
                         parse_mode=ParseMode.HTML,
                         reply_markup=None
                     )
@@ -7654,7 +7692,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✅ <b>Button Removed!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>{deleted_name}</code> has been removed.\n\n"
+            f"<code>{html.escape(deleted_name)}</code> has been removed.\n\n"
             f"• <b>Remaining Active Buttons:</b> <code>{len(new_list)}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
@@ -8236,7 +8274,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = []
         for c in page_c:
             lines.append(
-                f"🌍 <b>{c['name']}</b>\n"
+                f"🌍 <b>{html.escape(c['name'])}</b>\n"
                 f"   • Standard Available: <code>{c['available_std']}</code>\n"
                 f"   • Secret Available: <code>{c['available_sec']} 🔒</code>\n"
                 f"   • Delivered: <code>{c['used_std'] + c['used_sec']}</code>\n"
@@ -8311,7 +8349,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             f"⚠️ <b>Confirm Deletion — {c_name}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Are you sure you want to remove <b>{c_name}</b> and delete all <b>{c_avail} numbers</b> from stock?\n\n"
+            f"Are you sure you want to remove <b>{html.escape(c_name)}</b> and delete all <b>{c_avail} numbers</b> from stock?\n\n"
             f"• <i>The country pool will be removed from stock immediately.</i>\n"
             f"• <i>Cloud Gist will synchronize automatically.</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
@@ -8337,7 +8375,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             f"✅ <b>Successfully Removed!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🌍 <b>Country:</b> <code>{html.escape(c_name)}</code>\n"
             f"🗑️ <b>Deleted:</b> <code>{c_avail} numbers removed from stock</code>\n"
             f"☁️ <b>Cloud Status:</b> <code>Synchronized & Updated</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━"
@@ -8474,7 +8512,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             u_lines.append("<i>No registered users found.</i>")
         else:
             for idx, u in enumerate(users_list, start=offset + 1):
-                uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "No name")
+                uname = f"@{html.escape(u['username'])}" if u.get("username") else html.escape(u.get("first_name") or "No name")
                 sec_status = "🔓 Whitelisted" if u.get("has_secret_access") else "🔒 Restricted"
                 u_lines.append(
                     f"{idx}. <b>{uname}</b>\n"
@@ -8524,8 +8562,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"👤 <b>User Account Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>User Account ID:</b> <code>{u['user_id']}</code>\n"
-            f"📛 <b>Name:</b> <code>{u.get('first_name') or 'N/A'}</code>\n"
-            f"🔗 <b>Username:</b> @{u.get('username') or 'None'}\n"
+            f"📛 <b>Name:</b> <code>{html.escape(u.get('first_name') or 'N/A')}</code>\n"
+            f"🔗 <b>Username:</b> @{html.escape(u.get('username') or 'None')}\n"
             f"🔢 <b>Total Numbers Consumed:</b> <code>{u.get('numbers_consumed', 0)}</code> numbers\n"
             f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
             f"🚫 <b>Account Status:</b> <code>{ban_badge}</code>\n"
@@ -8582,8 +8620,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"👤 <b>User Account Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>User Account ID:</b> <code>{u_updated['user_id']}</code>\n"
-            f"📛 <b>Name:</b> <code>{u_updated.get('first_name') or 'N/A'}</code>\n"
-            f"🔗 <b>Username:</b> @{u_updated.get('username') or 'None'}\n"
+            f"📛 <b>Name:</b> <code>{html.escape(u_updated.get('first_name') or 'N/A')}</code>\n"
+            f"🔗 <b>Username:</b> @{html.escape(u_updated.get('username') or 'None')}\n"
             f"🔢 <b>Total Numbers Consumed:</b> <code>{u_updated.get('numbers_consumed', 0)}</code> numbers\n"
             f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
             f"📅 <b>Joined Date:</b> <code>{u_updated.get('joined_at', 'N/A')[:19]}</code>\n"
@@ -8650,8 +8688,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"👤 <b>User Account Details</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>User Account ID:</b> <code>{u_updated['user_id']}</code>\n"
-            f"📛 <b>Name:</b> <code>{u_updated.get('first_name') or 'N/A'}</code>\n"
-            f"🔗 <b>Username:</b> @{u_updated.get('username') or 'None'}\n"
+            f"📛 <b>Name:</b> <code>{html.escape(u_updated.get('first_name') or 'N/A')}</code>\n"
+            f"🔗 <b>Username:</b> @{html.escape(u_updated.get('username') or 'None')}\n"
             f"🔢 <b>Total Numbers Consumed:</b> <code>{u_updated.get('numbers_consumed', 0)}</code> numbers\n"
             f"🔒 <b>Secret Numbers Access:</b> <code>{secret_badge}</code>\n"
             f"🚫 <b>Account Status:</b> <code>{ban_badge}</code>\n"
@@ -8788,7 +8826,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         target_info = get_user_details(target_uid)
         t_name = f"@{target_info['username']}" if target_info and target_info.get("username") else (target_info.get("first_name") if target_info else str(target_uid))
         text = (
-            f"💬 <b>Direct Message to:</b> <code>{t_name}</code> (<code>{target_uid}</code>)\n"
+            f"💬 <b>Direct Message to:</b> <code>{html.escape(t_name)}</code> (<code>{target_uid}</code>)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Please send the message you wish to deliver to this user in chat:"
         )
@@ -8938,7 +8976,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🌍 <b>Country:</b> <code>{file_stem}</code>\n"
-                f"📄 <b>File:</b> <code>{filename}</code>\n"
+                f"📄 <b>File:</b> <code>{html.escape(filename)}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
@@ -8952,7 +8990,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         # Proceed to Step 2: Choose Stock Pool (Standard or Secret)
         text = (
             f"🌍 <b>Country Selected:</b> <code>{file_stem}</code>\n"
-            f"📄 <b>File:</b> <code>{filename}</code> (<b>{len(numbers)}</b> numbers)\n"
+            f"📄 <b>File:</b> <code>{html.escape(filename)}</code> (<b>{len(numbers)}</b> numbers)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
             f"• <b>Standard:</b> Available for anyone requesting numbers.\n"
@@ -8998,8 +9036,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 f"🗑️ <b>Removal Complete!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-                f"📄 <b>File:</b> <code>{filename}</code>\n"
+                f"🌍 <b>Country:</b> <code>{html.escape(c_name)}</code>\n"
+                f"📄 <b>File:</b> <code>{html.escape(filename)}</code>\n"
                 f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
                 f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━",
@@ -9016,8 +9054,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         pending["step_msg_id"] = query.message.message_id
 
         text = (
-            f"🌍 <b>Country Selected:</b> <code>{c_name}</code>\n"
-            f"📄 <b>File:</b> <code>{filename}</code> (<b>{len(numbers)}</b> numbers)\n"
+            f"🌍 <b>Country Selected:</b> <code>{html.escape(c_name)}</code>\n"
+            f"📄 <b>File:</b> <code>{html.escape(filename)}</code> (<b>{len(numbers)}</b> numbers)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
             f"• <b>Standard:</b> Available for anyone requesting numbers.\n"
@@ -9067,9 +9105,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             f"✅ <b>Upload Successful!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🌍 <b>Country:</b> <code>{html.escape(c_name)}</code>\n"
             f"📂 <b>Destination:</b> <code>{pool_type}</code>\n"
-            f"📄 <b>Source File:</b> <code>{filename}</code>\n"
+            f"📄 <b>Source File:</b> <code>{html.escape(filename)}</code>\n"
             f"➕ <b>Added Numbers (with +):</b> <code>{added}</code>\n"
             f"⚠️ <b>Duplicates Skipped:</b> <code>{duplicates}</code>\n"
             f"📊 <b>Current Available in Pool:</b> <code>{current_pool_avail} numbers</code>\n"
@@ -9155,8 +9193,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ])
 
         await query.edit_message_text(
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
-            f"🏷️ <b>Button Label:</b> <code>{btn_label}</code>\n"
+            f"🌍 <b>Country:</b> <code>{html.escape(c_name)}</code>\n"
+            f"🏷️ <b>Button Label:</b> <code>{html.escape(btn_label)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Standard Stock:</b> <code>{c_info.get('available_std', 0)}</code>\n"
             f"🔒 <b>Secret Stock:</b> <code>{c_info.get('available_sec', 0)}</code>\n"
@@ -9278,8 +9316,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await query.edit_message_text(
                 f"⏳ <b>Broadcasting to all registered users...</b>\n"
-                f"🌍 Country: <code>{c_name}</code>\n"
-                f"🏷️ Button: <code>{btn_label}</code>",
+                f"🌍 Country: <code>{html.escape(c_name)}</code>\n"
+                f"🏷️ Button: <code>{html.escape(btn_label)}</code>",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
@@ -9325,9 +9363,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"✅ <b>Stock Broadcast Successfully Sent!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>Broadcast ID:</b> <code>{bcast_id}</code>\n"
-            f"🌍 <b>Country:</b> <code>{c_name}</code>\n"
+            f"🌍 <b>Country:</b> <code>{html.escape(c_name)}</code>\n"
             f"📦 <b>Advertised Stock:</b> <code>{qty} numbers</code>\n"
-            f"🏷️ <b>Action Button:</b> <code>[{btn_label}]</code>\n"
+            f"🏷️ <b>Action Button:</b> <code>[{html.escape(btn_label)}]</code>\n"
             f"📤 <b>Delivered To:</b> <code>{total_sent} users</code>\n"
             f"⚠️ <b>Failed / Blocked:</b> <code>{total_failed} users</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -9390,7 +9428,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         c_name = next((x["name"] for x in all_c if x["id"] == cid), "Unknown")
 
         await query.edit_message_text(
-            f"⚠️ <b>Are you sure you want to delete {c_name} and its stock database?</b>\n"
+            f"⚠️ <b>Are you sure you want to delete {html.escape(c_name)} and its stock database?</b>\n"
             f"<i>This action cannot be undone.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([

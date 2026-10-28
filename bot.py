@@ -196,7 +196,7 @@ THIRDWAVE_BASE_URL     = _raw_tw_base or "https://thirdwave.im"
 
 TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
-POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "7.0"))  # 7.0s = ~8.5 req/min, 100% peace of mind under shared 30 req/min ceiling
+POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "2.5"))  # 2.5s = ~24 req/min, fast real-time OTP delivery under 30 req/min limit
 
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
@@ -2358,8 +2358,8 @@ def parse_message_timestamp(time_str: str) -> float:
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
 COLLAPSED_SMS_HINT = "<b>Tap to read SMS...</b>"
-CARD_DIVIDER = "━" * 20
-QUOTE_DIVIDER = "━" * 18
+CARD_DIVIDER = "━" * 26
+QUOTE_DIVIDER = "━" * 20
 
 def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 20) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
@@ -3408,7 +3408,7 @@ async def poll_thirdwave_otp_loop(application: Application):
             logger.warning(f"Error in OTP polling loop: {e}")
             await asyncio.sleep(2.0)
 
-        await asyncio.sleep(max(7.0, POLL_INTERVAL_SECONDS))
+        await asyncio.sleep(max(2.5, POLL_INTERVAL_SECONDS))
 
 async def periodic_otp_cleanup_loop():
     """Background task: periodically deletes expired records and cache items older than 28 hours."""
@@ -4050,22 +4050,23 @@ def format_delivered_numbers(
     with_plus: bool = True,
     is_secret: bool = False
 ) -> str:
-    """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
+    """Builds clean, compact, professional delivery confirmation header with unified fixed-width layout across all devices."""
     display_cname = format_country_name(country_name)
     title_prefix = "🔒 " if is_secret else ""
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
+    divider = "━" * 26
 
     lines = [
         f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
-        CARD_DIVIDER,
+        divider,
         f"👉 <b>{num_hint}</b>",
-        "⚡ <i>Your OTP verification code will appear here instantly.</i>",
-        "📢 <i>If your OTP is not received here, please check our OTP Group.</i>",
+        "⚡ <i>OTP will appear here instantly.</i>",
+        "📢 <i>No OTP? Check our OTP Group.</i>",
     ]
     if available_count is not None and available_count > 0:
-        lines.append(f"📦 <b>Pool Stock:</b> {available_count} numbers remaining")
-    lines.append(CARD_DIVIDER)
+        lines.append(f"📦 <b>Pool Stock:</b> {available_count} remaining")
+    lines.append(divider)
     return "\n".join(lines)
 
 def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -> str:
@@ -4078,7 +4079,7 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_select_country_text(secret_mode: bool = False) -> str:
     """Builds professional full-width header for Select Country message."""
-    divider = "━" * 22
+    divider = "━" * 26
     if secret_mode:
         return f"🔒 <b>Secret Numbers Pool:</b>\n{divider}"
     return f"🌍 <b>Select Country:</b>\n{divider}"
@@ -5171,7 +5172,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
     current_key = thirdwave_client.api_key
     masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>Missing</i>")
-    effective_poll = max(7.0, POLL_INTERVAL_SECONDS)
+    effective_poll = max(2.5, POLL_INTERVAL_SECONDS)
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
@@ -5920,7 +5921,7 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     else:
         pool_lines = "\n🌍 <b>Number Pools:</b> <i>No active stock in pools</i>\n━━━━━━━━━━━━━━━━━━━━\n"
 
-    effective_poll = max(7.0, POLL_INTERVAL_SECONDS)
+    effective_poll = max(2.5, POLL_INTERVAL_SECONDS)
     inbox_status = "ON ✅ (Private Delivery)" if is_inbox_otp_enabled() else "OFF ❌"
 
     text = (

@@ -214,7 +214,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PAT: ${{ secrets.PAT }}
           SESSION_TIMEOUT: "19500"
-          POLL_INTERVAL_SECONDS: ${{ secrets.POLL_INTERVAL_SECONDS || '7.0' }}
+          POLL_INTERVAL_SECONDS: ${{ secrets.POLL_INTERVAL_SECONDS || '6.0' }}
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |

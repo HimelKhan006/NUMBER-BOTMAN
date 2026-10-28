@@ -802,6 +802,15 @@ def register_user(user_id: int, username: str = "", first_name: str = ""):
                     last_seen = CURRENT_TIMESTAMP;
             """, (user_id, username or "", first_name or ""))
             conn.commit()
+        try:
+            del_users = _get_json_dict_setting("deleted_users")
+            if str(user_id) in del_users:
+                del_users.pop(str(user_id), None)
+                set_bot_setting("deleted_users", json.dumps(del_users))
+        except Exception:
+            pass
+        if "gist_storage" in globals() and gist_storage.enabled:
+            gist_storage.mark_dirty()
     except Exception as e:
         logger.warning(f"Error registering user: {e}")
 
@@ -1121,6 +1130,13 @@ def add_admin(user_id: int, added_by: int = 0, username: str = "", first_name: s
             """, (user_id, added_by, username or "", first_name or ""))
             conn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (user_id,))
             conn.commit()
+        try:
+            revoked = _get_json_dict_setting("revoked_admins")
+            if str(user_id) in revoked:
+                revoked.pop(str(user_id), None)
+                set_bot_setting("revoked_admins", json.dumps(revoked))
+        except Exception:
+            pass
         if "gist_storage" in globals() and gist_storage.enabled:
             try:
                 asyncio.create_task(gist_storage.export_and_sync(immediate=True))
@@ -1140,6 +1156,12 @@ def remove_admin(user_id: int) -> bool:
             conn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (user_id,))
             conn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (user_id,))
             conn.commit()
+        try:
+            revoked = _get_json_dict_setting("revoked_admins")
+            revoked[str(user_id)] = time.time()
+            set_bot_setting("revoked_admins", json.dumps(revoked))
+        except Exception:
+            pass
         if "gist_storage" in globals() and gist_storage.enabled:
             try:
                 asyncio.create_task(gist_storage.export_and_sync(immediate=True))
@@ -1256,6 +1278,17 @@ def delete_user(user_id: int) -> Optional[Dict[str, Any]]:
                         pass
 
         if result["user_existed"] or result["deleted_user"]:
+            try:
+                del_users = _get_json_dict_setting("deleted_users")
+                del_users[str(user_id)] = time.time()
+                set_bot_setting("deleted_users", json.dumps(del_users))
+                if result.get("was_admin"):
+                    revoked = _get_json_dict_setting("revoked_admins")
+                    revoked[str(user_id)] = time.time()
+                    set_bot_setting("revoked_admins", json.dumps(revoked))
+            except Exception:
+                pass
+            _RECENTLY_REGISTERED_USERS.pop(user_id, None)
             logger.info(f"🗑️ Successfully purged user {user_id}: {result}")
             if "gist_storage" in globals() and gist_storage.enabled:
                 try:
@@ -3873,9 +3906,11 @@ class GistStorage:
                         users_data = parsed.get("users", [])
                         admins_data = parsed.get("admins", [])
 
-                        # Preserve local country activity/deletion timestamps before restoring Gist settings
+                        # Preserve local country/user/admin activity & deletion timestamps before restoring Gist settings
                         local_updated_map = _get_json_dict_setting("country_updated_at")
                         local_deleted_map = _get_json_dict_setting("deleted_countries")
+                        local_del_users = _get_json_dict_setting("deleted_users")
+                        local_rev_admins = _get_json_dict_setting("revoked_admins")
 
                         # Restore Bot Settings
                         saved_settings = parsed.get("bot_settings", {})
@@ -3902,6 +3937,19 @@ class GistStorage:
                                 merged_deleted.pop(k, None)
                         set_bot_setting("country_updated_at", json.dumps(merged_updated))
                         set_bot_setting("deleted_countries", json.dumps(merged_deleted))
+
+                        # Merge deleted_users and revoked_admins maps
+                        gist_del_users = _get_json_dict_setting("deleted_users")
+                        merged_del_users: Dict[str, float] = dict(gist_del_users)
+                        for k, v in local_del_users.items():
+                            merged_del_users[k] = max(merged_del_users.get(k, 0.0), v)
+                        set_bot_setting("deleted_users", json.dumps(merged_del_users))
+
+                        gist_rev_admins = _get_json_dict_setting("revoked_admins")
+                        merged_rev_admins: Dict[str, float] = dict(gist_rev_admins)
+                        for k, v in local_rev_admins.items():
+                            merged_rev_admins[k] = max(merged_rev_admins.get(k, 0.0), v)
+                        set_bot_setting("revoked_admins", json.dumps(merged_rev_admins))
 
                         # Restore Seen OTPs from Gist cloud state
                         saved_seen = parsed.get("seen_otps", {})
@@ -3937,7 +3985,7 @@ class GistStorage:
                         with get_main_db() as mconn:
                             for u in users_data:
                                 uid = u.get("user_id")
-                                if not uid:
+                                if not uid or str(uid) in merged_del_users:
                                     continue
                                 mconn.execute("""
                                     INSERT INTO users (user_id, username, first_name, numbers_consumed, has_secret_access, prefer_plus, is_admin, joined_at, last_seen)
@@ -3956,14 +4004,14 @@ class GistStorage:
                                     u.get("numbers_consumed", 0),
                                     u.get("has_secret_access", 0),
                                     u.get("prefer_plus", 1),
-                                    u.get("is_admin", 0),
+                                    0 if str(uid) in merged_rev_admins else u.get("is_admin", 0),
                                     u.get("joined_at", datetime.now(timezone.utc).isoformat())
                                 ))
 
-                            # Restore Dynamic Administrators
+                            # Restore Dynamic Administrators (skipping explicitly revoked admins)
                             for a in admins_data:
                                 aid = a.get("user_id")
-                                if aid:
+                                if aid and str(aid) not in merged_rev_admins:
                                     mconn.execute("""
                                         INSERT INTO bot_admins (user_id, added_by, username, first_name)
                                         VALUES (?, ?, ?, ?)
@@ -3973,25 +4021,21 @@ class GistStorage:
                                     """, (aid, a.get("added_by", 0), a.get("username", ""), a.get("first_name", "")))
                                     mconn.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?;", (aid,))
 
-                            # Reconcile deletions: remove deleted users present in SQLite but absent from cloud Gist
-                            if users_data and isinstance(users_data, list):
-                                cloud_uids = {int(u["user_id"]) for u in users_data if u.get("user_id")}
-                                if cloud_uids:
-                                    local_users = [r[0] for r in mconn.execute("SELECT user_id FROM users;").fetchall()]
-                                    for l_uid in local_users:
-                                        if l_uid not in cloud_uids and not is_admin(l_uid):
-                                            mconn.execute("DELETE FROM users WHERE user_id = ?;", (l_uid,))
-                                            mconn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (l_uid,))
+                            # Remove only explicitly deleted users
+                            if merged_del_users:
+                                local_users = [r[0] for r in mconn.execute("SELECT user_id FROM users;").fetchall()]
+                                for l_uid in local_users:
+                                    if str(l_uid) in merged_del_users and not is_admin(l_uid):
+                                        mconn.execute("DELETE FROM users WHERE user_id = ?;", (l_uid,))
+                                        mconn.execute("DELETE FROM delivery_log WHERE user_id = ?;", (l_uid,))
 
-                            # Reconcile admin revocations: remove revoked admins present in SQLite but absent from cloud Gist
-                            if isinstance(admins_data, list):
-                                cloud_aids = {int(a["user_id"]) for a in admins_data if a.get("user_id")}
-                                if cloud_aids:
-                                    local_admins = [r[0] for r in mconn.execute("SELECT user_id FROM bot_admins;").fetchall()]
-                                    for l_aid in local_admins:
-                                        if l_aid not in cloud_aids and l_aid not in ADMIN_USER_IDS:
-                                            mconn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (l_aid,))
-                                            mconn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (l_aid,))
+                            # Remove only explicitly revoked admins
+                            if merged_rev_admins:
+                                local_admins = [r[0] for r in mconn.execute("SELECT user_id FROM bot_admins;").fetchall()]
+                                for l_aid in local_admins:
+                                    if str(l_aid) in merged_rev_admins and (not ADMIN_USER_IDS or l_aid not in ADMIN_USER_IDS):
+                                        mconn.execute("DELETE FROM bot_admins WHERE user_id = ?;", (l_aid,))
+                                        mconn.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?;", (l_aid,))
 
                             mconn.commit()
 
@@ -4865,6 +4909,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    ADMIN_STATES.pop(user.id, None)
     register_user(user.id, user.username, user.first_name)
 
     # Deep-link support
@@ -4892,7 +4937,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_name = get_bot_name()
 
     main_text = (
-        f"⚡ <b>Welcome to {bot_name}!</b>\n"
+        f"⚡ <b>Welcome to {html.escape(bot_name)}!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Use the menu buttons below to get started:</i>"
     )
@@ -5416,11 +5461,12 @@ def build_api_url_view() -> Tuple[str, InlineKeyboardMarkup]:
 def build_api_key_view() -> Tuple[str, InlineKeyboardMarkup]:
     """Builds interactive configuration panel for Thirdwave API Key."""
     current_key = thirdwave_client.api_key
-    masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>None</i>")
+    raw_masked = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else current_key
+    masked_key = f"<code>{html.escape(raw_masked)}</code>" if raw_masked else "<i>None</i>"
     msg = (
         "🔑 <b>Thirdwave API Key Configuration</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Active API Key:</b> <code>{masked_key}</code>\n"
+        f"• <b>Active API Key:</b> {masked_key}\n"
         f"• <b>Status:</b> <code>{'Configured ✅' if current_key else 'Missing ⚠️'}</code>\n"
         f"• <b>Cloud Database:</b> <code>Synced & Encrypted 🔒</code>\n\n"
         "💬 <b>How to update:</b>\n"
@@ -5435,6 +5481,7 @@ def build_api_key_view() -> Tuple[str, InlineKeyboardMarkup]:
 def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     stats = get_system_stats()
     current_bot_name = get_bot_name()
+    escaped_bot_name = html.escape(current_bot_name)
     fixed_qty = get_admin_fixed_quantity()
     qty_label = f"Fixed ({fixed_qty} numbers)" if fixed_qty else "Default (10 numbers)"
     custom_buttons = get_custom_link_buttons()
@@ -5463,14 +5510,15 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     full_sms_status = "📜 Long (Shown)" if is_view_full_sms_enabled() else "⚡ Short (Removed)"
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)
     current_key = thirdwave_client.api_key
-    masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>Missing</i>")
+    raw_masked = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else current_key
+    masked_key = f"<code>{html.escape(raw_masked)}</code>" if raw_masked else "<i>Missing</i>"
     effective_poll = max(6.0, POLL_INTERVAL_SECONDS)
 
     admin_text = (
-        f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
+        f"👑 <b>{escaped_bot_name} — Admin Dashboard</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Engine Status:</b> 100% Online ✅\n"
-        f"• <b>Bot Name:</b> {current_bot_name}\n"
+        f"• <b>Bot Name:</b> {escaped_bot_name}\n"
         f"• <b>Handover Mode:</b> Zero-Restart Handover Active 🔄\n"
         f"• <b>Session Uptime:</b> {uptime_str}\n"
         f"• <b>Next Handover:</b> {handover_info}\n"
@@ -5545,6 +5593,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    ADMIN_STATES.pop(user.id, None)
     admin_text, keyboard = build_admin_dashboard(user.id)
     await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
 
@@ -5676,7 +5725,7 @@ async def setkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg_obj.reply_text(
         f"✅ <b>Thirdwave API Key Successfully Updated!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>New Active Key:</b> <code>{new_masked}</code>\n\n"
+        f"• <b>New Active Key:</b> <code>{html.escape(new_masked)}</code>\n\n"
         f"The bot is now requesting OTP traffic with this key in real-time.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
@@ -6185,11 +6234,12 @@ def build_number_status_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
         if (gist_storage.enabled and active_gist_id)
         else ("Connected to GitHub Gist ☁️" if gist_storage.enabled else "Local Storage")
     )
-    masked_key = (
+    raw_masked = (
         f"{thirdwave_client.api_key[:8]}...{thirdwave_client.api_key[-4:]}"
         if (thirdwave_client.api_key and len(thirdwave_client.api_key) > 12)
-        else (thirdwave_client.api_key or "<i>Missing</i>")
+        else (thirdwave_client.api_key or "")
     )
+    masked_key = f"<code>{html.escape(raw_masked)}</code>" if raw_masked else "<i>Missing</i>"
     admins = get_all_admin_ids()
 
     # Active Number Pools Breakdown (Top active pools with available numbers - like OTP bot's country breakdown)
@@ -7941,7 +7991,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✅ <b>Button Removed!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<code>{html.escape(deleted_name)}</code> has been removed.\n\n"
+            f"<code>{deleted_name}</code> has been removed.\n\n"
             f"• <b>Remaining Active Buttons:</b> <code>{len(new_list)}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
@@ -8141,10 +8191,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 6. Admin Panel / Refresh Dashboard
     elif (data == "admin_panel" or data == "admin_refresh_dash") and user_admin:
-        if user.id in ADMIN_STATES:
-            ADMIN_STATES[user.id].pop("awaiting_api_url", None)
-            ADMIN_STATES[user.id].pop("awaiting_api_key", None)
-            ADMIN_STATES[user.id].pop("awaiting_bot_name", None)
+        ADMIN_STATES.pop(user.id, None)
         admin_text, keyboard = build_admin_dashboard(user.id)
         try:
             await query.edit_message_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
@@ -8204,14 +8251,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         ADMIN_STATES[user.id] = {"awaiting_api_key": True, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.answer("Send new API Key 💬")
         current_key = thirdwave_client.api_key
-        masked_key = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else (current_key or "<i>None</i>")
+        raw_masked = f"{current_key[:8]}...{current_key[-4:]}" if len(current_key) > 12 else current_key
+        masked_key = f"<code>{html.escape(raw_masked)}</code>" if raw_masked else "<i>None</i>"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_api_key_menu")]
         ])
         await query.edit_message_text(
             f"🔑 <b>Update Thirdwave API Key</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Current Key:</b> <code>{masked_key}</code>\n\n"
+            f"• <b>Current Key:</b> {masked_key}\n\n"
             f"💬 <b>Please send your new API Key</b> directly in this chat:\n"
             f"<i>Example:</i> <code>tw_live_1234567890abcdef</code>\n\n"
             f"Or click <b>❌ Cancel</b> below to abort.",
@@ -8226,7 +8274,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✏️ <b>Change Bot Display Name</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Current Name:</b> <code>{curr}</code>\n\n"
+            f"• <b>Current Name:</b> <code>{html.escape(curr)}</code>\n\n"
             f"Please send the new bot display name (1–64 characters) in chat.\n"
             f"It will be updated on the Telegram Bot API and saved across reboots.\n\n"
             f"💡 <i>Tip: Send <code>reset</code> or <code>default</code> to restore the default name.</i>",

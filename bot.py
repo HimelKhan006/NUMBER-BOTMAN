@@ -780,6 +780,19 @@ def init_db():
             logger.debug(f"Country flag auto-migration note: {e}")
 
         conn.commit()
+        try:
+            valid_cids = {int(r["id"]) for r in conn.execute("SELECT id FROM countries;").fetchall()}
+            if os.path.exists(STOCKS_DIR):
+                for fname in os.listdir(STOCKS_DIR):
+                    if fname.startswith("country_") and (fname.endswith(".db") or ".db-" in fname):
+                        num_part = fname.replace("country_", "", 1).split(".db")[0]
+                        if num_part.isdigit() and int(num_part) not in valid_cids:
+                            try:
+                                os.remove(os.path.join(STOCKS_DIR, fname))
+                            except Exception:
+                                pass
+        except Exception:
+            pass
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
 
@@ -1375,6 +1388,10 @@ def _mark_country_deleted(country_name: str):
     deleted_map = _get_json_dict_setting("deleted_countries")
     deleted_map[bkey] = now_ts
     set_bot_setting("deleted_countries", json.dumps(deleted_map))
+    updated_map = _get_json_dict_setting("country_updated_at")
+    if bkey in updated_map:
+        updated_map.pop(bkey, None)
+        set_bot_setting("country_updated_at", json.dumps(updated_map))
 
 def _is_country_explicitly_deleted(country_name: str) -> bool:
     bkey = _country_base_key(country_name)
@@ -1529,6 +1546,13 @@ def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool 
 
 def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
     removed = 0
+    try:
+        with get_main_db() as mconn:
+            crow = mconn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
+            if crow and crow["name"]:
+                _mark_country_active(crow["name"])
+    except Exception:
+        pass
     with get_country_db(country_id) as conn:
         conn.execute("BEGIN TRANSACTION;")
         for raw_num in numbers:
@@ -1537,6 +1561,9 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
                 continue
             plain = num.lstrip("+")
             plus = f"+{plain}"
+            CONSUMED_NUMBERS_CACHE.discard(num)
+            CONSUMED_NUMBERS_CACHE.discard(plain)
+            CONSUMED_NUMBERS_CACHE.discard(plus)
             cur = conn.execute(
                 "DELETE FROM available_numbers WHERE number IN (?, ?, ?);",
                 (num, plain, plus)
@@ -1590,6 +1617,11 @@ def delete_country_and_stock(country_id: int, record_deletion: bool = True):
     # 1. Wipe rows first to guarantee zero numbers regardless of file locks
     try:
         with get_country_db(country_id) as cconn:
+            for u_row in cconn.execute("SELECT number FROM used_numbers;").fetchall():
+                s_num = sanitize_phone_number(str(u_row[0]))
+                if s_num:
+                    CONSUMED_NUMBERS_CACHE.discard(s_num)
+                    CONSUMED_NUMBERS_CACHE.discard(s_num.lstrip("+"))
             cconn.execute("DELETE FROM available_numbers;")
             cconn.execute("DELETE FROM used_numbers;")
             cconn.commit()
@@ -1605,6 +1637,9 @@ def delete_country_and_stock(country_id: int, record_deletion: bool = True):
             cur = conn.execute("SELECT number FROM user_claimed_numbers WHERE country_id = ?;", (country_id,))
             for r in cur.fetchall():
                 raw_n = str(r[0])
+                s_num = sanitize_phone_number(raw_n)
+                if s_num:
+                    CONSUMED_NUMBERS_CACHE.discard(s_num)
                 dig = re.sub(r"\D", "", raw_n)
                 CLAIMED_NUMBER_OWNER_CACHE.pop(dig, None)
                 CLAIMED_NUMBER_OWNER_CACHE.pop(f"+{dig}", None)
@@ -1633,6 +1668,9 @@ def delete_country_and_stock(country_id: int, record_deletion: bool = True):
                 os.remove(p)
             except Exception as e:
                 logger.warning(f"Could not remove {p}: {e}")
+
+    if "gist_storage" in globals() and gist_storage.enabled:
+        gist_storage.mark_dirty()
 
 def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_secret: bool = False) -> Tuple[List[str], int, str]:
     """
@@ -3935,6 +3973,8 @@ class GistStorage:
                         for k in list(merged_deleted.keys()):
                             if merged_updated.get(k, 0.0) >= merged_deleted.get(k, 0.0):
                                 merged_deleted.pop(k, None)
+                            else:
+                                merged_updated.pop(k, None)
                         set_bot_setting("country_updated_at", json.dumps(merged_updated))
                         set_bot_setting("deleted_countries", json.dumps(merged_deleted))
 
@@ -4065,8 +4105,13 @@ class GistStorage:
                         for cname, c_stock in countries_data.items():
                             if _is_country_explicitly_deleted(cname):
                                 continue
+                            bkey = _country_base_key(cname)
+                            # If local SQLite already has newer modifications for this country than Gist, skip re-adding stale Gist numbers
+                            local_is_newer = bool(bkey and local_updated_map.get(bkey, 0.0) > gist_updated_map.get(bkey, 0.0))
                             cid = get_or_create_country(cname, from_gist=True)
                             active_gist_cids.add(cid)
+                            if local_is_newer:
+                                continue
                             if isinstance(c_stock, dict):
                                 if c_stock.get("button_name"):
                                     update_country_button_name(cid, str(c_stock["button_name"]))

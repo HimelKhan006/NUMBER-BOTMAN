@@ -198,8 +198,25 @@ TELEGRAM_GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_CHAT_ID", "").strip()
 SECONDARY_GROUP_CHAT_ID = os.getenv("SECONDARY_GROUP_CHAT_ID", os.getenv("TELEGRAM_SECONDARY_GROUP_CHAT_ID", "")).strip()
 POLL_INTERVAL_SECONDS  = float(os.getenv("POLL_INTERVAL_SECONDS", "6.0"))  # 6.0s = 10.0 req/min, 100% safe under shared 30 req/min ceiling
 
+def _resolve_gist_tokens() -> List[str]:
+    raw_candidates = [
+        os.getenv("GIST_TOKEN", "").strip(),
+        os.getenv("PAT", "").strip(),
+        os.getenv("GH_TOKEN", "").strip(),
+        os.getenv("GITHUB_TOKEN", "").strip(),
+    ]
+    valid: List[str] = []
+    for tok in raw_candidates:
+        if tok and tok.lower() not in ("true", "false", "none") and tok not in valid:
+            valid.append(tok)
+    # Prioritize Personal Access Tokens (ghp_ / github_pat_) over Actions installation tokens (ghs_)
+    pat_tokens = [t for t in valid if not t.startswith("ghs_")]
+    app_tokens = [t for t in valid if t.startswith("ghs_")]
+    return pat_tokens + app_tokens
+
+_GIST_TOKEN_CANDIDATES: List[str] = _resolve_gist_tokens()
 GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
-GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
+GIST_TOKEN = _GIST_TOKEN_CANDIDATES[0] if _GIST_TOKEN_CANDIDATES else ""
 _is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
 _manual_restart: bool = os.getenv("IS_MANUAL_RESTART", "false").strip().lower() in ("true", "1", "yes")
 _startup_alert_sent: bool = False  # in-process guard — prevents double-fire within a single bot.py run
@@ -1288,9 +1305,59 @@ def load_consumed_cache():
                     logger.warning(f"Error reading cache from {fname}: {e}")
     logger.info(f"Loaded {count} previously consumed numbers into memory cache.")
 
-def get_or_create_country(country_name: str) -> int:
+def _country_base_key(name: str) -> str:
+    """Returns normalized lowercase country name stripped of flags/symbols for tracking."""
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", str(name or "")).lower()
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+def _get_json_dict_setting(key: str) -> Dict[str, float]:
+    try:
+        raw = get_bot_setting(key, "{}")
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): float(v) for k, v in parsed.items() if v is not None}
+    except Exception:
+        pass
+    return {}
+
+def _mark_country_active(country_name: str):
+    bkey = _country_base_key(country_name)
+    if not bkey:
+        return
+    now_ts = time.time()
+    updated_map = _get_json_dict_setting("country_updated_at")
+    updated_map[bkey] = now_ts
+    set_bot_setting("country_updated_at", json.dumps(updated_map))
+    deleted_map = _get_json_dict_setting("deleted_countries")
+    if bkey in deleted_map:
+        deleted_map.pop(bkey, None)
+        set_bot_setting("deleted_countries", json.dumps(deleted_map))
+
+def _mark_country_deleted(country_name: str):
+    bkey = _country_base_key(country_name)
+    if not bkey:
+        return
+    now_ts = time.time()
+    deleted_map = _get_json_dict_setting("deleted_countries")
+    deleted_map[bkey] = now_ts
+    set_bot_setting("deleted_countries", json.dumps(deleted_map))
+
+def _is_country_explicitly_deleted(country_name: str) -> bool:
+    bkey = _country_base_key(country_name)
+    if not bkey:
+        return False
+    deleted_map = _get_json_dict_setting("deleted_countries")
+    if bkey not in deleted_map:
+        return False
+    updated_map = _get_json_dict_setting("country_updated_at")
+    return deleted_map.get(bkey, 0.0) > updated_map.get(bkey, 0.0)
+
+def get_or_create_country(country_name: str, from_gist: bool = False) -> int:
     clean_name = country_name.strip()
     formatted = format_country_name(clean_name)
+    if not from_gist:
+        _mark_country_active(formatted)
     with get_main_db() as conn:
         cur = conn.execute("SELECT id, name, button_name FROM countries WHERE LOWER(name) = LOWER(?) OR LOWER(name) = LOWER(?);", (clean_name, formatted))
         row = cur.fetchone()
@@ -1385,8 +1452,16 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
     _COUNTRIES_STOCK_CACHE_MAP[cache_key] = (now_ts, results)
     return results
 
-def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool = False) -> Tuple[int, int]:
+def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool = False, from_gist: bool = False) -> Tuple[int, int]:
     """Inserts numbers, ensuring '+' prefix, checking exclusivity against memory cache."""
+    if not from_gist:
+        try:
+            with get_main_db() as mconn:
+                crow = mconn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
+                if crow and crow["name"]:
+                    _mark_country_active(crow["name"])
+        except Exception:
+            pass
     added = 0
     duplicates = 0
     secret_val = 1 if is_secret else 0
@@ -1412,6 +1487,10 @@ def add_numbers_to_country(country_id: int, numbers: List[str], is_secret: bool 
             except sqlite3.IntegrityError:
                 duplicates += 1
         conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except Exception:
+            pass
     invalidate_countries_cache()  # stock changed — invalidate cache
     return added, duplicates
 
@@ -1464,7 +1543,17 @@ def remove_numbers_from_country(country_id: int, numbers: List[str]) -> int:
     invalidate_countries_cache()
     return removed
 
-def delete_country_and_stock(country_id: int):
+def delete_country_and_stock(country_id: int, record_deletion: bool = True):
+    # 0. Record explicit admin deletion so stale Gist/cache snapshots never resurrect it
+    if record_deletion:
+        try:
+            with get_main_db() as conn:
+                crow = conn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
+                if crow and crow["name"]:
+                    _mark_country_deleted(crow["name"])
+        except Exception:
+            pass
+
     # 1. Wipe rows first to guarantee zero numbers regardless of file locks
     try:
         with get_country_db(country_id) as cconn:
@@ -3542,11 +3631,14 @@ class GistStorage:
     def __init__(self, gist_id: str, token: str, filename: str = "number_botman_data.json",
                  description: str = "Number Botman — Persistent Cloud Backup (Auto-Managed)"):
         self.gist_id = gist_id or get_bot_setting("gist_id", "")
-        self.token = token
+        self.candidate_tokens: List[str] = list(_GIST_TOKEN_CANDIDATES)
+        if token and token not in self.candidate_tokens:
+            self.candidate_tokens.insert(0, token)
+        self.token = self.candidate_tokens[0] if self.candidate_tokens else token
         self.filename = filename
         self.description = description
         self.bot_name = "NUMBER_BOTMAN"
-        self.enabled = bool(token)
+        self.enabled = bool(self.token)
         self.api_url = f"https://api.github.com/gists/{self.gist_id}" if self.gist_id else ""
         # Debounce / throttle state
         self._lock: Optional[asyncio.Lock] = None  # created lazily after event loop starts
@@ -3564,66 +3656,69 @@ class GistStorage:
             self._lock = asyncio.Lock()
         return self._lock
 
-    def _auth_headers(self) -> Dict[str, str]:
-        return {**GIST_HEADERS, "Authorization": f"Bearer {self.token}"}
+    def _auth_headers(self, tok: Optional[str] = None) -> Dict[str, str]:
+        return {**GIST_HEADERS, "Authorization": f"Bearer {tok or self.token}"}
 
     async def ensure_gist(self) -> bool:
         """Finds existing Gist matching filename, deletes any duplicate Gists, or creates a new one automatically."""
-        if not self.token:
+        if not self.candidate_tokens:
             return False
         try:
             async with httpx.AsyncClient(timeout=15.0) as http:
-                if self.gist_id:
-                    check_res = await http.get(f"https://api.github.com/gists/{self.gist_id}", headers=self._auth_headers())
-                    if check_res.is_success:
-                        self.api_url = f"https://api.github.com/gists/{self.gist_id}"
-                        return True
+                for tok in list(self.candidate_tokens):
+                    headers = self._auth_headers(tok)
+                    if self.gist_id:
+                        check_res = await http.get(f"https://api.github.com/gists/{self.gist_id}", headers=headers)
+                        if check_res.is_success:
+                            self.token = tok
+                            self.api_url = f"https://api.github.com/gists/{self.gist_id}"
+                            return True
 
-                res = await http.get("https://api.github.com/gists", headers=self._auth_headers(), params={"per_page": 50})
-                if res.is_success:
-                    gists = res.json()
-                    matching = [g for g in gists if self.filename in g.get("files", {})]
-                    if matching:
-                        primary_gist = matching[0]
-                        self.gist_id = primary_gist["id"]
-                        self.api_url = f"https://api.github.com/gists/{self.gist_id}"
-                        set_bot_setting("gist_id", self.gist_id)
-                        logger.info(f"☁️ Reusing primary existing GitHub Gist: {self.gist_id}")
-                        for dup in matching[1:]:
-                            dup_id = dup["id"]
-                            try:
-                                await http.delete(f"https://api.github.com/gists/{dup_id}", headers=self._auth_headers())
-                                logger.info(f"🗑️ Deleted duplicate leftover Gist: {dup_id}")
-                            except Exception:
-                                pass
-                        return True
+                    res = await http.get("https://api.github.com/gists", headers=headers, params={"per_page": 50})
+                    if res.is_success:
+                        self.token = tok
+                        gists = res.json()
+                        matching = [g for g in gists if self.filename in g.get("files", {})]
+                        if matching:
+                            primary_gist = matching[0]
+                            self.gist_id = primary_gist["id"]
+                            self.api_url = f"https://api.github.com/gists/{self.gist_id}"
+                            set_bot_setting("gist_id", self.gist_id)
+                            logger.info(f"☁️ Reusing primary existing GitHub Gist: {self.gist_id}")
+                            for dup in matching[1:]:
+                                dup_id = dup["id"]
+                                try:
+                                    await http.delete(f"https://api.github.com/gists/{dup_id}", headers=headers)
+                                    logger.info(f"🗑️ Deleted duplicate leftover Gist: {dup_id}")
+                                except Exception:
+                                    pass
+                            return True
 
-                payload = {
-                    "description": self.description,
-                    "public": False,
-                    "files": {
-                        self.filename: {
-                            "content": json.dumps({
-                                "bot": self.bot_name,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "countries": {},
-                                "used_countries": {},
-                                "users": [],
-                                "admins": [],
-                            }, indent=2)
+                    payload = {
+                        "description": self.description,
+                        "public": False,
+                        "files": {
+                            self.filename: {
+                                "content": json.dumps({
+                                    "bot": self.bot_name,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "countries": {},
+                                    "used_countries": {},
+                                    "users": [],
+                                    "admins": [],
+                                }, indent=2)
+                            }
                         }
                     }
-                }
-                c_res = await http.post("https://api.github.com/gists", headers=self._auth_headers(), json=payload)
-                if c_res.is_success:
-                    data = c_res.json()
-                    self.gist_id = data["id"]
-                    self.api_url = f"https://api.github.com/gists/{self.gist_id}"
-                    set_bot_setting("gist_id", self.gist_id)
-                    logger.info(f"☁️ Auto-created new private persistent GitHub Gist: {self.gist_id}")
-                    return True
-                else:
-                    logger.error(f"Failed to create GitHub Gist: {c_res.status_code} {c_res.text}")
+                    c_res = await http.post("https://api.github.com/gists", headers=headers, json=payload)
+                    if c_res.is_success:
+                        self.token = tok
+                        data = c_res.json()
+                        self.gist_id = data["id"]
+                        self.api_url = f"https://api.github.com/gists/{self.gist_id}"
+                        set_bot_setting("gist_id", self.gist_id)
+                        logger.info(f"☁️ Auto-created new private persistent GitHub Gist: {self.gist_id}")
+                        return True
         except Exception as e:
             logger.error(f"Gist initialization error: {e}")
         return False
@@ -3736,19 +3831,20 @@ class GistStorage:
                 }
 
                 async with httpx.AsyncClient(timeout=20.0) as http:
-                    res = await http.patch(self.api_url, headers=self._auth_headers(), json=payload)
-                    if res.is_success:
-                        self._last_sync_time = _time.monotonic()
-                        logger.info(f"☁️ Successfully backed up to GitHub Gist ({len(countries_data)} pools, {len(users_data)} users).")
-                        return True
-                    else:
-                        logger.warning(f"Gist sync error: HTTP {res.status_code}")
+                    for tok in list(self.candidate_tokens):
+                        res = await http.patch(self.api_url, headers=self._auth_headers(tok), json=payload)
+                        if res.is_success:
+                            self.token = tok
+                            self._last_sync_time = _time.monotonic()
+                            logger.info(f"☁️ Successfully backed up to GitHub Gist ({len(countries_data)} pools, {len(users_data)} users).")
+                            return True
+                    logger.warning(f"Gist sync error: HTTP {res.status_code}")
             except Exception as e:
                 logger.error(f"Gist export error: {e}")
         return False
 
     async def restore_from_gist(self) -> bool:
-        """Restores databases from GitHub Gist into local SQLite files."""
+        """Restores databases from GitHub Gist into local SQLite files without wiping newer local stock."""
         if not self.enabled:
             return False
         if not self.gist_id:
@@ -3758,8 +3854,14 @@ class GistStorage:
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as http:
-                res = await http.get(self.api_url, headers=self._auth_headers())
-                if res.is_success:
+                res = None
+                for tok in list(self.candidate_tokens):
+                    r = await http.get(self.api_url, headers=self._auth_headers(tok))
+                    if r.is_success:
+                        self.token = tok
+                        res = r
+                        break
+                if res and res.is_success:
                     data = res.json()
                     files = data.get("files", {})
                     if self.filename in files:
@@ -3771,6 +3873,10 @@ class GistStorage:
                         users_data = parsed.get("users", [])
                         admins_data = parsed.get("admins", [])
 
+                        # Preserve local country activity/deletion timestamps before restoring Gist settings
+                        local_updated_map = _get_json_dict_setting("country_updated_at")
+                        local_deleted_map = _get_json_dict_setting("deleted_countries")
+
                         # Restore Bot Settings
                         saved_settings = parsed.get("bot_settings", {})
                         if isinstance(saved_settings, dict):
@@ -3780,6 +3886,22 @@ class GistStorage:
                                 thirdwave_client.update_base_url(str(saved_settings["thirdwave_base_url"]))
                             if "thirdwave_api_key" in saved_settings and "thirdwave_client" in globals():
                                 thirdwave_client.update_api_key(str(saved_settings["thirdwave_api_key"]))
+
+                        # Merge local and Gist country timestamps so newer local uploads are never treated as deleted
+                        gist_updated_map = _get_json_dict_setting("country_updated_at")
+                        gist_deleted_map = _get_json_dict_setting("deleted_countries")
+                        merged_updated: Dict[str, float] = dict(gist_updated_map)
+                        for k, v in local_updated_map.items():
+                            merged_updated[k] = max(merged_updated.get(k, 0.0), v)
+                        merged_deleted: Dict[str, float] = dict(gist_deleted_map)
+                        for k, v in local_deleted_map.items():
+                            merged_deleted[k] = max(merged_deleted.get(k, 0.0), v)
+                        # Clean any deleted entry that was re-uploaded more recently
+                        for k in list(merged_deleted.keys()):
+                            if merged_updated.get(k, 0.0) >= merged_deleted.get(k, 0.0):
+                                merged_deleted.pop(k, None)
+                        set_bot_setting("country_updated_at", json.dumps(merged_updated))
+                        set_bot_setting("deleted_countries", json.dumps(merged_deleted))
 
                         # Restore Seen OTPs from Gist cloud state
                         saved_seen = parsed.get("seen_otps", {})
@@ -3875,10 +3997,10 @@ class GistStorage:
 
                         # Restore used numbers archive
                         total_used_restored = 0
-                        used_gist_cids: Set[int] = set()
                         for cname, u_list in used_data.items():
-                            cid = get_or_create_country(cname)
-                            used_gist_cids.add(cid)
+                            if _is_country_explicitly_deleted(cname):
+                                continue
+                            cid = get_or_create_country(cname, from_gist=True)
                             with get_country_db(cid) as cconn:
                                 for unum in u_list:
                                     s_num = sanitize_phone_number(unum)
@@ -3892,22 +4014,15 @@ class GistStorage:
                                             pass
                                 cconn.commit()
 
-                        # Restore available numbers (Standard & Secret) and reconcile with cloud Gist
+                        # Restore available numbers (Standard & Secret) non-destructively
                         total_std_restored = 0
                         total_sec_restored = 0
                         active_gist_cids: Set[int] = set()
-                        cleared_cids: Set[int] = set()
                         for cname, c_stock in countries_data.items():
-                            cid = get_or_create_country(cname)
+                            if _is_country_explicitly_deleted(cname):
+                                continue
+                            cid = get_or_create_country(cname, from_gist=True)
                             active_gist_cids.add(cid)
-                            if cid not in cleared_cids:
-                                try:
-                                    with get_country_db(cid) as cconn:
-                                        cconn.execute("DELETE FROM available_numbers;")
-                                        cconn.commit()
-                                except Exception:
-                                    pass
-                                cleared_cids.add(cid)
                             if isinstance(c_stock, dict):
                                 if c_stock.get("button_name"):
                                     update_country_button_name(cid, str(c_stock["button_name"]))
@@ -3919,38 +4034,42 @@ class GistStorage:
                                 std_nums = [n for n in std_nums if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
                                 sec_nums = [n for n in sec_nums if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
                                 if std_nums:
-                                    added_std, _ = add_numbers_to_country(cid, std_nums, is_secret=False)
+                                    added_std, _ = add_numbers_to_country(cid, std_nums, is_secret=False, from_gist=True)
                                     total_std_restored += added_std
                                 if sec_nums:
-                                    added_sec, _ = add_numbers_to_country(cid, sec_nums, is_secret=True)
+                                    added_sec, _ = add_numbers_to_country(cid, sec_nums, is_secret=True, from_gist=True)
                                     total_sec_restored += added_sec
                             elif isinstance(c_stock, list):
                                 valid_nums = [n for n in c_stock if sanitize_phone_number(n) not in CONSUMED_NUMBERS_CACHE]
                                 if valid_nums:
-                                    added, _ = add_numbers_to_country(cid, valid_nums, is_secret=False)
+                                    added, _ = add_numbers_to_country(cid, valid_nums, is_secret=False, from_gist=True)
                                     total_std_restored += added
 
-                        # Reconcile deleted or exhausted countries present in stale local cache but absent from cloud Gist
-                        if parsed.get("updated_at") and isinstance(countries_data, dict):
-                            try:
-                                with get_main_db() as mconn:
-                                    local_c_rows = [r[0] for r in mconn.execute("SELECT id FROM countries;").fetchall()]
-                                for l_cid in local_c_rows:
-                                    if l_cid not in active_gist_cids:
-                                        if l_cid not in used_gist_cids:
-                                            delete_country_and_stock(l_cid)
-                                        else:
-                                            with get_country_db(l_cid) as cconn:
-                                                cconn.execute("DELETE FROM available_numbers;")
-                                                cconn.commit()
-                                invalidate_countries_cache()
-                            except Exception as rec_err:
-                                logger.debug(f"Country Gist reconciliation note: {rec_err}")
+                        # Only remove local countries that were explicitly deleted by an admin
+                        needs_gist_push = False
+                        try:
+                            with get_main_db() as mconn:
+                                local_c_rows = [(r["id"], r["name"]) for r in mconn.execute("SELECT id, name FROM countries;").fetchall()]
+                            for l_cid, l_cname in local_c_rows:
+                                if _is_country_explicitly_deleted(l_cname):
+                                    delete_country_and_stock(l_cid, record_deletion=False)
+                                    needs_gist_push = True
+                                elif l_cid not in active_gist_cids:
+                                    # Local SQLite has a valid country not yet in Gist -> push to Gist!
+                                    needs_gist_push = True
+                            invalidate_countries_cache()
+                        except Exception as rec_err:
+                            logger.debug(f"Country Gist check note: {rec_err}")
 
                         logger.info(
                             f"☁️ Restored {len(users_data)} users, "
                             f"{total_std_restored} standard numbers, {total_sec_restored} secret numbers & {total_used_restored} archived used numbers from GitHub Gist."
                         )
+                        if needs_gist_push:
+                            try:
+                                asyncio.create_task(self.export_and_sync(immediate=True))
+                            except Exception:
+                                pass
                         return True
         except Exception as e:
             logger.warning(f"Gist restore error: {e}")

@@ -49,9 +49,99 @@ jobs:
           echo "⚠️ Scheduled safety-net fired — bot was not running. Starting recovery session now."
 
       # ─────────────────────────────────────────────────────────────────
-      # Restore the database & stock pools from cache FIRST
-      # BEFORE any cancellation or history cleanup!
+      # Cancel any previous running instance FIRST and wait for its
+      # Save Persistent Database to Cache step to finish before restoring!
       # ─────────────────────────────────────────────────────────────────
+      - name: Cancel Any Other Running Instances
+        if: github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAT: ${{ secrets.PAT }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time, urllib.request
+          tokens = [t.strip() for t in [
+              os.environ.get('GH_TOKEN', ''),
+              os.environ.get('PAT', ''),
+              os.environ.get('GIST_TOKEN', ''),
+          ] if t.strip() and t.strip().lower() != 'true']
+          repo = '${{ github.repository }}'
+          current_id = '${{ github.run_id }}'
+          if not tokens:
+              print('⚠️ No token available, skipping cancel.')
+              exit(0)
+          token = tokens[0]
+          headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json', 'User-Agent': 'BotRunner'}
+          try:
+              req = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/runs?per_page=30', headers=headers)
+              with urllib.request.urlopen(req, timeout=8) as resp:
+                  data = json.load(resp)
+              active_ids = []
+              bad_sha_ids = set()
+              for r in data.get('workflow_runs', []):
+                  r_id = str(r.get('id'))
+                  r_num = r.get('run_number')
+                  r_status = r.get('status')
+                  r_sha = str(r.get('head_sha', ''))
+                  if r_sha.startswith('1a936d0'):
+                      bad_sha_ids.add(r_id)
+                  if r_id != current_id and r_status in ('in_progress', 'queued', 'pending', 'waiting'):
+                      active_ids.append((r_id, r_num))
+                      try:
+                          c_req = urllib.request.Request(
+                              f'https://api.github.com/repos/{repo}/actions/runs/{r_id}/cancel',
+                              method='POST', headers=headers
+                          )
+                          urllib.request.urlopen(c_req, timeout=8)
+                          print(f'🛑 Cancelled run #{r_num} (id:{r_id}, was:{r_status})')
+                      except Exception as e:
+                          print(f'⚠️ Could not cancel run #{r_num}: {e}')
+              if active_ids:
+                  print(f'⏳ Waiting for {len(active_ids)} previous runner(s) to finish saving cache...')
+                  for _ in range(18):
+                      time.sleep(2)
+                      still_running = []
+                      for r_id, r_num in active_ids:
+                          try:
+                              chk = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/runs/{r_id}', headers=headers)
+                              with urllib.request.urlopen(chk, timeout=6) as cr:
+                                  cdata = json.load(cr)
+                              if cdata.get('status') != 'completed':
+                                  still_running.append((r_id, r_num))
+                          except Exception:
+                              pass
+                      active_ids = still_running
+                      if not active_ids:
+                          print('✅ Previous runner(s) completed and saved cache.')
+                          break
+              else:
+                  print('✅ No other active runners found.')
+
+              # Purge any cache written by commit 1a936d0 so actions/cache/restore recovers the intact pre-1a936d0 cache
+              if bad_sha_ids:
+                  time.sleep(2)
+                  for tok in tokens:
+                      try:
+                          c_hdrs = {'Authorization': f'Bearer {tok}', 'Accept': 'application/vnd.github+json', 'User-Agent': 'BotRunner'}
+                          creq = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/caches?per_page=50', headers=c_hdrs)
+                          with urllib.request.urlopen(creq, timeout=8) as cresp:
+                              caches = json.load(cresp).get('actions_caches', [])
+                          for c_item in caches:
+                              ckey = str(c_item.get('key', ''))
+                              cid = c_item.get('id')
+                              if any(ckey.startswith(f'bot4-database-persistent-{bid}-') for bid in bad_sha_ids):
+                                  dreq = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/caches/{cid}', method='DELETE', headers=c_hdrs)
+                                  urllib.request.urlopen(dreq, timeout=8)
+                                  print(f'🧹 Purged wiped cache {ckey} (id:{cid}) to recover previous stock cache.')
+                          break
+                      except Exception as ce:
+                          continue
+          except Exception as e:
+              print(f'⚠️ Cancel check error: {e}')
+          PYEOF
+          echo "✅ Cancel step complete."
+
       - name: Restore Persistent Database from Cache
         uses: actions/cache/restore@v4
         with:
@@ -66,50 +156,6 @@ jobs:
           restore-keys: |
             bot4-database-persistent-
             bot4-database-
-
-      - name: Cancel Any Other Running Instances
-        if: github.event_name != 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 << 'PYEOF'
-          import os, json, time, urllib.request
-          token = os.environ.get('GH_TOKEN', '')
-          repo = '${{ github.repository }}'
-          current_id = '${{ github.run_id }}'
-          if not token:
-              print('⚠️ No token available, skipping cancel.')
-              exit(0)
-          headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json', 'User-Agent': 'BotRunner'}
-          try:
-              req = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/runs?per_page=30', headers=headers)
-              with urllib.request.urlopen(req, timeout=8) as resp:
-                  data = json.load(resp)
-              cancelled = 0
-              for r in data.get('workflow_runs', []):
-                  r_id = str(r.get('id'))
-                  r_num = r.get('run_number')
-                  r_status = r.get('status')
-                  if r_id != current_id and r_status in ('in_progress', 'queued', 'pending', 'waiting'):
-                      try:
-                          c_req = urllib.request.Request(
-                              f'https://api.github.com/repos/{repo}/actions/runs/{r_id}/cancel',
-                              method='POST', headers=headers
-                          )
-                          urllib.request.urlopen(c_req, timeout=8)
-                          print(f'🛑 Cancelled run #{r_num} (id:{r_id}, was:{r_status})')
-                          cancelled += 1
-                      except Exception as e:
-                          print(f'⚠️ Could not cancel run #{r_num}: {e}')
-              if cancelled > 0:
-                  print(f'⏳ Waiting 5s for {cancelled} cancelled runner(s) to stop...')
-                  time.sleep(5)
-              else:
-                  print('✅ No other active runners found.')
-          except Exception as e:
-              print(f'⚠️ Cancel check error: {e}')
-          PYEOF
-          echo "✅ Cancel step complete."
 
       - name: Clear Old Completed Workflow History
         env:
@@ -202,7 +248,7 @@ jobs:
           OTPMAN_BASE_URL: ${{ secrets.OTPMAN_BASE_URL }}
           OTPMAN2_API_KEY: ${{ secrets.OTPMAN2_API_KEY }}
           OTPMAN2_BASE_URL: ${{ secrets.OTPMAN2_BASE_URL }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.PAT || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
@@ -339,7 +385,7 @@ jobs:
         if: ${{ !cancelled() && steps.run_bot.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.PAT || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           if [ -f ".handover_dispatched" ]; then
             echo "✅ Proactive handover was already dispatched in advance by bot.py. Skipping duplicate trigger."

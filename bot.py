@@ -720,14 +720,33 @@ def init_db():
         except Exception:
             pass
 
-        # Ensure all existing countries and button_names have their flag emoji formatted
+        # Ensure all existing countries and button_names have their flag emoji formatted (and merge duplicates)
         try:
-            c_rows = conn.execute("SELECT id, name, button_name FROM countries;").fetchall()
+            c_rows = conn.execute("SELECT id, name, button_name FROM countries ORDER BY id ASC;").fetchall()
             for r in c_rows:
                 cid = r["id"]
                 old_name = r["name"] or ""
                 new_name = format_country_name(old_name)
                 if new_name and new_name != old_name:
+                    existing_target = conn.execute(
+                        "SELECT id FROM countries WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1;",
+                        (new_name, cid)
+                    ).fetchone()
+                    if existing_target:
+                        target_id = existing_target["id"]
+                        try:
+                            with get_country_db(cid) as src_db, get_country_db(target_id) as dst_db:
+                                for a_row in src_db.execute("SELECT number, is_secret FROM available_numbers;").fetchall():
+                                    dst_db.execute("INSERT OR IGNORE INTO available_numbers (number, is_secret) VALUES (?, ?);", (a_row[0], a_row[1]))
+                                for u_row in src_db.execute("SELECT number, user_id, is_secret FROM used_numbers;").fetchall():
+                                    dst_db.execute("INSERT OR IGNORE INTO used_numbers (number, user_id, is_secret) VALUES (?, ?, ?);", (u_row[0], u_row[1], u_row[2]))
+                                dst_db.commit()
+                            conn.execute("UPDATE user_claimed_numbers SET country_id = ? WHERE country_id = ?;", (target_id, cid))
+                            conn.execute("UPDATE delivery_log SET country_id = ? WHERE country_id = ?;", (target_id, cid))
+                            conn.execute("DELETE FROM countries WHERE id = ?;", (cid,))
+                        except Exception:
+                            pass
+                        continue
                     try:
                         conn.execute("UPDATE countries SET name = ? WHERE id = ?;", (new_name, cid))
                     except Exception:
@@ -3856,25 +3875,39 @@ class GistStorage:
 
                         # Restore used numbers archive
                         total_used_restored = 0
+                        used_gist_cids: Set[int] = set()
                         for cname, u_list in used_data.items():
                             cid = get_or_create_country(cname)
+                            used_gist_cids.add(cid)
                             with get_country_db(cid) as cconn:
                                 for unum in u_list:
                                     s_num = sanitize_phone_number(unum)
                                     if s_num:
                                         CONSUMED_NUMBERS_CACHE.add(s_num)
                                         try:
+                                            cconn.execute("DELETE FROM available_numbers WHERE number = ?;", (s_num,))
                                             cconn.execute("INSERT OR IGNORE INTO used_numbers (number, user_id) VALUES (?, 0);", (s_num,))
                                             total_used_restored += 1
                                         except Exception:
                                             pass
                                 cconn.commit()
 
-                        # Restore available numbers (Standard & Secret)
+                        # Restore available numbers (Standard & Secret) and reconcile with cloud Gist
                         total_std_restored = 0
                         total_sec_restored = 0
+                        active_gist_cids: Set[int] = set()
+                        cleared_cids: Set[int] = set()
                         for cname, c_stock in countries_data.items():
                             cid = get_or_create_country(cname)
+                            active_gist_cids.add(cid)
+                            if cid not in cleared_cids:
+                                try:
+                                    with get_country_db(cid) as cconn:
+                                        cconn.execute("DELETE FROM available_numbers;")
+                                        cconn.commit()
+                                except Exception:
+                                    pass
+                                cleared_cids.add(cid)
                             if isinstance(c_stock, dict):
                                 if c_stock.get("button_name"):
                                     update_country_button_name(cid, str(c_stock["button_name"]))
@@ -3896,6 +3929,23 @@ class GistStorage:
                                 if valid_nums:
                                     added, _ = add_numbers_to_country(cid, valid_nums, is_secret=False)
                                     total_std_restored += added
+
+                        # Reconcile deleted or exhausted countries present in stale local cache but absent from cloud Gist
+                        if parsed.get("updated_at") and isinstance(countries_data, dict):
+                            try:
+                                with get_main_db() as mconn:
+                                    local_c_rows = [r[0] for r in mconn.execute("SELECT id FROM countries;").fetchall()]
+                                for l_cid in local_c_rows:
+                                    if l_cid not in active_gist_cids:
+                                        if l_cid not in used_gist_cids:
+                                            delete_country_and_stock(l_cid)
+                                        else:
+                                            with get_country_db(l_cid) as cconn:
+                                                cconn.execute("DELETE FROM available_numbers;")
+                                                cconn.commit()
+                                invalidate_countries_cache()
+                            except Exception as rec_err:
+                                logger.debug(f"Country Gist reconciliation note: {rec_err}")
 
                         logger.info(
                             f"☁️ Restored {len(users_data)} users, "
@@ -6628,12 +6678,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_key = thirdwave_client.update_api_key(clean_input)
         set_bot_setting("thirdwave_api_key", new_key)
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
         new_masked = f"{new_key[:8]}...{new_key[-4:]}" if len(new_key) > 12 else new_key
         resp_text = (
             f"✅ <b>Thirdwave API Key Successfully Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>New Active Key:</b> <code>{new_masked}</code>\n"
+            f"• <b>New Active Key:</b> <code>{html.escape(new_masked)}</code>\n"
             f"• <b>Status:</b> <code>Active & Forwarding OTPs ⚡</code>\n"
             f"• <b>Cloud DB:</b> <code>Synced & Encrypted 🔒</code>"
         )
@@ -7018,15 +7068,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_name = text.strip()
         update_country_button_name(cid, new_name)
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
+        disp_btn = c_info.get("button_name") or format_country_name(new_name, fallback_country=c_name)
         resp_text = (
             f"✅ <b>Button Name Updated!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 Country: <code>{html.escape(c_name)}</code>\n"
-            f"🏷️ New Button Name: <code>{html.escape(new_name)}</code>\n"
+            f"🏷️ New Button Name: <code>{html.escape(disp_btn)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>This custom label will now be displayed on country buttons and broadcasts!</i>"
         )
@@ -7043,7 +7094,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_srv = text.strip()
         update_country_service_name(cid, new_srv)
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
         c_name = c_info.get("name", "Unknown")
@@ -7081,7 +7132,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if admin_state.get("awaiting_country_name"):
-        country_name = text.strip()
+        country_name = format_country_name(text.strip())
         numbers = admin_state["numbers"]
         filename = admin_state["filename"]
         mode = admin_state.get("mode", "add")
@@ -7108,7 +7159,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 except Exception:
                     pass
             if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             all_c = get_all_countries_with_stock(only_active=False)
             c_info = next((x for x in all_c if x["id"] == cid), {})
@@ -8449,7 +8500,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         delete_country_and_stock(cid)
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
         text = (
             f"✅ <b>Successfully Removed!</b>\n"
@@ -9046,7 +9097,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 except Exception:
                     pass
             if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
             all_c = get_all_countries_with_stock(only_active=False)
             c_info = next((x for x in all_c if x["id"] == cid), {})
@@ -9112,7 +9163,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
 
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
 
         all_c = get_all_countries_with_stock(only_active=False)
         c_info = next((x for x in all_c if x["id"] == cid), {})
@@ -9459,7 +9510,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         cid = int(data.split("_")[3])
         delete_country_and_stock(cid)
         if gist_storage.enabled:
-            asyncio.create_task(gist_storage.export_and_sync())
+            asyncio.create_task(gist_storage.export_and_sync(immediate=True))
         await query.edit_message_text(
             "🗑️ <b>Country pool and database deleted successfully.</b>",
             parse_mode=ParseMode.HTML,
@@ -9480,7 +9531,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        ok = await gist_storage.export_and_sync()
+        ok = await gist_storage.export_and_sync(immediate=True)
         status_msg = "✅ <b>Database and User permissions backed up to GitHub Gist!</b>" if ok else "❌ <b>Backup to Gist failed.</b> Check logs."
         await query.edit_message_text(
             status_msg,

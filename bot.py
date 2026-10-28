@@ -2379,8 +2379,8 @@ def parse_message_timestamp(time_str: str) -> float:
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
 COLLAPSED_SMS_HINT = "<b>Tap to read SMS...</b>"
-CARD_DIVIDER = "━" * 26
-QUOTE_DIVIDER = "━" * 20
+CARD_DIVIDER = "━" * 20
+QUOTE_DIVIDER = "━" * 18
 
 def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 20) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
@@ -4093,7 +4093,7 @@ def format_delivered_numbers(
     title_prefix = "🔒 " if is_secret else ""
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
-    divider = "━" * 26
+    divider = "━" * 20
 
     lines = [
         f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
@@ -4117,7 +4117,7 @@ def format_delivered_numbers_clean(numbers: List[str], with_plus: bool = True) -
 
 def get_select_country_text(secret_mode: bool = False) -> str:
     """Builds professional full-width header for Select Country message."""
-    divider = "━" * 26
+    divider = "━" * 20
     if secret_mode:
         return f"🔒 <b>Secret Numbers Pool:</b>\n{divider}"
     return f"🌍 <b>Select Country:</b>\n{divider}"

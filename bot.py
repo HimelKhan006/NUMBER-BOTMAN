@@ -4055,11 +4055,27 @@ def format_delivered_numbers(
     title_prefix = "🔒 " if is_secret else ""
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
+
+    # Resolve active OTP group link if configured
+    grp_link = get_group_link()
+    if not grp_link:
+        for cb in get_custom_link_buttons():
+            u = str(cb.get("url", "")).strip()
+            if u:
+                grp_link = u
+                break
+    if grp_link and grp_link.startswith(("http://", "https://", "tg://", "t.me/")):
+        target_url = grp_link if grp_link.startswith(("http://", "https://", "tg://")) else f"https://{grp_link}"
+        grp_html = f'<a href="{html.escape(target_url)}">OTP Group</a>'
+    else:
+        grp_html = "<b>OTP Group</b>"
+
     lines = [
         f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
         CARD_DIVIDER,
         f"👉 <b>{num_hint}</b>",
         "⚡ <i>Your OTP verification code will appear here instantly.</i>",
+        f"📢 <i>If your OTP is not received here, please check our {grp_html}.</i>",
     ]
     if available_count is not None and available_count > 0:
         lines.append(f"📦 <b>Pool Stock:</b> {available_count} numbers remaining")

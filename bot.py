@@ -4052,18 +4052,17 @@ def format_delivered_numbers(
 ) -> str:
     """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
     display_cname = format_country_name(country_name)
-    title_icon = "🔒" if is_secret else "📲"
+    title_prefix = "🔒 " if is_secret else ""
     assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
     lines = [
-        f"{title_icon} <b>{html.escape(display_cname)} — {assigned_label}</b>",
+        f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
         CARD_DIVIDER,
         f"👉 <b>{num_hint}</b>",
         "⚡ <i>Your OTP verification code will appear here instantly.</i>",
     ]
     if available_count is not None and available_count > 0:
-        lines.append("")
-        lines.append(f"📦 <b>Pool Stock:</b>  {available_count} numbers remaining")
+        lines.append(f"📦 <b>Pool Stock:</b> {available_count} numbers remaining")
     lines.append(CARD_DIVIDER)
     return "\n".join(lines)
 

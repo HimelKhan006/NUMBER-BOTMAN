@@ -9795,9 +9795,12 @@ def main():
 
     async def auto_session_handover(application: Application, duration_seconds: int):
         logger.info(f"⏱️ Zero-restart handover timer armed: {duration_seconds}s ({duration_seconds/3600:.1f}h).")
-        sleep_before = max(0, duration_seconds - 60)
+        # Stage 1: Wake up the incoming runner 4 minutes (240s) before session timeout
+        proactive_lead = 240
+        sleep_before = max(0, duration_seconds - proactive_lead)
         await asyncio.sleep(sleep_before)
-        logger.info("⏱️ Approaching handover window (60s remaining). Performing pre-handover state freeze...")
+
+        logger.info("🔄 Proactive handover window reached: dispatching next runner in advance...")
         try:
             with get_main_db() as conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -9818,12 +9821,41 @@ def main():
                 logger.info("☁️ Pre-handover Gist backup completed successfully.")
             except Exception as e:
                 logger.warning(f"Pre-handover Gist backup warning: {e}")
-        logger.info("✅ Pre-handover state snapshot saved. Triggering next runner in advance...")
+
         try:
             await trigger_proactive_handover(manual_restart=False)
         except Exception as e:
             logger.warning(f"Proactive handover dispatch error: {e}")
-        logger.info("Exiting cleanly for next runner switch (exit 0)...")
+
+        # Stage 2: Continue serving live users and OTPs for 3 minutes while the new runner boots up
+        remain_wait = max(0, min(180, duration_seconds - 60 - sleep_before))
+        if remain_wait > 0:
+            logger.info(f"⚡ Current runner continuing live operations for {remain_wait}s while new runner initializes...")
+            await asyncio.sleep(remain_wait)
+
+        # Stage 3: Final state checkpoint and clean handover exit (exit 0)
+        logger.info("⏱️ Session limit approaching (60s remaining). Performing final handover freeze...")
+        try:
+            with get_main_db() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            if os.path.exists(STOCKS_DIR):
+                for f in os.listdir(STOCKS_DIR):
+                    if f.endswith(".db"):
+                        try:
+                            with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                                cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        if gist_storage.enabled:
+            try:
+                await gist_storage.export_and_sync(is_handover=True)
+            except Exception:
+                pass
+
+        logger.info("✅ Final handover state saved. Exiting cleanly for next runner switch (exit 0)...")
         try:
             application.stop_running()
         except Exception as e:

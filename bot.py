@@ -202,6 +202,7 @@ GIST_ID    = os.getenv("GIST_ID", os.getenv("GITHUB_GIST_ID", "")).strip()
 GIST_TOKEN = os.getenv("GIST_TOKEN", os.getenv("GH_TOKEN", os.getenv("GITHUB_TOKEN", ""))).strip()
 _is_handover: bool = os.getenv("IS_HANDOVER", "false").strip().lower() in ("true", "1", "yes")
 _manual_restart: bool = os.getenv("IS_MANUAL_RESTART", "false").strip().lower() in ("true", "1", "yes")
+_startup_alert_sent: bool = False  # in-process guard — prevents double-fire within a single bot.py run
 _handover_epoch: float = 0.0
 bot_process_start_time: float = time.time()
 
@@ -3912,7 +3913,12 @@ async def send_startup_announcement(application: Application):
     initial deployment, or manual admin restart. Matching OTP bot format.
     COMPLETELY SILENT on routine 24/7 handover sessions (zero spam).
     """
-    global _is_handover, _manual_restart
+    global _is_handover, _manual_restart, _startup_alert_sent
+    if _startup_alert_sent:
+        logger.info("ℹ️ send_startup_announcement: already sent in this process — skipping.")
+        return
+    _startup_alert_sent = True
+
     silent_env = os.getenv("SILENT_STARTUP", "").strip().lower() in ("true", "1", "yes")
     if silent_env:
         logger.info("🤫 SILENT_STARTUP set: startup notification suppressed.")
@@ -3934,6 +3940,14 @@ async def send_startup_announcement(application: Application):
     is_commit_change = bool(current_commit and last_notified_commit and current_commit != last_notified_commit)
     is_new_update = is_git_push or is_commit_change or manual_restart
 
+    # Crash-restart deduplication: already notified for this exact commit?
+    if is_git_push and current_commit and current_commit == last_notified_commit and not manual_restart:
+        logger.info(
+            f"ℹ️ Push event — startup alert already sent for commit {current_commit[:7]}. "
+            f"Skipping duplicate (crash-restart protection)."
+        )
+        return
+
     if not is_new_update and not admin_alert_enabled:
         logger.info("ℹ️ NUMBER BOTMAN started cleanly in background (no new update to alert).")
         if current_commit and not last_notified_commit:
@@ -3949,6 +3963,15 @@ async def send_startup_announcement(application: Application):
                 os.remove(".manual_restart")
         except Exception:
             pass
+
+    # Pre-record commit to DB and Gist *before* sending to prevent duplicates on crash
+    if current_commit and not manual_restart:
+        set_bot_setting("last_notified_commit", current_commit)
+        if gist_storage.enabled:
+            try:
+                asyncio.create_task(gist_storage.export_and_sync(immediate=True))
+            except Exception as e:
+                logger.debug(f"Pre-send Gist commit record notice: {e}")
 
     bot_name = get_bot_name()
     time_str, date_str = format_bangladesh_12h()
@@ -4024,19 +4047,25 @@ def format_delivered_numbers(
     numbers: List[str],
     country_name: str,
     available_count: Optional[int] = None,
-    with_plus: bool = True
+    with_plus: bool = True,
+    is_secret: bool = False
 ) -> str:
     """Builds clean, professional delivery confirmation header with country flag, waiting status, and available count."""
     display_cname = format_country_name(country_name)
+    title_icon = "🔒" if is_secret else "📲"
+    assigned_label = "Secret Number Assigned" if is_secret else "Number Assigned"
     lines = [
-        f"<b>{html.escape(display_cname)} Allocated For You</b>",
+        f"{title_icon} <b>{html.escape(display_cname)} — {assigned_label}</b>",
+        CARD_DIVIDER,
+        "<b>Status:</b>  ✅ Active &amp; Monitoring",
+        "<b>Action:</b>  Use the number below to receive your OTP",
         "",
-        "🕒 <b>Waiting for OTP code...</b> ⏳",
-        "<i>⚡ Your OTP will be delivered directly here as soon as received.</i>",
+        "<i>⚡ OTP messages will appear here instantly once received.</i>",
     ]
     if available_count is not None and available_count > 0:
         lines.append("")
-        lines.append(f"📦 <b>Available:</b> {available_count} numbers")
+        lines.append(f"📦 <b>Pool Stock:</b>  {available_count} numbers remaining")
+    lines.append("")
     lines.append(CARD_DIVIDER)
     return "\n".join(lines)
 
@@ -5994,7 +6023,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         if prev_mode == "remove":
             countries = get_all_countries_with_stock(only_active=False)
             buttons = []
-            buttons.append([InlineKeyboardButton(f"📁 Use File Name: '{file_stem}'", callback_data="upload_use_filename")])
+            buttons.append([InlineKeyboardButton(f"✅ Use Filename as Country: {file_stem}", callback_data="upload_use_filename")])
             row = []
             for c in countries[:8]:
                 row.append(InlineKeyboardButton(f"{c['name']}", callback_data=f"sel_upload_c_{c['id']}"))
@@ -6019,7 +6048,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         # Upload Flow: Step 1 Select Country
         buttons = []
         # Direct button to use uploaded file name as country
-        buttons.append([InlineKeyboardButton(f"📁 Use File Name: '{file_stem}'", callback_data="upload_use_filename")])
+        buttons.append([InlineKeyboardButton(f"✅ Use Filename as Country: {file_stem}", callback_data="upload_use_filename")])
 
         countries = get_all_countries_with_stock(only_active=False)
         row = []
@@ -7301,7 +7330,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 return
 
             pref_plus = get_user_plus_preference(user.id)
-            response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus)
+            response_text = format_delivered_numbers(numbers, country_name, available_count=remaining_count, with_plus=pref_plus, is_secret=True)
             markup = get_numbers_view_keyboard(country_id, is_secret=True, with_plus=pref_plus, quantity=limit, is_fixed=is_fixed, numbers=numbers)
 
             try:

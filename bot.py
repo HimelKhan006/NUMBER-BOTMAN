@@ -4014,11 +4014,19 @@ async def send_startup_announcement(application: Application):
     bot_name = get_bot_name()
     time_str, date_str = format_bangladesh_12h()
 
+    if manual_restart and not is_git_push and not is_commit_change:
+        trigger_label = "🔄 <b>Admin Manual Restart</b>"
+    elif is_git_push:
+        trigger_label = "🚀 <b>New Update Deployed</b>"
+    else:
+        trigger_label = "📦 <b>Code Update Detected</b>"
+
     admin_msg = (
         f"✅ <b>{html.escape(bot_name)}</b> is now <b>LIVE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ <b>Start Time:</b> <code>{time_str}</code>\n"
         f"📅 <b>Date:</b>       <code>{date_str}</code>\n"
+        f"⚡ <b>Trigger:</b>    {trigger_label}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<i>👑 Use /start anytime to open the admin dashboard.</i>"
     )

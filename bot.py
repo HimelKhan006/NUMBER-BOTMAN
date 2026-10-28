@@ -780,19 +780,6 @@ def init_db():
             logger.debug(f"Country flag auto-migration note: {e}")
 
         conn.commit()
-        try:
-            valid_cids = {int(r["id"]) for r in conn.execute("SELECT id FROM countries;").fetchall()}
-            if os.path.exists(STOCKS_DIR):
-                for fname in os.listdir(STOCKS_DIR):
-                    if fname.startswith("country_") and (fname.endswith(".db") or ".db-" in fname):
-                        num_part = fname.replace("country_", "", 1).split(".db")[0]
-                        if num_part.isdigit() and int(num_part) not in valid_cids:
-                            try:
-                                os.remove(os.path.join(STOCKS_DIR, fname))
-                            except Exception:
-                                pass
-        except Exception:
-            pass
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
 
@@ -3844,13 +3831,12 @@ class GistStorage:
                         with get_country_db(cid) as cconn:
                             std_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 0 ORDER BY id ASC;").fetchall()]
                             sec_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 1 ORDER BY id ASC;").fetchall()]
-                            if std_nums or sec_nums:
-                                countries_data[cname] = {
-                                    "standard": std_nums,
-                                    "secret": sec_nums,
-                                    "button_name": btn_name,
-                                    "service_name": srv_name,
-                                }
+                            countries_data[cname] = {
+                                "standard": std_nums,
+                                "secret": sec_nums,
+                                "button_name": btn_name,
+                                "service_name": srv_name,
+                            }
                             u_list = [r[0] for r in cconn.execute("SELECT number FROM used_numbers ORDER BY id ASC;").fetchall()]
                             if u_list:
                                 used_data[cname] = u_list
@@ -4105,13 +4091,8 @@ class GistStorage:
                         for cname, c_stock in countries_data.items():
                             if _is_country_explicitly_deleted(cname):
                                 continue
-                            bkey = _country_base_key(cname)
-                            # If local SQLite already has newer modifications for this country than Gist, skip re-adding stale Gist numbers
-                            local_is_newer = bool(bkey and local_updated_map.get(bkey, 0.0) > gist_updated_map.get(bkey, 0.0))
                             cid = get_or_create_country(cname, from_gist=True)
                             active_gist_cids.add(cid)
-                            if local_is_newer:
-                                continue
                             if isinstance(c_stock, dict):
                                 if c_stock.get("button_name"):
                                     update_country_button_name(cid, str(c_stock["button_name"]))

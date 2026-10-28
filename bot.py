@@ -2982,7 +2982,6 @@ def format_inbox_otp_message(
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
-            f"{QUOTE_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
@@ -3035,13 +3034,12 @@ def format_group_otp_message(
 
     quote_block = ""
     if sms_format != "short" and clean_msg:
-        styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=28)
+        styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=22)
         quote_block = (
             f"\n\n{EXPANDABLE_SMS_LABEL}\n"
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
-            f"{QUOTE_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )

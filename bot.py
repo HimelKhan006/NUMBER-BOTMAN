@@ -2976,12 +2976,13 @@ def format_inbox_otp_message(
     ]
 
     if show_full_sms and raw_message:
-        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=20)
+        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=28)
         lines.append("")
         lines.append(
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
+            f"{CARD_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )
@@ -3034,12 +3035,13 @@ def format_group_otp_message(
 
     quote_block = ""
     if sms_format != "short" and clean_msg:
-        styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=22)
+        styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=28)
         quote_block = (
             f"\n\n{EXPANDABLE_SMS_LABEL}\n"
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
+            f"{CARD_DIVIDER}\n"
             f"💬 <b>SMS Content:</b>\n"
             f"{styled_sms}</blockquote>"
         )

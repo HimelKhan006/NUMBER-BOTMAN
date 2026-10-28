@@ -1865,13 +1865,19 @@ def get_bot_setting(key: str, default: str = "") -> str:
             pass
     return default
 
-def set_bot_setting(key: str, value: str) -> bool:
+def set_bot_setting(key: str, value: str, from_gist: bool = False) -> bool:
     try:
+        now_str = str(time.time())
         with get_main_db() as conn:
             conn.execute("""
                 INSERT INTO bot_settings (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             """, (key, str(value).strip()))
+            if not from_gist and key != "_settings_updated_at":
+                conn.execute("""
+                    INSERT INTO bot_settings (key, value) VALUES ('_settings_updated_at', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """, (now_str,))
             conn.commit()
             try:
                 conn.execute("PRAGMA wal_checkpoint(FULL);")
@@ -1888,6 +1894,8 @@ def set_bot_setting(key: str, value: str) -> bool:
                 except Exception:
                     data = {}
             data[key] = str(value).strip()
+            if not from_gist and key != "_settings_updated_at":
+                data["_settings_updated_at"] = now_str
             with open(data_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -3936,19 +3944,34 @@ class GistStorage:
                         local_del_users = _get_json_dict_setting("deleted_users")
                         local_rev_admins = _get_json_dict_setting("revoked_admins")
 
-                        # Restore Bot Settings
+                        # Restore Bot Settings (without letting an older Gist overwrite newer local Admin Panel changes)
                         saved_settings = parsed.get("bot_settings", {})
                         if isinstance(saved_settings, dict):
+                            local_s_ts = float(get_bot_setting("_settings_updated_at", "0") or 0.0)
+                            cloud_s_ts = float(saved_settings.get("_settings_updated_at") or 0.0)
+                            cloud_is_newer = (cloud_s_ts >= local_s_ts) or (local_s_ts == 0.0)
                             for sk, sv in saved_settings.items():
-                                set_bot_setting(str(sk), str(sv))
-                            if "thirdwave_base_url" in saved_settings and "thirdwave_client" in globals():
-                                thirdwave_client.update_base_url(str(saved_settings["thirdwave_base_url"]))
-                            if "thirdwave_api_key" in saved_settings and "thirdwave_client" in globals():
-                                thirdwave_client.update_api_key(str(saved_settings["thirdwave_api_key"]))
+                                if cloud_is_newer or not get_bot_setting(str(sk), ""):
+                                    set_bot_setting(str(sk), str(sv), from_gist=True)
+                            active_url = get_bot_setting("thirdwave_base_url", "")
+                            if active_url and "thirdwave_client" in globals():
+                                thirdwave_client.update_base_url(active_url)
+                            active_key = get_bot_setting("thirdwave_api_key", "")
+                            if active_key and "thirdwave_client" in globals():
+                                thirdwave_client.update_api_key(active_key)
 
                         # Merge local and Gist country timestamps so newer local uploads are never treated as deleted
-                        gist_updated_map = _get_json_dict_setting("country_updated_at")
-                        gist_deleted_map = _get_json_dict_setting("deleted_countries")
+                        gist_updated_map = {}
+                        gist_deleted_map = {}
+                        if isinstance(saved_settings, dict):
+                            try:
+                                gist_updated_map = {str(k): float(v) for k, v in json.loads(saved_settings.get("country_updated_at", "{}")).items() if v is not None}
+                            except Exception:
+                                pass
+                            try:
+                                gist_deleted_map = {str(k): float(v) for k, v in json.loads(saved_settings.get("deleted_countries", "{}")).items() if v is not None}
+                            except Exception:
+                                pass
                         merged_updated: Dict[str, float] = dict(gist_updated_map)
                         for k, v in local_updated_map.items():
                             merged_updated[k] = max(merged_updated.get(k, 0.0), v)
@@ -3961,21 +3984,30 @@ class GistStorage:
                                 merged_deleted.pop(k, None)
                             else:
                                 merged_updated.pop(k, None)
-                        set_bot_setting("country_updated_at", json.dumps(merged_updated))
-                        set_bot_setting("deleted_countries", json.dumps(merged_deleted))
+                        set_bot_setting("country_updated_at", json.dumps(merged_updated), from_gist=True)
+                        set_bot_setting("deleted_countries", json.dumps(merged_deleted), from_gist=True)
 
                         # Merge deleted_users and revoked_admins maps
-                        gist_del_users = _get_json_dict_setting("deleted_users")
+                        gist_del_users = {}
+                        gist_rev_admins = {}
+                        if isinstance(saved_settings, dict):
+                            try:
+                                gist_del_users = {str(k): float(v) for k, v in json.loads(saved_settings.get("deleted_users", "{}")).items() if v is not None}
+                            except Exception:
+                                pass
+                            try:
+                                gist_rev_admins = {str(k): float(v) for k, v in json.loads(saved_settings.get("revoked_admins", "{}")).items() if v is not None}
+                            except Exception:
+                                pass
                         merged_del_users: Dict[str, float] = dict(gist_del_users)
                         for k, v in local_del_users.items():
                             merged_del_users[k] = max(merged_del_users.get(k, 0.0), v)
-                        set_bot_setting("deleted_users", json.dumps(merged_del_users))
+                        set_bot_setting("deleted_users", json.dumps(merged_del_users), from_gist=True)
 
-                        gist_rev_admins = _get_json_dict_setting("revoked_admins")
                         merged_rev_admins: Dict[str, float] = dict(gist_rev_admins)
                         for k, v in local_rev_admins.items():
                             merged_rev_admins[k] = max(merged_rev_admins.get(k, 0.0), v)
-                        set_bot_setting("revoked_admins", json.dumps(merged_rev_admins))
+                        set_bot_setting("revoked_admins", json.dumps(merged_rev_admins), from_gist=True)
 
                         # Restore Seen OTPs from Gist cloud state
                         saved_seen = parsed.get("seen_otps", {})

@@ -367,20 +367,32 @@ COUNTRY_FLAGS: Dict[str, str] = {
     "papua new guinea": "🇵🇬", "pg": "🇵🇬",
 }
 
+def extract_flag_emoji(text: str) -> Optional[str]:
+    """Extracts the first 2-character regional indicator flag emoji from a string, if present."""
+    if not text:
+        return None
+    chars = [ch for ch in text if 127462 <= ord(ch) <= 127487]
+    if len(chars) >= 2:
+        return "".join(chars[:2])
+    return None
+
 def get_country_flag(name: str) -> Optional[str]:
     """Finds or resolves the flag emoji for any country name, code, or composite label."""
     cleaned = name.strip()
     if not cleaned:
         return None
     # Check if text already contains a regional indicator flag symbol
-    for ch in cleaned:
-        if 127462 <= ord(ch) <= 127487:
-            return None
+    if extract_flag_emoji(cleaned):
+        return None
 
     lower = cleaned.lower()
-    # 1. Direct match in dictionary
+    iso_dict = globals().get("COUNTRY_ISO_DATA", {})
+
+    # 1. Direct match in dictionaries
     if lower in COUNTRY_FLAGS:
         return COUNTRY_FLAGS[lower]
+    if lower in iso_dict:
+        return iso_dict[lower][0]
 
     # 2. Check 2-letter ISO code conversion
     if len(lower) == 2 and lower.isalpha():
@@ -397,17 +409,28 @@ def get_country_flag(name: str) -> Optional[str]:
     for cand in [" ".join(sub_tokens), *sub_tokens]:
         if cand in COUNTRY_FLAGS:
             return COUNTRY_FLAGS[cand]
+        if cand in iso_dict:
+            return iso_dict[cand][0]
 
     # 4. Substring search in dictionary keys
     for key, flag in COUNTRY_FLAGS.items():
         if len(key) >= 4 and key in lower:
             return flag
+    for key, (flag, _code) in iso_dict.items():
+        if len(key) >= 4 and key in lower:
+            return flag
 
     return None
 
-def format_country_name(name: str) -> str:
+def format_country_name(name: str, fallback_country: str = "") -> str:
     cleaned = name.strip()
+    if not cleaned:
+        return cleaned
+    if extract_flag_emoji(cleaned):
+        return cleaned
     flag = get_country_flag(cleaned)
+    if not flag and fallback_country:
+        flag = extract_flag_emoji(fallback_country) or get_country_flag(fallback_country)
     if flag:
         return f"{flag} {cleaned}"
     return cleaned
@@ -697,6 +720,29 @@ def init_db():
         except Exception:
             pass
 
+        # Ensure all existing countries and button_names have their flag emoji formatted
+        try:
+            c_rows = conn.execute("SELECT id, name, button_name FROM countries;").fetchall()
+            for r in c_rows:
+                cid = r["id"]
+                old_name = r["name"] or ""
+                new_name = format_country_name(old_name)
+                if new_name and new_name != old_name:
+                    try:
+                        conn.execute("UPDATE countries SET name = ? WHERE id = ?;", (new_name, cid))
+                    except Exception:
+                        pass
+                old_btn = r["button_name"] or ""
+                if old_btn:
+                    new_btn = format_country_name(old_btn, fallback_country=new_name or old_name)
+                    if new_btn != old_btn:
+                        try:
+                            conn.execute("UPDATE countries SET button_name = ? WHERE id = ?;", (new_btn, cid))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug(f"Country flag auto-migration note: {e}")
+
         conn.commit()
     logger.info("📦 Main Management Database initialized at %s", MAIN_DB_FILE)
     load_consumed_cache()
@@ -822,7 +868,10 @@ def record_broadcast_history(
 def update_country_button_name(country_id: int, button_name: str) -> bool:
     try:
         with get_main_db() as conn:
-            conn.execute("UPDATE countries SET button_name = ? WHERE id = ?;", (button_name, country_id))
+            c_row = conn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
+            c_name = c_row["name"] if c_row else ""
+            formatted_btn = format_country_name(button_name.strip(), fallback_country=c_name) if button_name.strip() else ""
+            conn.execute("UPDATE countries SET button_name = ? WHERE id = ?;", (formatted_btn, country_id))
             conn.commit()
         invalidate_countries_cache()
         return True
@@ -1163,7 +1212,7 @@ def delete_user(user_id: int) -> Optional[Dict[str, Any]]:
                 if fname.startswith("country_") and fname.endswith(".db"):
                     c_path = os.path.join(STOCKS_DIR, fname)
                     try:
-                        with sqlite3.connect(c_path, timeout=10.0) as cconn:
+                        with ClosingConnection(sqlite3.connect(c_path, timeout=10.0)) as cconn:
                             c_cur = cconn.execute("UPDATE used_numbers SET user_id = 0 WHERE user_id = ?;", (user_id,))
                             result["deleted_stock_logs"] += c_cur.rowcount
                             cconn.commit()
@@ -1209,7 +1258,7 @@ def load_consumed_cache():
             if fname.startswith("country_") and fname.endswith(".db"):
                 c_path = os.path.join(STOCKS_DIR, fname)
                 try:
-                    with sqlite3.connect(c_path, timeout=10.0) as conn:
+                    with ClosingConnection(sqlite3.connect(c_path, timeout=10.0)) as conn:
                         cur = conn.execute("SELECT number FROM used_numbers;")
                         for row in cur.fetchall():
                             num = sanitize_phone_number(str(row[0]))
@@ -1224,14 +1273,34 @@ def get_or_create_country(country_name: str) -> int:
     clean_name = country_name.strip()
     formatted = format_country_name(clean_name)
     with get_main_db() as conn:
-        cur = conn.execute("SELECT id FROM countries WHERE LOWER(name) = LOWER(?) OR LOWER(name) = LOWER(?);", (clean_name, formatted))
+        cur = conn.execute("SELECT id, name, button_name FROM countries WHERE LOWER(name) = LOWER(?) OR LOWER(name) = LOWER(?);", (clean_name, formatted))
         row = cur.fetchone()
         if row:
-            return row["id"]
+            cid = row["id"]
+            updated = False
+            if row["name"] != formatted:
+                try:
+                    conn.execute("UPDATE countries SET name = ? WHERE id = ?;", (formatted, cid))
+                    updated = True
+                except Exception:
+                    pass
+            if row["button_name"]:
+                fmt_btn = format_country_name(row["button_name"], fallback_country=formatted)
+                if fmt_btn != row["button_name"]:
+                    try:
+                        conn.execute("UPDATE countries SET button_name = ? WHERE id = ?;", (fmt_btn, cid))
+                        updated = True
+                    except Exception:
+                        pass
+            if updated:
+                conn.commit()
+                invalidate_countries_cache()
+            return cid
         cur = conn.execute("INSERT INTO countries (name) VALUES (?);", (formatted,))
         conn.commit()
         cid = cur.lastrowid
         get_country_db(cid).close()
+        invalidate_countries_cache()
         return cid
 
 # Short in-memory cache for country stock queries
@@ -1259,7 +1328,7 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
 
     for c in countries:
         cid = c["id"]
-        cname = c["name"]
+        cname = format_country_name(c["name"])
         try:
             with get_country_db(cid) as cconn:
                 avail_std = cconn.execute("SELECT COUNT(*) FROM available_numbers WHERE is_secret = 0;").fetchone()[0]
@@ -1278,7 +1347,7 @@ def get_all_countries_with_stock(only_active: bool = True, secret_mode: bool = F
         if only_active and target_avail == 0:
             continue
 
-        btn_val = c["button_name"] if ("button_name" in c.keys() and c["button_name"]) else cname
+        btn_val = format_country_name(c["button_name"], fallback_country=cname) if ("button_name" in c.keys() and c["button_name"]) else cname
         srv_val = c["service_name"] if ("service_name" in c.keys() and c["service_name"]) else "WhatsApp"
         results.append({
             "id": cid,
@@ -1432,7 +1501,7 @@ def consume_numbers_for_user(country_id: int, user_id: int, limit: int = 10, is_
     secret_val = 1 if is_secret else 0
     with get_main_db() as mconn:
         c_row = mconn.execute("SELECT name FROM countries WHERE id = ?;", (country_id,)).fetchone()
-        country_name = c_row["name"] if c_row else "Unknown"
+        country_name = format_country_name(c_row["name"]) if c_row else "Unknown"
 
     with get_country_db(country_id) as cconn:
         cconn.execute("BEGIN IMMEDIATE;")
@@ -1947,7 +2016,7 @@ def get_number_owner(phone_number: str, max_age_hours: int = 28) -> Optional[int
                 if f.endswith(".db"):
                     c_path = os.path.join(STOCKS_DIR, f)
                     try:
-                        with sqlite3.connect(c_path, timeout=5.0) as cconn:
+                        with ClosingConnection(sqlite3.connect(c_path, timeout=5.0)) as cconn:
                             placeholders = ",".join(["?"] * len(candidates))
                             cur = cconn.execute(
                                 f"SELECT user_id FROM used_numbers WHERE number IN ({placeholders}) AND user_id > 0 ORDER BY id DESC LIMIT 1;",
@@ -3579,12 +3648,14 @@ class GistStorage:
                 used_data: Dict[str, List[str]] = {}
 
                 with get_main_db() as conn:
-                    cur = conn.execute("SELECT id, name FROM countries;")
+                    cur = conn.execute("SELECT id, name, button_name, service_name FROM countries;")
                     all_countries = cur.fetchall()
 
                     for c in all_countries:
                         cid = c["id"]
-                        cname = c["name"]
+                        cname = format_country_name(c["name"])
+                        btn_name = format_country_name(c["button_name"], fallback_country=cname) if c["button_name"] else ""
+                        srv_name = c["service_name"] or "WhatsApp"
                         with get_country_db(cid) as cconn:
                             std_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 0 ORDER BY id ASC;").fetchall()]
                             sec_nums = [r[0] for r in cconn.execute("SELECT number FROM available_numbers WHERE is_secret = 1 ORDER BY id ASC;").fetchall()]
@@ -3592,6 +3663,8 @@ class GistStorage:
                                 countries_data[cname] = {
                                     "standard": std_nums,
                                     "secret": sec_nums,
+                                    "button_name": btn_name,
+                                    "service_name": srv_name,
                                 }
                             u_list = [r[0] for r in cconn.execute("SELECT number FROM used_numbers ORDER BY id ASC;").fetchall()]
                             if u_list:
@@ -3803,6 +3876,10 @@ class GistStorage:
                         for cname, c_stock in countries_data.items():
                             cid = get_or_create_country(cname)
                             if isinstance(c_stock, dict):
+                                if c_stock.get("button_name"):
+                                    update_country_button_name(cid, str(c_stock["button_name"]))
+                                if c_stock.get("service_name"):
+                                    update_country_service_name(cid, str(c_stock["service_name"]))
                                 std_nums = c_stock.get("standard", [])
                                 sec_nums = c_stock.get("secret", [])
                                 # Strictly exclude any number that was already consumed
@@ -3931,7 +4008,7 @@ def is_admin_action_callback(data: str) -> bool:
     if data in (
         "admin_panel", "admin_refresh_dash", "admin_stock_pools", "admin_uploaded_files",
         "toggle_inbox_otp", "toggle_view_full_sms", "reset_url_default", "cancel_upload",
-        "confirm_restart", "upload_use_filename", "link_list", "admin_api_url_menu",
+        "confirm_restart", "link_list", "admin_api_url_menu",
         "admin_api_key_menu", "admin_manage_admins", "admin_broadcast_menu", "admin_sms_format_menu",
         "admin_live_status", "admin_qty_menu", "admin_users"
     ):
@@ -4182,7 +4259,7 @@ def get_countries_keyboard(page: int = 0, per_page: int = 8, is_admin_mode: bool
     buttons = []
     row = []
     for c in current_page_countries:
-        btn_disp = c.get("button_name") or c["name"]
+        btn_disp = format_country_name(c.get("button_name") or c["name"], fallback_country=c["name"])
 
         if is_admin_mode:
             prefix = "adm_country_"
@@ -4416,7 +4493,7 @@ async def show_user_profile(update: Update, target_user_id: int, viewer_user_id:
     plus_pref = "With Leading '+' (+123456789)" if u.get("prefer_plus", 1) else "Without '+' (123456789)"
 
     name = u.get("first_name") or "User"
-    uname = f"@{u['username']}" if u.get("username") else "None"
+    uname = f"@{html.escape(u['username'])}" if u.get("username") else "None"
     joined = (u.get("joined_at") or "N/A")[:19]
     last_seen = (u.get("last_seen") or "N/A")[:19]
     consumed = u.get("numbers_consumed", 0)
@@ -5689,7 +5766,7 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     for a in all_adm:
         badge = "👑 Super Admin" if a.get("is_super") else "🛡️ Admin"
-        uname = f"@{a['username']}" if a.get("username") else a.get("first_name", "")
+        uname = f"@{html.escape(a['username'])}" if a.get("username") else html.escape(a.get("first_name") or "")
         lines.append(f"• <code>{a['user_id']}</code> ({uname}) — <b>{badge}</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -5779,7 +5856,7 @@ async def trigger_proactive_handover(manual_restart: bool = False) -> bool:
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
                     try:
-                        with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
                             cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                     except Exception:
                         pass
@@ -5848,7 +5925,7 @@ async def perform_zero_restart_handover(target_message=None, manual_restart: boo
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
                     try:
-                        with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
                             cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                     except Exception:
                         pass
@@ -6056,12 +6133,10 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         prev_mode = ADMIN_STATES.get(user.id, {}).get("mode", "add")
-        file_stem = os.path.splitext(file_name)[0].strip()
 
         ADMIN_STATES[user.id] = {
             "numbers": extracted_numbers,
             "filename": file_name,
-            "file_stem": file_stem,
             "mode": prev_mode,
             "doc_msg_id": update.message.message_id,
             "step_msg_id": msg.message_id,
@@ -6070,7 +6145,6 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         if prev_mode == "remove":
             countries = get_all_countries_with_stock(only_active=False)
             buttons = []
-            buttons.append([InlineKeyboardButton(f"✅ Use Filename as Country: {file_stem}", callback_data="upload_use_filename")])
             row = []
             for c in countries[:8]:
                 row.append(InlineKeyboardButton(f"{c['name']}", callback_data=f"sel_upload_c_{c['id']}"))
@@ -6094,9 +6168,6 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
         # Upload Flow: Step 1 Select Country
         buttons = []
-        # Direct button to use uploaded file name as country
-        buttons.append([InlineKeyboardButton(f"✅ Use Filename as Country: {file_stem}", callback_data="upload_use_filename")])
-
         countries = get_all_countries_with_stock(only_active=False)
         row = []
         for c in countries[:8]:
@@ -6117,7 +6188,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             f"🔢 <b>Valid Numbers (with +):</b> <code>{len(extracted_numbers)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🌍 <b>Step 1: Choose Country:</b>\n"
-            f"<i>Tap 'Use File Name', an existing country, or 'Type New Country Name':</i>",
+            f"<i>Select an existing country below or tap 'Type New Country Name':</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -6303,7 +6374,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     await render_prompt_response(context, prompt_chat_id, prompt_msg_id, update.message, not_found_text, not_found_kb)
                     return
 
-                uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
+                uname = f"@{html.escape(u['username'])}" if u.get("username") else html.escape(u.get("first_name") or "Unknown")
                 confirm_text = (
                     f"⚠️ <b>Confirm User Removal</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -7575,7 +7646,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 if fname.startswith("country_") and fname.endswith(".db"):
                     c_path = os.path.join(STOCKS_DIR, fname)
                     try:
-                        with sqlite3.connect(c_path, timeout=10.0) as cconn:
+                        with ClosingConnection(sqlite3.connect(c_path, timeout=10.0)) as cconn:
                             rows = cconn.execute("SELECT number FROM used_numbers WHERE user_id = ? ORDER BY id DESC LIMIT 500;", (user.id,)).fetchall()
                             user_nums.extend([r[0] for r in rows])
                     except Exception:
@@ -8355,7 +8426,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         c_avail = c_info.get("total_available", 0)
 
         text = (
-            f"⚠️ <b>Confirm Deletion — {c_name}</b>\n"
+            f"⚠️ <b>Confirm Deletion — {html.escape(c_name)}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Are you sure you want to remove <b>{html.escape(c_name)}</b> and delete all <b>{c_avail} numbers</b> from stock?\n\n"
             f"• <i>The country pool will be removed from stock immediately.</i>\n"
@@ -8726,7 +8797,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not u:
             await query.answer("⚠️ User not found in database.", show_alert=True)
             return
-        uname = f"@{u['username']}" if u.get("username") else (u.get("first_name") or "Unknown")
+        uname = f"@{html.escape(u['username'])}" if u.get("username") else html.escape(u.get("first_name") or "Unknown")
         confirm_text = (
             f"⚠️ <b>Confirm User Removal</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8880,7 +8951,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     except Exception:
                         cid = 0
                 c_name = c_map.get(cid) or (f"Country #{cid}" if cid else "Country Stock")
-                t_type = f"🌍 {c_name}"
+                t_type = f"🌍 {html.escape(c_name)}"
             elif b.get("target_type") == "all":
                 t_type = "👥 All Users"
             else:
@@ -8950,68 +9021,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 
     # 12. Admin Select Existing Country for Upload / Removal
-    # 11b. Admin Use Uploaded File Name as Country Name
-    elif data == "upload_use_filename" and user_admin:
-        pending = ADMIN_STATES.get(user.id)
-        if not pending or "numbers" not in pending:
-            await query.edit_message_text("⚠️ <b>Upload session expired. Please upload your .txt file again.</b>", parse_mode=ParseMode.HTML)
-            return
-
-        file_stem = pending.get("file_stem") or os.path.splitext(pending.get("filename", "Numbers"))[0]
-        cid = get_or_create_country(file_stem)
-        pending["country_id"] = cid
-        pending["country_name"] = file_stem
-        pending["step_msg_id"] = query.message.message_id
-        mode = pending.get("mode", "add")
-        numbers = pending["numbers"]
-        filename = pending["filename"]
-
-        if mode == "remove":
-            removed = remove_numbers_from_country(cid, numbers)
-            doc_id = pending.get("doc_msg_id")
-            del ADMIN_STATES[user.id]
-            if doc_id:
-                try:
-                    await context.bot.delete_message(chat_id=user.id, message_id=doc_id)
-                except Exception:
-                    pass
-            if gist_storage.enabled:
-                asyncio.create_task(gist_storage.export_and_sync())
-
-            all_c = get_all_countries_with_stock(only_active=False)
-            c_info = next((x for x in all_c if x["id"] == cid), {})
-            await query.edit_message_text(
-                f"🗑️ <b>Removal Complete!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌍 <b>Country:</b> <code>{file_stem}</code>\n"
-                f"📄 <b>File:</b> <code>{html.escape(filename)}</code>\n"
-                f"🗑️ <b>Removed Numbers:</b> <code>{removed}</code>\n"
-                f"📊 <b>Remaining Stock:</b> <code>{c_info.get('total_available', 0)}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-            return
-
-        # Proceed to Step 2: Choose Stock Pool (Standard or Secret)
-        text = (
-            f"🌍 <b>Country Selected:</b> <code>{file_stem}</code>\n"
-            f"📄 <b>File:</b> <code>{html.escape(filename)}</code> (<b>{len(numbers)}</b> numbers)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 <b>Step 2: Choose Destination Pool:</b>\n\n"
-            f"• <b>Standard:</b> Available for anyone requesting numbers.\n"
-            f"• <b>Secret:</b> Hidden & reserved for Admin + Whitelisted users only.\n\n"
-            f"<i>Where would you like to add these numbers?</i>"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Add to Standard Stock", callback_data=f"apply_stock_std_{cid}")],
-            [InlineKeyboardButton("🔒 Add to Secret Stock", callback_data=f"apply_stock_sec_{cid}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
-        ])
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
     elif data.startswith("sel_upload_c_") and user_admin:
         cid = int(data.split("_")[3])
         pending = ADMIN_STATES.get(user.id)
@@ -9223,9 +9232,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         ADMIN_STATES[user.id] = {"awaiting_rename_country_btn": cid, "prompt_msg_id": query.message.message_id, "prompt_chat_id": query.message.chat_id}
         await query.edit_message_text(
-            f"✏️ <b>Rename Button Name for {c_name}</b>\n"
+            f"✏️ <b>Rename Button Name for {html.escape(c_name)}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Current Button Name: <code>{current_btn}</code>\n\n"
+            f"Current Button Name: <code>{html.escape(current_btn)}</code>\n\n"
             f"Please enter the new button name to display in the bot\n"
             f"(e.g. <code>🇳🇵 Nepal WhatsApp</code> or <code>WhatsApp Nepal</code>):",
             parse_mode=ParseMode.HTML,
@@ -9864,7 +9873,7 @@ def main():
                 for f in os.listdir(STOCKS_DIR):
                     if f.endswith(".db"):
                         try:
-                            with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
                                 cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                         except Exception:
                             pass
@@ -9898,7 +9907,7 @@ def main():
                 for f in os.listdir(STOCKS_DIR):
                     if f.endswith(".db"):
                         try:
-                            with sqlite3.connect(os.path.join(STOCKS_DIR, f)) as cconn:
+                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
                                 cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                         except Exception:
                             pass

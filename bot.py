@@ -4057,12 +4057,25 @@ def format_delivered_numbers(
     num_hint = "Tap any number below to copy" if len(numbers) > 1 else "Tap the number below to copy"
     divider = "━" * 26
 
+    # Try to fetch the configured OTP group link & name for a professional inline hint
+    try:
+        _grp_link = get_group_link()
+        _grp_name = get_group_name()
+    except Exception:
+        _grp_link, _grp_name = "", ""
+
+    if _grp_link and _grp_link.startswith(("http://", "https://", "tg://")):
+        _label = html.escape(_grp_name.strip()) if _grp_name and _grp_name.strip() else "OTP Group"
+        otp_hint = f"📢 <i>No OTP? <a href=\"{_grp_link}\">Check our {_label}</a> — OTPs arrive there first.</i>"
+    else:
+        otp_hint = "📢 <i>No OTP? Check our OTP Group — it may appear there first.</i>"
+
     lines = [
         f"{title_prefix}<b>{html.escape(display_cname)} — {assigned_label}</b>",
         divider,
         f"👉 <b>{num_hint}</b>",
         "⚡ <i>OTP will appear here instantly.</i>",
-        "📢 <i>No OTP? Check our OTP Group.</i>",
+        otp_hint,
     ]
     if available_count is not None and available_count > 0:
         lines.append(f"📦 <b>Pool Stock:</b> {available_count} remaining")
@@ -5176,7 +5189,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
 
     admin_text = (
         f"👑 <b>{current_bot_name} — Admin Dashboard</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Engine Status:</b> 100% Online ✅\n"
         f"• <b>Bot Name:</b> {current_bot_name}\n"
         f"• <b>Handover Mode:</b> Zero-Restart Handover Active 🔄\n"
@@ -5191,7 +5204,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>OTPs Today:</b> {today_otps} received\n"
         f"• <b>28h OTP Records:</b> {total_28h_otps} records\n"
         f"• <b>Cloud Storage:</b> {'Connected ☁️' if gist_storage.enabled else 'Local SQLite'}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Live Inventory:</b>\n"
         f"• <b>Standard:</b> {stats['total_std_available']} available\n"
         f"• <b>Secret Pool:</b> {stats['total_sec_available']} available 🔒\n"
@@ -5200,7 +5213,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
         f"• <b>Registered Users:</b> {stats['total_users']} users\n"
         f"• <b>Secret Whitelisted:</b> {stats['total_secret_users']} users\n"
         f"• <b>Custom Buttons:</b> {link_display}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
     keyboard = InlineKeyboardMarkup([

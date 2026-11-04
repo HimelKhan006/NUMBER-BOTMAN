@@ -2623,7 +2623,8 @@ def parse_message_timestamp(time_str: str) -> float:
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
 COLLAPSED_SMS_HINT = "<b>✦\u00a0\u00a0TAP TO READ SMS..</b>"
 CARD_DIVIDER = "━" * 20
-QUOTE_DIVIDER = "━" * 18
+QUOTE_DIVIDER = "━" * 16
+CARD_WIDTH_PAD = "\u2800" * 3
 
 def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 20) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
@@ -3204,23 +3205,24 @@ def format_inbox_otp_message(
         else:
             c_flag = "🌐"
 
-    if iso_clean and iso_clean != "XX":
-        country_part = f"({iso_clean} {c_flag})"
-    elif c_name and c_name != "Global":
-        country_part = f"({html.escape(c_name)} {c_flag})"
-    else:
-        country_part = f"({c_flag})"
+    iso_fixed = iso_clean if (iso_clean and iso_clean != "XX" and len(iso_clean) == 2) else "GL"
+    country_part = f"({html.escape(iso_fixed)} {c_flag})"
 
-    svc_display = html.escape(service or "SMS Service")
+    raw_svc = re.sub(r"\s+", " ", (service or "SMS Service")).strip()
+    if len(raw_svc) > 15:
+        raw_svc = raw_svc[:14].rstrip() + "."
+    svc_display = html.escape(raw_svc)
     lines = [
-        f"📩 <b>NEW SMS • {country_part}</b>",
+        f"📩 <b>NEW SMS • {country_part}</b>{CARD_WIDTH_PAD}",
         "",
         f"<b>✦\u00a0\u00a0{svc_display}</b>",
         f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
-        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=22)
+        clean_msg = raw_message.strip()
+        display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
+        styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=20)
         lines.append("")
         lines.append(
             f"<blockquote expandable>⠀\n"
@@ -6133,7 +6135,7 @@ async def trigger_proactive_handover(manual_restart: bool = False) -> bool:
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
                     try:
-                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
+                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f), timeout=30.0)) as cconn:
                             cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                     except Exception:
                         pass
@@ -6202,7 +6204,7 @@ async def perform_zero_restart_handover(target_message=None, manual_restart: boo
             for f in os.listdir(STOCKS_DIR):
                 if f.endswith(".db"):
                     try:
-                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
+                        with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f), timeout=30.0)) as cconn:
                             cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                     except Exception:
                         pass
@@ -10150,7 +10152,7 @@ def main():
                 for f in os.listdir(STOCKS_DIR):
                     if f.endswith(".db"):
                         try:
-                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
+                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f), timeout=30.0)) as cconn:
                                 cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                         except Exception:
                             pass
@@ -10184,7 +10186,7 @@ def main():
                 for f in os.listdir(STOCKS_DIR):
                     if f.endswith(".db"):
                         try:
-                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f))) as cconn:
+                            with ClosingConnection(sqlite3.connect(os.path.join(STOCKS_DIR, f), timeout=30.0)) as cconn:
                                 cconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                         except Exception:
                             pass

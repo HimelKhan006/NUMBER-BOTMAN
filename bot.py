@@ -3232,6 +3232,8 @@ def format_inbox_otp_message(
             f"💬 <b>FULL SMS</b>\n"
             f"{styled_sms}</blockquote>"
         )
+    else:
+        lines.append("⠀")
 
     return "\n".join(lines)
 

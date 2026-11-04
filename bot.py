@@ -2623,10 +2623,10 @@ def parse_message_timestamp(time_str: str) -> float:
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
 COLLAPSED_SMS_HINT = "<b>✦\u00a0\u00a0TAP TO READ SMS..</b>"
 CARD_DIVIDER = "━" * 20
-QUOTE_DIVIDER = "━" * 16
-CARD_WIDTH_PAD = "\u2800" * 3
+QUOTE_DIVIDER = "━" * 14
+CARD_WIDTH_PAD = "\u2800" * 7
 
-def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 20) -> str:
+def style_sms_with_copyable_otp(msg: str, otp: str, width: int = 18) -> str:
     """Wraps SMS lines cleanly and highlights ONLY the OTP code inside a copyable <code> tag."""
     if not msg:
         return ""
@@ -3213,7 +3213,7 @@ def format_inbox_otp_message(
         raw_svc = raw_svc[:14].rstrip() + "."
     svc_display = html.escape(raw_svc)
     lines = [
-        f"📩 <b>NEW SMS • {country_part}</b>{CARD_WIDTH_PAD}",
+        f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
         "",
         f"<b>✦\u00a0\u00a0{svc_display}</b>",
         f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
@@ -3222,7 +3222,7 @@ def format_inbox_otp_message(
     if show_full_sms and raw_message:
         clean_msg = raw_message.strip()
         display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
-        styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=20)
+        styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
         lines.append("")
         lines.append(
             f"<blockquote expandable>⠀\n"

@@ -2621,7 +2621,7 @@ def parse_message_timestamp(time_str: str) -> float:
         return 0.0
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
-COLLAPSED_SMS_HINT = "<b>Tap to read SMS...</b>"
+COLLAPSED_SMS_HINT = "<b>✦\u00a0\u00a0TAP TO READ SMS..</b>"
 CARD_DIVIDER = "━" * 20
 QUOTE_DIVIDER = "━" * 18
 
@@ -3213,20 +3213,21 @@ def format_inbox_otp_message(
 
     svc_display = html.escape(service or "SMS Service")
     lines = [
-        "📩 <b>New SMS Received</b>",
-        f"💬 <b>{svc_display}</b> {country_part}",
-        f"📱 <b>{html.escape(num_display)}</b>",
+        f"📩 <b>NEW SMS • {country_part}</b>",
+        "",
+        f"<b>✦\u00a0\u00a0{svc_display}</b>",
+        f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
     ]
 
     if show_full_sms and raw_message:
-        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=28)
+        styled_sms = style_sms_with_copyable_otp(raw_message.strip(), otp_code, width=22)
         lines.append("")
         lines.append(
             f"<blockquote expandable>⠀\n"
             f"{COLLAPSED_SMS_HINT}\n"
             f"⠀\n"
-            f"{CARD_DIVIDER}\n"
-            f"💬 <b>SMS Content:</b>\n"
+            f"{QUOTE_DIVIDER}\n"
+            f"💬 <b>FULL SMS</b>\n"
             f"{styled_sms}</blockquote>"
         )
 
@@ -5389,7 +5390,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         f"• <b>Short (Without View Full SMS)</b> {short_active}\n"
         "  Clean, compact card with Service, Country Flag & Name, Unmasked Number & Copy OTP button. No expandable blockquote.\n\n"
         f"• <b>Long (With View Full SMS)</b> {long_active}\n"
-        "  Full card with Service, Country Flag & Name, Unmasked Number, Copy OTP button, and expandable '📩 View Full SMS' blockquote.\n"
+        "  Full card with Service, Country Flag & Name, Unmasked Number, Copy OTP button, and expandable '💬 FULL SMS' blockquote.\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."

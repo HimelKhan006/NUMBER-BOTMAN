@@ -4367,6 +4367,15 @@ async def send_startup_announcement(application: Application):
 
     # A git push event ALWAYS alerts (any push = update deployed)
     is_git_push = (STARTUP_TYPE == "push")
+    if is_git_push:
+        manual_restart = False
+        _manual_restart = False
+        set_bot_setting("manual_restart", "0")
+        try:
+            if os.path.exists(".manual_restart"):
+                os.remove(".manual_restart")
+        except Exception:
+            pass
     # A new update if commit changed from last notified or this is a fresh push
     is_commit_change = bool(current_commit and last_notified_commit and current_commit != last_notified_commit)
     is_new_update = is_git_push or is_commit_change or manual_restart
@@ -4407,10 +4416,10 @@ async def send_startup_announcement(application: Application):
     bot_name = get_bot_name()
     time_str, date_str = format_bangladesh_12h()
 
-    if manual_restart:
-        trigger_label = "🔄 <b>Admin Manual Restart</b>"
-    elif is_git_push:
+    if is_git_push:
         trigger_label = "🚀 <b>New Update Deployed</b>"
+    elif manual_restart:
+        trigger_label = "🔄 <b>Admin Manual Restart</b>"
     else:
         trigger_label = "📦 <b>Code Update Detected</b>"
 

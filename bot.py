@@ -3243,11 +3243,9 @@ def format_inbox_otp_message(
 
     if active_mode in ("classic_short", "old_short", "classic"):
         lines = [
-            f"📩 <b>NEW SMS{CARD_WIDTH_PAD_CLASSIC}</b>",
-            "",
-            f"<b>✦\u00a0\u00a0{svc_display} {country_part}</b>",
+            f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
+            f"<b>✦\u00a0\u00a0{svc_display}</b>",
             f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
-            "⠀"
         ]
         return "\n".join(lines)
 
@@ -5430,7 +5428,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     if curr_fmt == "short":
         active_label = "Short ⚡ (Header Country)"
     elif curr_fmt == "classic_short":
-        active_label = "Classic Short ⏳ (Service Country)"
+        active_label = "Classic Short ⏳ (Compact, No Extra Space)"
     else:
         active_label = "Long 📜 (With View Full SMS)"
 
@@ -5440,11 +5438,11 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         f"🟢 <b>Active Mode:</b>   {active_label}\n\n"
         "<b>Available Modes:</b>\n"
         f"• <b>Short (Header Country)</b> {short_active}\n"
-        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, Copy OTP button.\n\n"
+        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, clean spacing.\n\n"
         f"• <b>Long (With View Full SMS)</b> {long_active}\n"
         "  Full card with expandable '💬 FULL SMS' blockquote.\n\n"
-        f"• <b>Classic Short (Service Country)</b> {classic_active}\n"
-        "  Previous layout with Service + Country on line 2, styled with new ✦ icon.\n"
+        f"• <b>Classic Short (Compact)</b> {classic_active}\n"
+        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, without extra spacing.\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."
@@ -5465,7 +5463,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>📺 Live Preview — Short (Header Country):</b>\n\n"
             f"{preview_body}\n\n"
-            f"<i>💡 Clean inbox card without expandable blockquote. Tap button below to test copying:</i>"
+            f"<i>💡 Clean card with spacing. Tap button below to test copying:</i>"
         )
     elif preview_mode == "classic_short":
         preview_body = format_inbox_otp_message(
@@ -5480,9 +5478,9 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         )
         msg += (
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>📺 Live Preview — Classic Short (Service Country):</b>\n\n"
+            f"<b>📺 Live Preview — Classic Short (Compact, No Extra Space):</b>\n\n"
             f"{preview_body}\n\n"
-            f"<i>💡 Previous layout with Service + Country line, styled with new ✦ icon. Tap button below to test copying:</i>"
+            f"<i>💡 Compact layout without extra blank spaces. Tap button below to test copying:</i>"
         )
     elif preview_mode == "long":
         preview_body = format_inbox_otp_message(
@@ -5514,11 +5512,15 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     kb.append([
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'short' else ''}⚡ Short", callback_data="fmt_set_short"),
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'long' else ''}📜 Long", callback_data="fmt_set_long"),
+    ])
+    kb.append([
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'classic_short' else ''}⏳ Classic Short", callback_data="fmt_set_classic_short"),
     ])
     kb.append([
         InlineKeyboardButton("📺 Preview Short", callback_data="fmt_preview_short"),
         InlineKeyboardButton("📺 Preview Long", callback_data="fmt_preview_long"),
+    ])
+    kb.append([
         InlineKeyboardButton("📺 Preview Classic", callback_data="fmt_preview_classic_short"),
     ])
     kb.append([
@@ -5657,7 +5659,7 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     if curr_fmt == "long":
         full_sms_status = "📜 Long (With Full SMS)"
     elif curr_fmt == "classic_short":
-        full_sms_status = "⏳ Classic Short (Service Country)"
+        full_sms_status = "⏳ Classic Short (Compact)"
     else:
         full_sms_status = "⚡ Short (Header Country)"
     today_otps, total_28h_otps, _ = get_otp_stats(max_age_hours=28)

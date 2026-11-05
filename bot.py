@@ -4355,7 +4355,9 @@ async def send_startup_announcement(application: Application):
 
     current_commit = get_current_commit()
     last_notified_commit = get_bot_setting("last_notified_commit", "")
-    manual_restart = (get_bot_setting("manual_restart", "0") == "1") or _manual_restart
+    file_manual = os.path.exists(".manual_restart")
+    db_manual = (get_bot_setting("manual_restart", "0") == "1")
+    manual_restart = bool(_manual_restart or file_manual or db_manual)
     admin_alert_enabled = os.getenv("ADMIN_STARTUP_ALERT", "false").strip().lower() in ("true", "1", "yes")
 
     # Scheduled safety-net triggers and routine session handovers must NEVER announce unless manually restarted
@@ -4405,7 +4407,7 @@ async def send_startup_announcement(application: Application):
     bot_name = get_bot_name()
     time_str, date_str = format_bangladesh_12h()
 
-    if manual_restart and not is_git_push and not is_commit_change:
+    if manual_restart:
         trigger_label = "🔄 <b>Admin Manual Restart</b>"
     elif is_git_push:
         trigger_label = "🚀 <b>New Update Deployed</b>"

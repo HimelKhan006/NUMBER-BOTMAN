@@ -3263,7 +3263,6 @@ def format_inbox_otp_message(
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
             styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
-            lines.append("")
             lines.append(
                 f"<blockquote expandable>⠀\n"
                 f"{COLLAPSED_SMS_HINT}\n"

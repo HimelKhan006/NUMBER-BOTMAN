@@ -130,7 +130,7 @@ except ImportError:
     CopyTextButton = None
 
 from telegram.constants import ParseMode, ChatType
-from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict, BadRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict, BadRequest, InvalidToken
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -10069,6 +10069,20 @@ def main():
         send_telegram_alert("❌ CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
         sys.exit(1)
 
+    # Validate token status with Telegram API
+    try:
+        r = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8.0)
+        if r.status_code == 401:
+            logger.critical("==========================================================================")
+            logger.critical("❌ CRITICAL: TELEGRAM_BOT_TOKEN is INVALID or REVOKED (HTTP 401 Unauthorized)!")
+            logger.critical("👉 Please generate a new bot token from @BotFather in Telegram and update TELEGRAM_BOT_TOKEN.")
+            logger.critical("==========================================================================")
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.warning(f"Initial Telegram getMe verification notice (proceeding): {e}")
+
 
     req = HTTPXRequest(
         connect_timeout=15.0,
@@ -10290,9 +10304,17 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped cleanly.")
-        sys.exit(0)
+    except (KeyboardInterrupt, SystemExit) as se:
+        code = se.code if isinstance(se, SystemExit) and se.code is not None else 0
+        if code == 0:
+            logger.info("Bot stopped cleanly.")
+        else:
+            logger.warning(f"Bot stopped with exit code {code}.")
+        sys.exit(code)
+    except InvalidToken as it:
+        logger.critical(f"❌ FATAL: Telegram Bot Token is invalid or revoked: {it}")
+        logger.critical("👉 Update TELEGRAM_BOT_TOKEN in GitHub Secrets / .env with a valid token from @BotFather.")
+        sys.exit(1)
     except Exception as e:
         logger.critical(f"UNHANDLED EXCEPTION in bot main: {e}", exc_info=True)
         sys.exit(2)

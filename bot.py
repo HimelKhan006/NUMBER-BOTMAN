@@ -2123,8 +2123,10 @@ def set_inbox_otp_enabled(enabled: bool):
             pass
 
 def get_sms_format() -> str:
-    """Returns the active SMS delivery format: 'long', 'short', or 'classic_short'."""
+    """Returns the active SMS delivery format: 'long', 'short', 'classic_short', or 'classic_long'."""
     val = get_bot_setting("sms_format", "long").strip().lower()
+    if val in ("classic_long", "old_long"):
+        return "classic_long"
     if val in ("classic_short", "old_short", "classic"):
         return "classic_short"
     if val in ("short", "clean", "off", "0", "false"):
@@ -2132,9 +2134,11 @@ def get_sms_format() -> str:
     return "long"
 
 def set_sms_format(fmt: str):
-    """Saves SMS delivery format ('long', 'short', or 'classic_short') permanently to SQLite bot_settings."""
+    """Saves SMS delivery format ('long', 'short', 'classic_short', or 'classic_long') permanently to SQLite bot_settings."""
     val = str(fmt).strip().lower()
-    if val in ("classic_short", "old_short", "classic"):
+    if val in ("classic_long", "old_long"):
+        target = "classic_long"
+    elif val in ("classic_short", "old_short", "classic"):
         target = "classic_short"
     elif val in ("short", "clean", "off", "0", "false"):
         target = "short"
@@ -2148,8 +2152,8 @@ def set_sms_format(fmt: str):
             pass
 
 def is_view_full_sms_enabled() -> bool:
-    """Returns True if View Full SMS (expandable blockquote) is enabled (long format), False if short or classic_short."""
-    return get_sms_format() == "long"
+    """Returns True if View Full SMS (expandable blockquote) is enabled (long or classic_long format), False if short or classic_short."""
+    return get_sms_format() in ("long", "classic_long")
 
 def set_view_full_sms_enabled(enabled: bool):
     """Backwards-compatible helper: saves View Full SMS toggle ('long' or 'short')."""
@@ -3232,7 +3236,7 @@ def format_inbox_otp_message(
         raw_svc = raw_svc[:14].rstrip() + "."
     svc_display = html.escape(raw_svc)
 
-    # Resolve active format mode: "short", "long", or "classic_short"
+    # Resolve active format mode: "short", "long", "classic_short", or "classic_long"
     active_mode = "long"
     if sms_format:
         active_mode = str(sms_format).lower().strip()
@@ -3247,6 +3251,27 @@ def format_inbox_otp_message(
             f"<b>✦\u00a0\u00a0{svc_display}</b>",
             f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
         ]
+        return "\n".join(lines)
+
+    if active_mode in ("classic_long", "old_long"):
+        lines = [
+            f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
+            f"<b>✦\u00a0\u00a0{svc_display}</b>",
+            f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
+        ]
+        if raw_message:
+            clean_msg = raw_message.strip()
+            display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
+            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
+            lines.append("")
+            lines.append(
+                f"<blockquote expandable>⠀\n"
+                f"{COLLAPSED_SMS_HINT}\n"
+                f"⠀\n"
+                f"{QUOTE_DIVIDER}\n"
+                f"💬 <b>FULL SMS</b>\n"
+                f"{styled_sms}</blockquote>"
+            )
         return "\n".join(lines)
 
     lines = [
@@ -3319,7 +3344,7 @@ def format_group_otp_message(
     clean_msg = raw_message.strip()
 
     quote_block = ""
-    if sms_format != "short" and clean_msg:
+    if sms_format not in ("short", "classic_short") and clean_msg:
         styled_sms = style_sms_with_copyable_otp(clean_msg, otp_code, width=28)
         quote_block = (
             f"\n\n{EXPANDABLE_SMS_LABEL}\n"
@@ -3343,7 +3368,7 @@ def format_group_otp_message(
             f"{quote_block}"
         )
     elif clean_msg:
-        if sms_format == "short":
+        if sms_format in ("short", "classic_short"):
             full_text = (
                 f"🎟️ <b>VERIFICATION PASS</b>\n"
                 f"{CARD_DIVIDER}\n"
@@ -5438,11 +5463,14 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     short_active = "✅ (Active)" if curr_fmt == "short" else "⚪"
     long_active  = "✅ (Active)" if curr_fmt == "long" else "⚪"
     classic_active = "✅ (Active)" if curr_fmt == "classic_short" else "⚪"
+    classic_long_active = "✅ (Active)" if curr_fmt == "classic_long" else "⚪"
 
     if curr_fmt == "short":
         active_label = "Short ⚡ (Header Country)"
     elif curr_fmt == "classic_short":
         active_label = "Classic Short ⏳ (Compact, No Extra Space)"
+    elif curr_fmt == "classic_long":
+        active_label = "Classic Long ⏳ (Compact + Full SMS)"
     else:
         active_label = "Long 📜 (With View Full SMS)"
 
@@ -5456,7 +5484,9 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         f"• <b>Long (With View Full SMS)</b> {long_active}\n"
         "  Full card with expandable '💬 FULL SMS' blockquote.\n\n"
         f"• <b>Classic Short (Compact)</b> {classic_active}\n"
-        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, without extra spacing.\n"
+        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, without extra spacing.\n\n"
+        f"• <b>Classic Long (Compact + Full SMS)</b> {classic_long_active}\n"
+        "  Compact layout with ✦ marks and expandable '💬 FULL SMS' blockquote.\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."
@@ -5496,6 +5526,23 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
             f"{preview_body}\n\n"
             f"<i>💡 Compact layout without extra blank spaces. Tap button below to test copying:</i>"
         )
+    elif preview_mode == "classic_long":
+        preview_body = format_inbox_otp_message(
+            service="WhatsApp",
+            country_name="Vietnam",
+            country_flag="🇻🇳",
+            unmasked_number="+84987938835",
+            otp_code=otp_sample,
+            raw_message=sample_sms,
+            show_full_sms="classic_long",
+            country_iso="VN",
+        )
+        msg += (
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📺 Live Preview — Classic Long (Compact + Full SMS):</b>\n\n"
+            f"{preview_body}\n\n"
+            f"<i>💡 Compact layout with expandable blockquote. Tap button below to test copying:</i>"
+        )
     elif preview_mode == "long":
         preview_body = format_inbox_otp_message(
             service="WhatsApp",
@@ -5517,7 +5564,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         msg += "\n<i>Choose an option below to set the format or preview it live:</i>"
 
     kb = []
-    if preview_mode in ("short", "long", "classic_short"):
+    if preview_mode in ("short", "long", "classic_short", "classic_long"):
         if CopyTextButton:
             kb.append([InlineKeyboardButton(otp_sample, copy_text=CopyTextButton(text=otp_sample))])
         else:
@@ -5529,13 +5576,15 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
     ])
     kb.append([
         InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'classic_short' else ''}⏳ Classic Short", callback_data="fmt_set_classic_short"),
+        InlineKeyboardButton(f"{'✅ ' if curr_fmt == 'classic_long' else ''}⏳ Classic Long", callback_data="fmt_set_classic_long"),
     ])
     kb.append([
         InlineKeyboardButton("📺 Preview Short", callback_data="fmt_preview_short"),
         InlineKeyboardButton("📺 Preview Long", callback_data="fmt_preview_long"),
     ])
     kb.append([
-        InlineKeyboardButton("📺 Preview Classic", callback_data="fmt_preview_classic_short"),
+        InlineKeyboardButton("📺 Classic Short", callback_data="fmt_preview_classic_short"),
+        InlineKeyboardButton("📺 Classic Long", callback_data="fmt_preview_classic_long"),
     ])
     kb.append([
         InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")
@@ -5574,9 +5623,23 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "✅ <b>SMS Delivery Format Updated!</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "• <b>Active Mode:</b> Classic Short ⏳ (Service Country)\n"
+                    "• <b>Active Mode:</b> Classic Short ⏳ (Compact, No Extra Space)\n"
                     "• <b>Icons:</b> Aligned ✦ mark on Service and Number\n"
                     "• <b>Expandable Blockquote:</b> Removed",
+                    parse_mode=ParseMode.HTML
+                )
+            return
+        elif arg in ("classic_long", "old_long"):
+            set_sms_format("classic_long")
+            if gist_storage.enabled:
+                gist_storage.mark_dirty()
+            if update.message:
+                await update.message.reply_text(
+                    "✅ <b>SMS Delivery Format Updated!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "• <b>Active Mode:</b> Classic Long ⏳ (Compact + Full SMS)\n"
+                    "• <b>Icons:</b> Aligned ✦ mark on Service and Number\n"
+                    "• <b>Expandable Blockquote:</b> Active",
                     parse_mode=ParseMode.HTML
                 )
             return
@@ -5672,6 +5735,8 @@ def build_admin_dashboard(user_id: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     curr_fmt = get_sms_format()
     if curr_fmt == "long":
         full_sms_status = "📜 Long (With Full SMS)"
+    elif curr_fmt == "classic_long":
+        full_sms_status = "⏳ Classic Long (Compact + Full SMS)"
     elif curr_fmt == "classic_short":
         full_sms_status = "⏳ Classic Short (Compact)"
     else:
@@ -8303,7 +8368,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             alert_msg = "⚡ SMS format set to Short (Header Country)"
         elif curr == "short":
             new_fmt = "classic_short"
-            alert_msg = "⏳ SMS format set to Classic Short (Service Country)"
+            alert_msg = "⏳ SMS format set to Classic Short (Compact)"
+        elif curr == "classic_short":
+            new_fmt = "classic_long"
+            alert_msg = "⏳ SMS format set to Classic Long (Compact + Full SMS)"
         else:
             new_fmt = "long"
             alert_msg = "📜 SMS format set to Long (With Full SMS)"
@@ -8340,8 +8408,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         set_sms_format("classic_short")
         if gist_storage.enabled:
             gist_storage.mark_dirty()
-        await query.answer("SMS Format set to Classic Short ⏳ (Service Country)")
+        await query.answer("SMS Format set to Classic Short ⏳ (Compact, No Extra Space)")
         text_view, markup = build_sms_format_view(preview_mode="classic_short")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_set_classic_long" and user_admin:
+        set_sms_format("classic_long")
+        if gist_storage.enabled:
+            gist_storage.mark_dirty()
+        await query.answer("SMS Format set to Classic Long ⏳ (Compact + Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="classic_long")
         try:
             await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception:
@@ -8367,8 +8446,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             pass
 
     elif data == "fmt_preview_classic_short" and user_admin:
-        await query.answer("Previewing Classic Short Format (Service Country)")
+        await query.answer("Previewing Classic Short Format (Compact, No Extra Space)")
         text_view, markup = build_sms_format_view(preview_mode="classic_short")
+        try:
+            await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+    elif data == "fmt_preview_classic_long" and user_admin:
+        await query.answer("Previewing Classic Long Format (Compact + Full SMS)")
+        text_view, markup = build_sms_format_view(preview_mode="classic_long")
         try:
             await query.edit_message_text(text_view, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception:

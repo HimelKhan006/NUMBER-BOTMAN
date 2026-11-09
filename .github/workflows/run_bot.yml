@@ -266,18 +266,16 @@ jobs:
           OTPMAN2_API_KEY: ${{ secrets.OTPMAN2_API_KEY }}
           OTPMAN2_BASE_URL: ${{ secrets.OTPMAN2_BASE_URL }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN || secrets.PAT || secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
-          PAT: ${{ secrets.PAT || '' }}
-          GH_TOKEN: ${{ github.token }}
           GIST_ID: ${{ secrets.GIST_ID }}
           DB_FILE: ${{ github.workspace }}/bot4_database.db
           STARTUP_TYPE: ${{ github.event_name }}
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          PAT: ${{ secrets.PAT || '' }}
           IS_HANDOVER: ${{ github.event.inputs.is_handover || 'false' }}
           IS_MANUAL_RESTART: ${{ github.event.inputs.is_manual_restart || 'false' }}
-          GH_TOKEN: ${{ github.token }}
-          PAT: ${{ secrets.PAT }}
           SESSION_TIMEOUT: "19500"
           POLL_INTERVAL_SECONDS: ${{ secrets.POLL_INTERVAL_SECONDS || '6.0' }}
           PYTHONUNBUFFERED: "1"

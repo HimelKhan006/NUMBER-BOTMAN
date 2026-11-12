@@ -3413,7 +3413,8 @@ def format_inbox_otp_message(
         active_mode = "short"
 
     if active_mode in ("glass_short", "glass_long", "glass", "direct_short", "direct_long", "direct"):
-        header_line = f"📩\u00a0\u00a0<b>{html.escape(iso_fixed)} {c_flag}\u00a0\u00a0✦\u00a0\u00a0{svc_display}</b>{CARD_WIDTH_PAD}"
+        fixed_pad = "\u2800" * max(3, 25 - len(f"{iso_fixed} 00  ✦  {raw_svc}"))
+        header_line = f"📩\u00a0\u00a0<b>{html.escape(iso_fixed)} {c_flag}\u00a0\u00a0✦\u00a0\u00a0{svc_display}</b>{fixed_pad}"
         lines = [
             header_line,
             "",
@@ -3422,11 +3423,13 @@ def format_inbox_otp_message(
         if active_mode in ("glass_long", "glass", "direct_long", "direct") and raw_message:
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
-            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=26)
+            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=20)
             compact_sms = "\n".join(ln for ln in styled_sms.splitlines() if ln.strip())
             lines.append("")
-            lines.append("<b>▸\u00a0\u00a0💬 Full SMS</b>")
-            lines.append(compact_sms)
+            lines.append(
+                f"<blockquote>💬 <b>FULL SMS</b>\n"
+                f"{compact_sms}</blockquote>"
+            )
         return "\n".join(lines)
 
     if active_mode in ("classic_short", "old_short", "classic"):

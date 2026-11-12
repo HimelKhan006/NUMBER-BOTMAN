@@ -3427,7 +3427,7 @@ def format_inbox_otp_message(
             styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=24)
             compact_sms = "\n".join(ln for ln in styled_sms.splitlines() if ln.strip())
             lines.append("")
-            lines.append(compact_sms)
+            lines.append(f"💬 <b>Full SMS</b>\n{compact_sms}")
         return "\n".join(lines)
 
     if active_mode in ("classic_short", "old_short", "classic"):

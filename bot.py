@@ -3351,6 +3351,29 @@ def format_phone_for_card(raw_num: str) -> str:
         chunks.append(digits[i:i+chunk_size])
     return "+" + "\u200c".join(chunks)
 
+def build_fixed_width_direct_header(source_raw: str, iso_fixed: str, flag: str, target_units: float = 25.5) -> str:
+    """
+    Builds '📩 <b>{Service} • {ISO} {Flag}</b>' padded with Braille spaces inside <b> and a
+    trailing ZWNJ (\u200c) so Telegram never trims trailing spacing and every card keeps a fixed width.
+    """
+    vw = 2.0
+    plain_head = f"{source_raw} • {iso_fixed} "
+    for ch in plain_head:
+        if ch in "ijlItrf1!|.,:;• ":
+            vw += 0.62
+        elif ch in "WMGOQ@#%&":
+            vw += 1.32
+        elif ch.isupper() or ch.isdigit():
+            vw += 1.08
+        elif ord(ch) > 127:
+            vw += 1.6
+        else:
+            vw += 0.92
+    vw += 2.0
+    pad_count = max(6, round((target_units - vw) / 0.55))
+    fixed_pad = ("\u2800" * pad_count) + "\u200c"
+    return f"📩 <b>{html.escape(source_raw)} • {html.escape(iso_fixed)} {flag}{fixed_pad}</b>"
+
 def format_inbox_otp_message(
     service: str,
     country_name: str,
@@ -3413,9 +3436,7 @@ def format_inbox_otp_message(
         active_mode = "short"
 
     if active_mode in ("glass_short", "glass_long", "glass", "direct_short", "direct_long", "direct"):
-        header_raw_len = len(f"📩 {raw_svc} • {iso_fixed} 00")
-        fixed_pad = "\u2800" * max(4, 28 - header_raw_len)
-        header_line = f"📩 <b>{svc_display} • {html.escape(iso_fixed)} {c_flag}</b>{fixed_pad}"
+        header_line = build_fixed_width_direct_header(raw_svc, iso_fixed, c_flag)
         lines = [
             header_line,
             "",
@@ -3424,7 +3445,7 @@ def format_inbox_otp_message(
         if active_mode in ("glass_long", "glass", "direct_long", "direct") and raw_message:
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
-            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=24)
+            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=26)
             compact_sms = "\n".join(ln for ln in styled_sms.splitlines() if ln.strip())
             lines.append("")
             lines.append(f"💬 <b>Full SMS</b>\n{compact_sms}")

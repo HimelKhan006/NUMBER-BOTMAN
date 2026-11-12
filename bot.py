@@ -3413,8 +3413,8 @@ def format_inbox_otp_message(
         active_mode = "short"
 
     if active_mode in ("glass_short", "glass_long", "glass", "direct_short", "direct_long", "direct"):
-        fixed_pad = "\u2800" * max(3, 25 - len(f"{iso_fixed} 00  ✦  {raw_svc}"))
-        header_line = f"📩\u00a0\u00a0<b>{html.escape(iso_fixed)} {c_flag}\u00a0\u00a0✦\u00a0\u00a0{svc_display}</b>{fixed_pad}"
+        fixed_pad = "\u2800" * max(3, 25 - len(f"{raw_svc} • {iso_fixed} 00"))
+        header_line = f"📩 <b>{svc_display} • {html.escape(iso_fixed)} {c_flag}</b>{fixed_pad}"
         lines = [
             header_line,
             "",
@@ -5670,9 +5670,9 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         f"• <b>Classic Long (Compact + Full SMS)</b> {classic_long_active}\n"
         "  Compact layout with ✦ marks and expandable '💬 FULL SMS' blockquote.\n\n"
         f"• <b>Direct Short (Signal Ticket)</b> {glass_short_active}\n"
-        "  Top bar (📩 VN 🇻🇳 ✦ WhatsApp), ✦ Number below, fixed compact card size.\n\n"
+        "  Top bar (📩 WhatsApp • VN 🇻🇳), ✦ Number below, fixed compact card size.\n\n"
         f"• <b>Direct Full (Open SMS Card)</b> {glass_long_active}\n"
-        "  Top bar + ✦ Number + SMS shown directly without any expandable quote.\n"
+        "  Top bar + ✦ Number + open SMS quote shown directly on card.\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."

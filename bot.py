@@ -3351,10 +3351,11 @@ def format_phone_for_card(raw_num: str) -> str:
         chunks.append(digits[i:i+chunk_size])
     return "+" + "\u200c".join(chunks)
 
-def build_fixed_width_direct_header(source_raw: str, iso_fixed: str, flag: str, target_units: float = 25.5) -> str:
+def build_fixed_width_direct_header(source_raw: str, iso_fixed: str, flag: str, target_units: float = 27.5) -> str:
     """
-    Builds '📩 <b>{Service} • {ISO} {Flag}</b>' padded with Braille spaces inside <b> and a
-    trailing ZWNJ (\u200c) so Telegram never trims trailing spacing and every card keeps a fixed width.
+    Builds '📩 <b>{Service} • {ISO} {Flag}</b>' padded with Word-Joined Braille spaces
+    inside <b> and a trailing ZWNJ (\u200c) so mobile/desktop Telegram never wraps or trims
+    trailing spacing and every card keeps a fixed width.
     """
     vw = 2.0
     plain_head = f"{source_raw} • {iso_fixed} "
@@ -3370,8 +3371,8 @@ def build_fixed_width_direct_header(source_raw: str, iso_fixed: str, flag: str, 
         else:
             vw += 0.92
     vw += 2.0
-    pad_count = max(6, round((target_units - vw) / 0.55))
-    fixed_pad = ("\u2800" * pad_count) + "\u200c"
+    pad_count = max(10, round((target_units - vw) / 0.55))
+    fixed_pad = ("\u2060\u2800" * pad_count) + "\u200c"
     return f"📩 <b>{html.escape(source_raw)} • {html.escape(iso_fixed)} {flag}{fixed_pad}</b>"
 
 def format_inbox_otp_message(

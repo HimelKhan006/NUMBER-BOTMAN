@@ -2805,7 +2805,7 @@ def parse_message_timestamp(time_str: str) -> float:
         return 0.0
 
 EXPANDABLE_SMS_LABEL = "📩 <b>View Full SMS:</b>"
-COLLAPSED_SMS_HINT = "<b>✦\u00a0\u00a0TAP TO READ SMS..</b>"
+COLLAPSED_SMS_HINT = "<b>▾\u00a0\u00a0SMS Content</b>"
 CARD_DIVIDER = "━" * 20
 QUOTE_DIVIDER = "━" * 14
 CARD_WIDTH_PAD = "\u2800" * 7
@@ -3403,39 +3403,34 @@ def format_inbox_otp_message(
     elif not show_full_sms:
         active_mode = "short"
 
+    header_line = f"📩 <b>{svc_display}\u00a0\u00a0•\u00a0\u00a0{html.escape(iso_fixed)} {c_flag}{CARD_WIDTH_PAD}</b>"
+
     if active_mode in ("classic_short", "old_short", "classic"):
         lines = [
-            f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
-            f"<b>✦\u00a0\u00a0{svc_display}</b>",
-            f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
+            header_line,
+            f"<b>{html.escape(num_display)}</b>",
         ]
         return "\n".join(lines)
 
     if active_mode in ("classic_long", "old_long"):
         lines = [
-            f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
-            f"<b>✦\u00a0\u00a0{svc_display}</b>",
-            f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
+            header_line,
+            f"<b>{html.escape(num_display)}</b>",
         ]
         if raw_message:
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
             styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
             lines.append(
-                f"<blockquote expandable>⠀\n"
-                f"{COLLAPSED_SMS_HINT}\n"
-                f"⠀\n"
-                f"{QUOTE_DIVIDER}\n"
-                f"💬 <b>FULL SMS</b>\n"
+                f"<blockquote expandable>{COLLAPSED_SMS_HINT}\n"
                 f"{styled_sms}</blockquote>"
             )
         return "\n".join(lines)
 
     lines = [
-        f"📩 <b>NEW SMS • {country_part}{CARD_WIDTH_PAD}</b>",
+        header_line,
         "",
-        f"<b>✦\u00a0\u00a0{svc_display}</b>",
-        f"<b>✦\u00a0\u00a0{html.escape(num_display)}</b>",
+        f"<b>{html.escape(num_display)}</b>",
     ]
 
     if active_mode != "short" and raw_message:
@@ -3444,11 +3439,7 @@ def format_inbox_otp_message(
         styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
         lines.append("")
         lines.append(
-            f"<blockquote expandable>⠀\n"
-            f"{COLLAPSED_SMS_HINT}\n"
-            f"⠀\n"
-            f"{QUOTE_DIVIDER}\n"
-            f"💬 <b>FULL SMS</b>\n"
+            f"<blockquote expandable>{COLLAPSED_SMS_HINT}\n"
             f"{styled_sms}</blockquote>"
         )
     else:
@@ -5622,18 +5613,18 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         active_label = "Long 📜 (With View Full SMS)"
 
     msg = (
-        "📋 <b>SMS Format & Live Preview</b>\n"
+        "📋 <b>SMS Format & Live Preview (Minimalist Glass)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🟢 <b>Active Mode:</b>   {active_label}\n\n"
         "<b>Available Modes:</b>\n"
-        f"• <b>Short (Header Country)</b> {short_active}\n"
-        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, clean spacing.\n\n"
-        f"• <b>Long (With View Full SMS)</b> {long_active}\n"
-        "  Full card with expandable '💬 FULL SMS' blockquote.\n\n"
-        f"• <b>Classic Short (Compact)</b> {classic_active}\n"
-        "  Country in header (NEW SMS • VN 🇻🇳), Service & Number with ✦, without extra spacing.\n\n"
-        f"• <b>Classic Long (Compact + Full SMS)</b> {classic_long_active}\n"
-        "  Compact layout with ✦ marks and expandable '💬 FULL SMS' blockquote.\n"
+        f"• <b>Short (Minimalist Glass)</b> {short_active}\n"
+        "  Service & Country on top (📩 WhatsApp • VN 🇻🇳), number below, airy spacing.\n\n"
+        f"• <b>Long (Minimalist Glass + SMS)</b> {long_active}\n"
+        "  Airy Minimalist Glass card with expandable '▾ SMS Content' blockquote.\n\n"
+        f"• <b>Classic Short (Compact Glass)</b> {classic_active}\n"
+        "  Tight layout without extra blank spacing.\n\n"
+        f"• <b>Classic Long (Compact + SMS)</b> {classic_long_active}\n"
+        "  Tight Minimalist Glass layout with expandable '▾ SMS Content' blockquote.\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."

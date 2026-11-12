@@ -3422,13 +3422,11 @@ def format_inbox_otp_message(
         if active_mode in ("glass_long", "glass", "direct_long", "direct") and raw_message:
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
-            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=18)
-            indented_sms = "\n".join(f"\u00a0\u00a0{ln}" if ln else "" for ln in styled_sms.splitlines())
+            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=26)
+            compact_sms = "\n".join(ln for ln in styled_sms.splitlines() if ln.strip())
             lines.append("")
             lines.append("<b>▸\u00a0\u00a0💬 Full SMS</b>")
-            lines.append(indented_sms)
-        else:
-            lines.append("⠀")
+            lines.append(compact_sms)
         return "\n".join(lines)
 
     if active_mode in ("classic_short", "old_short", "classic"):

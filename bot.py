@@ -3413,7 +3413,8 @@ def format_inbox_otp_message(
         active_mode = "short"
 
     if active_mode in ("glass_short", "glass_long", "glass", "direct_short", "direct_long", "direct"):
-        fixed_pad = "\u2800" * max(3, 25 - len(f"{raw_svc} • {iso_fixed} 00"))
+        header_raw_len = len(f"📩 {raw_svc} • {iso_fixed} 00")
+        fixed_pad = "\u2800" * max(4, 28 - header_raw_len)
         header_line = f"📩 <b>{svc_display} • {html.escape(iso_fixed)} {c_flag}</b>{fixed_pad}"
         lines = [
             header_line,
@@ -3423,13 +3424,10 @@ def format_inbox_otp_message(
         if active_mode in ("glass_long", "glass", "direct_long", "direct") and raw_message:
             clean_msg = raw_message.strip()
             display_sms = clean_msg if len(clean_msg) <= 3000 else (clean_msg[:3000] + "... [truncated]")
-            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=20)
+            styled_sms = style_sms_with_copyable_otp(display_sms, otp_code, width=24)
             compact_sms = "\n".join(ln for ln in styled_sms.splitlines() if ln.strip())
             lines.append("")
-            lines.append(
-                f"<blockquote>💬 <b>FULL SMS</b>\n"
-                f"{compact_sms}</blockquote>"
-            )
+            lines.append(compact_sms)
         return "\n".join(lines)
 
     if active_mode in ("classic_short", "old_short", "classic"):
@@ -5672,7 +5670,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
         f"• <b>Direct Short (Signal Ticket)</b> {glass_short_active}\n"
         "  Top bar (📩 WhatsApp • VN 🇻🇳), ✦ Number below, fixed compact card size.\n\n"
         f"• <b>Direct Full (Open SMS Card)</b> {glass_long_active}\n"
-        "  Top bar + ✦ Number + open SMS quote shown directly on card.\n"
+        "  Top bar + ✦ Number + full SMS shown directly on card (no quote box).\n"
     )
 
     sample_sms = "Your WhatsApp verification code is 292-356. Do not share this code with anyone."
@@ -5778,7 +5776,7 @@ def build_sms_format_view(preview_mode: Optional[str] = None) -> Tuple[str, Inli
             f"\n━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>📺 Live Preview — Direct Full (Open SMS Card):</b>\n\n"
             f"{preview_body}\n\n"
-            f"<i>💡 Open SMS directly on card without expandable quote. Tap button below to test copying:</i>"
+            f"<i>💡 Open SMS directly on card without any quote box. Tap button below to test copying:</i>"
         )
     else:
         msg += "\n<i>Choose an option below to set the format or preview it live:</i>"
@@ -5893,7 +5891,7 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>SMS Delivery Format Updated!</b>\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     "• <b>Active Mode:</b> Direct Full 📩 (Open SMS Card)\n"
-                    "• <b>Full SMS:</b> Directly visible on card (no expandable quote)",
+                    "• <b>Full SMS:</b> Directly visible on card (no quote box)",
                     parse_mode=ParseMode.HTML
                 )
             return
